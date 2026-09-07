@@ -40,12 +40,8 @@ def reconcile_costs(
     if estimated.order != authoritative.order:
         raise ValueError("cannot reconcile quotes for different orders")
 
-    estimated_total = estimated.charges.total
-    broker_total = (
-        authoritative.broker_reported_total
-        if authoritative.broker_reported_total is not None
-        else authoritative.charges.total
-    )
+    estimated_total = estimated.total
+    broker_total = authoritative.total
     absolute_error = abs(estimated_total - broker_total)
     return ReconciliationResult(
         estimated_total=estimated_total,
@@ -87,6 +83,8 @@ def round_trip_result(
         exit=exit_order,
         entry_charges=entry_quote.charges,
         exit_charges=exit_quote.charges,
+        entry_cost_total=entry_quote.total,
+        exit_cost_total=exit_quote.total,
         modeled_execution_friction=modeled_execution_friction,
         gross_pnl=gross_pnl,
     )
