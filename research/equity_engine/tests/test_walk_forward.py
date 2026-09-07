@@ -6,6 +6,7 @@ import pandas as pd
 from equity_engine.candidate_grid import baseline_definition
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.event_simulator import FillAssumptions, IntradaySimulationConfig
+from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
 from equity_engine.tournament import RankingMetric
 from equity_engine.walk_forward import make_walk_forward_windows, run_walk_forward_selection
@@ -82,9 +83,14 @@ def test_walk_forward_selects_only_from_train_and_evaluates_on_test() -> None:
             half_spread_bps_per_leg=Decimal("0"),
             tick_size=Decimal("0.05"),
         ),
+        # This fixture models a non-CAS NSE cash stock. Normal continuous trading ends at
+        # 15:30, and the explicit 10-minute research buffer gives a 15:20 simulator exit.
+        session_policy=NSEEquitySessionPolicy(
+            cas_eligible=False,
+            exit_buffer_minutes=10,
+        ),
         simulation_config=IntradaySimulationConfig(
             initial_cash=Decimal("1000"),
-            session_exit_time=time(15, 20),
             max_trades_per_day=1,
         ),
     )
