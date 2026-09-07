@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from typing import Iterable
 
 from .instrument_master import EquityInstrument
 
@@ -17,6 +18,68 @@ class TickSizeVerification:
     expected_rupees: Decimal
     observed_rupees: Decimal
     source: str
+
+
+@dataclass(frozen=True)
+class TickSizePoint:
+    effective_from: date
+    tick_size_rupees: Decimal
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.tick_size_rupees <= 0:
+            raise ValueError("tick_size_rupees must be positive")
+        if not self.source.strip():
+            raise ValueError("tick-size source is required")
+
+
+@dataclass(frozen=True)
+class FixedTickSizePolicy:
+    """Explicit fixed tick policy for synthetic/unit-test datasets only."""
+
+    tick_size_rupees: Decimal
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.tick_size_rupees <= 0:
+            raise ValueError("tick_size_rupees must be positive")
+        if not self.source.strip():
+            raise ValueError("fixed tick-size source is required")
+
+    def tick_size(self, trade_date: date) -> Decimal:
+        return self.tick_size_rupees
+
+
+class EffectiveDatedTickSizePolicy:
+    """Resolve tick size from explicit dated security-master evidence.
+
+    The policy does not infer monthly effective dates. Each point must come from an external
+    security master/circular snapshot. For a trade date, the latest point not after that date is
+    used. Dates before the earliest point fail closed.
+    """
+
+    def __init__(self, points: Iterable[TickSizePoint]) -> None:
+        ordered = tuple(sorted(points, key=lambda item: item.effective_from))
+        if not ordered:
+            raise ValueError("at least one effective-dated tick point is required")
+        if len({item.effective_from for item in ordered}) != len(ordered):
+            raise ValueError("duplicate effective_from dates in tick policy")
+        self._points = ordered
+
+    @property
+    def points(self) -> tuple[TickSizePoint, ...]:
+        return self._points
+
+    def tick_size(self, trade_date: date) -> Decimal:
+        applicable: TickSizePoint | None = None
+        for point in self._points:
+            if point.effective_from <= trade_date:
+                applicable = point
+            else:
+                break
+        if applicable is None:
+            raise ValueError(f"no verified tick-size evidence for trade date {trade_date}")
+        return applicable.tick_size_rupees
 
 
 def expected_nse_cm_tick_size_rupees(
