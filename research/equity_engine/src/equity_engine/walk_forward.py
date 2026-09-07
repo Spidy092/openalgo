@@ -13,6 +13,7 @@ from .event_simulator import (
     IntradaySimulationConfig,
     SessionExitResolver,
     TickSizeResolver,
+    TradingEligibilityResolver,
 )
 from .models import Exchange
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact, rank_candidates
@@ -99,9 +100,14 @@ def run_walk_forward_selection(
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
     tick_size_policy: TickSizeResolver,
+    trading_eligibility_policy: TradingEligibilityResolver,
     simulation_config: IntradaySimulationConfig,
 ) -> list[WalkForwardResult]:
-    """Select only on train data, freeze candidate, then evaluate untouched test data."""
+    """Select only on train data, freeze candidate, then evaluate untouched test data.
+
+    The same point-in-time trading-eligibility resolver is used for both train and test windows;
+    the simulator queries it for each actual entry date and fails if evidence is missing.
+    """
 
     if not candidates:
         raise ValueError("at least one candidate is required")
@@ -126,6 +132,7 @@ def run_walk_forward_selection(
                     fills=fills,
                     session_policy=session_policy,
                     tick_size_policy=tick_size_policy,
+                    trading_eligibility_policy=trading_eligibility_policy,
                     config=simulation_config,
                 )
             )
@@ -144,6 +151,7 @@ def run_walk_forward_selection(
             fills=fills,
             session_policy=session_policy,
             tick_size_policy=tick_size_policy,
+            trading_eligibility_policy=trading_eligibility_policy,
             config=simulation_config,
         )
         results.append(
