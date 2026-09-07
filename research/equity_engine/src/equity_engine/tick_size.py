@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from typing import Iterable
+from typing import Iterable, Protocol
 
 from .instrument_master import EquityInstrument
 
@@ -31,6 +31,22 @@ class TickSizePoint:
             raise ValueError("tick_size_rupees must be positive")
         if not self.source.strip():
             raise ValueError("tick-size source is required")
+
+
+class TickPolicy(Protocol):
+    def tick_size(self, trade_date: date) -> Decimal:
+        ...
+
+
+@dataclass(frozen=True)
+class TickCoverageAssessment:
+    requested_dates: tuple[date, ...]
+    covered_dates: tuple[date, ...]
+    missing_dates: tuple[date, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing_dates
 
 
 @dataclass(frozen=True)
@@ -80,6 +96,35 @@ class EffectiveDatedTickSizePolicy:
         if applicable is None:
             raise ValueError(f"no verified tick-size evidence for trade date {trade_date}")
         return applicable.tick_size_rupees
+
+
+def assess_tick_policy_coverage(
+    *,
+    policy: TickPolicy,
+    trading_dates: Iterable[date],
+) -> TickCoverageAssessment:
+    """Verify that every requested historical trade date resolves to a positive tick size."""
+
+    requested = tuple(sorted(set(trading_dates)))
+    if not requested:
+        raise ValueError("at least one trading date is required")
+    covered: list[date] = []
+    missing: list[date] = []
+    for trade_date in requested:
+        try:
+            tick = policy.tick_size(trade_date)
+        except ValueError:
+            missing.append(trade_date)
+            continue
+        if tick <= 0:
+            missing.append(trade_date)
+            continue
+        covered.append(trade_date)
+    return TickCoverageAssessment(
+        requested_dates=requested,
+        covered_dates=tuple(covered),
+        missing_dates=tuple(missing),
+    )
 
 
 def expected_nse_cm_tick_size_rupees(
