@@ -5,6 +5,7 @@ import pandas as pd
 
 from equity_engine.instrument_master import build_nse_equity_master
 from equity_engine.liquidity import SpreadObservation, summarize_historical_liquidity, summarize_live_spreads
+from equity_engine.tick_size import TickSizeVerification
 from equity_engine.universe import (
     CorporateActionAssessment,
     LiveUniverseThresholds,
@@ -42,6 +43,15 @@ def _instrument(*, mis: bool = True, suspended: bool = False):
     return snapshot.instruments[0]
 
 
+def _tick_ok() -> TickSizeVerification:
+    return TickSizeVerification(
+        passed=True,
+        expected_rupees=Decimal("0.05"),
+        observed_rupees=Decimal("0.05"),
+        source="synthetic-test",
+    )
+
+
 def _frame() -> pd.DataFrame:
     index = pd.DatetimeIndex(
         [
@@ -64,10 +74,7 @@ def _frame() -> pd.DataFrame:
 
 
 def test_historical_liquidity_uses_labeled_notional_proxy() -> None:
-    evidence = summarize_historical_liquidity(
-        frame=_frame(),
-        affordable_quantity_after_entry_costs=9,
-    )
+    evidence = summarize_historical_liquidity(frame=_frame(), affordable_quantity_after_entry_costs=9)
     assert evidence.observed_trading_days == 2
     assert evidence.median_daily_volume_shares == Decimal("5000")
     assert evidence.median_daily_notional_proxy_rupees == Decimal("510000")
@@ -88,14 +95,12 @@ def test_live_spread_is_computed_from_actual_bid_ask_observations() -> None:
 
 def test_research_and_live_eligibility_are_separate() -> None:
     instrument = _instrument()
-    liquidity = summarize_historical_liquidity(
-        frame=_frame(),
-        affordable_quantity_after_entry_costs=9,
-    )
+    liquidity = summarize_historical_liquidity(frame=_frame(), affordable_quantity_after_entry_costs=9)
     research = evaluate_research_universe_candidate(
         instrument=instrument,
         liquidity=liquidity,
         corporate_actions=CorporateActionAssessment(complete=True, blocking_events=()),
+        tick_size_verification=_tick_ok(),
         thresholds=ResearchUniverseThresholds(
             max_last_price_rupees=Decimal("500"),
             min_median_daily_notional_proxy_rupees=Decimal("100000"),
@@ -108,9 +113,7 @@ def test_research_and_live_eligibility_are_separate() -> None:
 
     live = evaluate_live_universe_candidate(
         research_decision=research,
-        spread=summarize_live_spreads(
-            [SpreadObservation(Decimal("100"), Decimal("100.05"))]
-        ),
+        spread=summarize_live_spreads([SpreadObservation(Decimal("100"), Decimal("100.05"))]),
         thresholds=LiveUniverseThresholds(
             max_median_spread_bps=Decimal("10"),
             min_spread_observations=5,
@@ -127,6 +130,7 @@ def test_not_mis_and_suspended_are_hard_rejections() -> None:
         instrument=instrument,
         liquidity=liquidity,
         corporate_actions=CorporateActionAssessment(complete=True, blocking_events=()),
+        tick_size_verification=_tick_ok(),
         thresholds=ResearchUniverseThresholds(
             max_last_price_rupees=Decimal("500"),
             min_median_daily_notional_proxy_rupees=Decimal("0"),
@@ -138,3 +142,28 @@ def test_not_mis_and_suspended_are_hard_rejections() -> None:
     assert decision.eligible is False
     assert any("MIS" in violation for violation in decision.violations)
     assert any("suspended" in violation for violation in decision.violations)
+
+
+def test_failed_tick_verification_blocks_research() -> None:
+    instrument = _instrument()
+    liquidity = summarize_historical_liquidity(frame=_frame(), affordable_quantity_after_entry_costs=9)
+    decision = evaluate_research_universe_candidate(
+        instrument=instrument,
+        liquidity=liquidity,
+        corporate_actions=CorporateActionAssessment(complete=True, blocking_events=()),
+        tick_size_verification=TickSizeVerification(
+            passed=False,
+            expected_rupees=Decimal("0.10"),
+            observed_rupees=Decimal("0.05"),
+            source="synthetic-test",
+        ),
+        thresholds=ResearchUniverseThresholds(
+            max_last_price_rupees=Decimal("500"),
+            min_median_daily_notional_proxy_rupees=Decimal("0"),
+            min_median_daily_volume_shares=Decimal("0"),
+            min_observed_trading_days=1,
+            min_affordable_quantity=1,
+        ),
+    )
+    assert decision.eligible is False
+    assert any("tick-size verification failed" in violation for violation in decision.violations)
