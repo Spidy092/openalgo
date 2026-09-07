@@ -95,6 +95,7 @@ class UpstoxHistoricalDataProvider:
             symbol=symbol,
             timezone=str(frame.index.tz),
             interval=f"{interval_minutes}m",
+            timestamp_semantics="candle_start",
             start=frame.index[0].to_pydatetime(),
             end=frame.index[-1].to_pydatetime(),
             retrieved_at=datetime.now(timezone.utc),
