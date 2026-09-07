@@ -88,6 +88,31 @@ def _slice_dates(frame: pd.DataFrame, dates: tuple[date, ...]) -> pd.DataFrame:
     return frame[[d in allowed for d in frame.index.date]].copy()
 
 
+def _filter_to_trading_eligible_dates(
+    frame: pd.DataFrame,
+    *,
+    trading_eligibility_policy: TradingEligibilityResolver,
+    window_id: int,
+    phase: str,
+) -> pd.DataFrame:
+    """Remove exchange-ineligible dates before any strategy can observe their bars."""
+
+    if phase not in {"train", "test"}:
+        raise ValueError("phase must be train or test")
+    dates = tuple(sorted(set(frame.index.date)))
+    eligible_dates = {
+        trade_date
+        for trade_date in dates
+        if trading_eligibility_policy.is_eligible(trade_date)
+    }
+    filtered = frame[[d in eligible_dates for d in frame.index.date]].copy()
+    if filtered.empty:
+        raise ValueError(
+            f"walk-forward window {window_id} {phase} contains no exchange-eligible rows"
+        )
+    return filtered
+
+
 def run_walk_forward_selection(
     *,
     frame: pd.DataFrame,
@@ -103,10 +128,11 @@ def run_walk_forward_selection(
     trading_eligibility_policy: TradingEligibilityResolver,
     simulation_config: IntradaySimulationConfig,
 ) -> list[WalkForwardResult]:
-    """Select only on train data, freeze candidate, then evaluate untouched test data.
+    """Select on eligible train data, freeze candidate, then evaluate eligible test data.
 
-    The same point-in-time trading-eligibility resolver is used for both train and test windows;
-    the simulator queries it for each actual entry date and fails if evidence is missing.
+    Point-in-time exchange eligibility is applied before signal generation as well as during
+    execution. This prevents suspended, not-yet-listed, or otherwise ineligible bars from
+    influencing indicators on later eligible dates.
     """
 
     if not candidates:
@@ -114,8 +140,18 @@ def run_walk_forward_selection(
 
     results: list[WalkForwardResult] = []
     for window in windows:
-        train_frame = _slice_dates(frame, window.train_dates)
-        test_frame = _slice_dates(frame, window.test_dates)
+        train_frame = _filter_to_trading_eligible_dates(
+            _slice_dates(frame, window.train_dates),
+            trading_eligibility_policy=trading_eligibility_policy,
+            window_id=window.window_id,
+            phase="train",
+        )
+        test_frame = _filter_to_trading_eligible_dates(
+            _slice_dates(frame, window.test_dates),
+            trading_eligibility_policy=trading_eligibility_policy,
+            window_id=window.window_id,
+            phase="test",
+        )
 
         train_evaluations: list[CandidateEvaluation] = []
         definition_by_id = {candidate.candidate_id: candidate for candidate in candidates}
