@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .instrument_master import EquityInstrument
+from .tick_size import TickSizeVerification
 
 
 @dataclass(frozen=True)
@@ -31,8 +32,6 @@ class ResearchUniverseThresholds:
 
 @dataclass(frozen=True)
 class LiveUniverseThresholds:
-    """Additional thresholds required before paper/live eligibility."""
-
     max_median_spread_bps: Decimal
     min_spread_observations: int
 
@@ -114,11 +113,19 @@ def evaluate_research_universe_candidate(
     instrument: EquityInstrument,
     liquidity: HistoricalLiquidityEvidence,
     corporate_actions: CorporateActionAssessment,
+    tick_size_verification: TickSizeVerification,
     thresholds: ResearchUniverseThresholds,
 ) -> UniverseDecision:
-    """Eligibility for historical strategy research; does not pretend OHLC contains spread."""
+    """Eligibility for historical strategy research; no guessed spread or tick conversion."""
 
     violations = _static_violations(instrument)
+
+    if not tick_size_verification.passed:
+        violations.append(
+            "tick-size verification failed: "
+            f"observed ₹{tick_size_verification.observed_rupees} vs "
+            f"expected ₹{tick_size_verification.expected_rupees}"
+        )
 
     if not liquidity.source_complete:
         violations.append("historical liquidity evidence is incomplete")
@@ -127,10 +134,7 @@ def evaluate_research_universe_candidate(
             f"last price ₹{liquidity.last_price_rupees} exceeds research cap "
             f"₹{thresholds.max_last_price_rupees}"
         )
-    if (
-        liquidity.median_daily_notional_proxy_rupees
-        < thresholds.min_median_daily_notional_proxy_rupees
-    ):
+    if liquidity.median_daily_notional_proxy_rupees < thresholds.min_median_daily_notional_proxy_rupees:
         violations.append("median daily notional proxy is below required threshold")
     if liquidity.median_daily_volume_shares < thresholds.min_median_daily_volume_shares:
         violations.append("median daily volume is below required threshold")
@@ -156,8 +160,6 @@ def evaluate_live_universe_candidate(
     spread: LiveSpreadEvidence,
     thresholds: LiveUniverseThresholds,
 ) -> UniverseDecision:
-    """Add measured live bid/ask evidence; historical OHLC is never used as a spread substitute."""
-
     violations = list(research_decision.violations)
     if not research_decision.eligible and not violations:
         violations.append("research universe decision did not pass")
