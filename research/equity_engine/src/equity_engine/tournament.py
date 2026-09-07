@@ -11,6 +11,7 @@ from .event_simulator import (
     FillAssumptions,
     IntradaySimulationConfig,
     IntradaySimulationResult,
+    SessionExitResolver,
     simulate_long_intraday,
 )
 from .models import Exchange
@@ -96,6 +97,7 @@ def evaluate_candidate_exact(
     exchange: Exchange,
     cost_provider: CostProvider,
     fills: FillAssumptions,
+    session_policy: SessionExitResolver,
     config: IntradaySimulationConfig,
 ) -> CandidateEvaluation:
     """Run one strategy candidate through the Decimal event-driven simulator."""
@@ -111,6 +113,7 @@ def evaluate_candidate_exact(
         exchange=exchange,
         cost_provider=cost_provider,
         fills=fills,
+        session_policy=session_policy,
         config=config,
     )
     return CandidateEvaluation(
