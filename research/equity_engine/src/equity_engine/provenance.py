@@ -16,6 +16,7 @@ class MarketDataManifest:
     symbol: str
     timezone: str
     interval: str
+    timestamp_semantics: str
     start: datetime
     end: datetime
     retrieved_at: datetime
