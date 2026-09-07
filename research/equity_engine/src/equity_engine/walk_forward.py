@@ -8,7 +8,12 @@ import pandas as pd
 
 from .candidate_grid import StrategyDefinition
 from .costs import CostProvider
-from .event_simulator import FillAssumptions, IntradaySimulationConfig, SessionExitResolver
+from .event_simulator import (
+    FillAssumptions,
+    IntradaySimulationConfig,
+    SessionExitResolver,
+    TickSizeResolver,
+)
 from .models import Exchange
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact, rank_candidates
 
@@ -36,11 +41,7 @@ def make_walk_forward_windows(
     step_trading_days: int,
     embargo_trading_days: int,
 ) -> list[WalkForwardWindow]:
-    """Create chronological train/test windows from actual trading dates in the dataset.
-
-    All sizes are caller supplied. `embargo_trading_days` creates an explicit gap between the
-    training set and test set; pass 0 deliberately when no embargo is desired.
-    """
+    """Create chronological train/test windows from actual trading dates in the dataset."""
 
     for name, value in (
         ("train_trading_days", train_trading_days),
@@ -66,7 +67,6 @@ def make_walk_forward_windows(
         test_end = test_start + test_trading_days
         if test_end > len(trading_dates):
             break
-
         windows.append(
             WalkForwardWindow(
                 window_id=window_id,
@@ -98,9 +98,10 @@ def run_walk_forward_selection(
     cost_provider: CostProvider,
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
+    tick_size_policy: TickSizeResolver,
     simulation_config: IntradaySimulationConfig,
 ) -> list[WalkForwardResult]:
-    """Select a candidate only on each train window, then evaluate it untouched on test data."""
+    """Select only on train data, freeze candidate, then evaluate untouched test data."""
 
     if not candidates:
         raise ValueError("at least one candidate is required")
@@ -124,6 +125,7 @@ def run_walk_forward_selection(
                     cost_provider=cost_provider,
                     fills=fills,
                     session_policy=session_policy,
+                    tick_size_policy=tick_size_policy,
                     config=simulation_config,
                 )
             )
@@ -141,6 +143,7 @@ def run_walk_forward_selection(
             cost_provider=cost_provider,
             fills=fills,
             session_policy=session_policy,
+            tick_size_policy=tick_size_policy,
             config=simulation_config,
         )
         results.append(
@@ -156,8 +159,6 @@ def run_walk_forward_selection(
 
 
 def aggregate_test_net_return_pct(results: list[WalkForwardResult]) -> Decimal:
-    """Sum non-overlapping window returns only; caller must ensure the window schedule is disjoint."""
-
     if not results:
         raise ValueError("results cannot be empty")
     return sum((item.test_evaluation.metrics.net_return_pct for item in results), Decimal("0"))
