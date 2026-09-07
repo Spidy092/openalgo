@@ -13,6 +13,7 @@ from equity_engine.event_simulator import (
 )
 from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
+from equity_engine.tick_size import FixedTickSizePolicy
 
 
 def _frame(times: list[str], opens: list[float]) -> pd.DataFrame:
@@ -37,8 +38,11 @@ def _fills() -> FillAssumptions:
     return FillAssumptions(
         slippage_bps_per_leg=Decimal("0"),
         half_spread_bps_per_leg=Decimal("0"),
-        tick_size=Decimal("0.05"),
     )
+
+
+def _tick_policy() -> FixedTickSizePolicy:
+    return FixedTickSizePolicy(tick_size_rupees=Decimal("0.05"), source="synthetic-test")
 
 
 def _session_policy() -> NSEEquitySessionPolicy:
@@ -73,6 +77,7 @@ def test_signal_at_close_executes_at_next_bar_open_with_exact_costs() -> None:
         cost_provider=_provider(),
         fills=_fills(),
         session_policy=_session_policy(),
+        tick_size_policy=_tick_policy(),
         config=_config(),
     )
 
@@ -83,6 +88,8 @@ def test_signal_at_close_executes_at_next_bar_open_with_exact_costs() -> None:
     assert trade.reference_entry_price == Decimal("101.0")
     assert trade.reference_exit_price == Decimal("103.0")
     assert trade.quantity == 9
+    assert trade.entry_tick_size_rupees == Decimal("0.05")
+    assert trade.exit_tick_size_rupees == Decimal("0.05")
     assert trade.exit_reason is ExitReason.SIGNAL
     assert result.final_cash == result.initial_cash + trade.net_pnl
     assert result.net_pnl == trade.net_pnl
@@ -110,6 +117,7 @@ def test_cutoff_forces_same_day_exit() -> None:
         cost_provider=_provider(),
         fills=_fills(),
         session_policy=_session_policy(),
+        tick_size_policy=_tick_policy(),
         config=_config(),
     )
 
@@ -140,6 +148,7 @@ def test_yesterdays_final_signal_is_not_executed_at_next_days_open() -> None:
         cost_provider=_provider(),
         fills=_fills(),
         session_policy=_session_policy(),
+        tick_size_policy=_tick_policy(),
         config=_config(),
     )
 
@@ -168,5 +177,6 @@ def test_incomplete_session_fails_instead_of_hiding_overnight_position() -> None
             cost_provider=_provider(),
             fills=_fills(),
             session_policy=_session_policy(),
+            tick_size_policy=_tick_policy(),
             config=_config(),
         )
