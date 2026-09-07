@@ -5,6 +5,7 @@ import pandas as pd
 
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.event_simulator import FillAssumptions, IntradaySimulationConfig
+from equity_engine.liquidation_equity import EquityObservation, liquidation_drawdown_metrics
 from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
 from equity_engine.strategies import first_bar_hold_baseline
@@ -111,3 +112,28 @@ def test_close_liquidation_curve_includes_modeled_exit_cost_before_trade_is_clos
     entry_mark = next(item for item in evaluation.equity_curve if item.position_quantity > 0)
     assert entry_mark.close_liquidation_equity < Decimal("1000")
     assert evaluation.metrics.close_liquidation_max_drawdown_pct > Decimal("0")
+
+
+def test_low_stress_uses_previous_close_peak_without_using_same_bar_close_retroactively() -> None:
+    observations = (
+        EquityObservation(
+            timestamp=pd.Timestamp("2026-09-01 09:20", tz="Asia/Kolkata"),
+            cash_on_hand=Decimal("100"),
+            position_quantity=1,
+            close_liquidation_equity=Decimal("1200"),
+            ohlc_low_liquidation_stress_equity=Decimal("1000"),
+        ),
+        EquityObservation(
+            timestamp=pd.Timestamp("2026-09-01 09:25", tz="Asia/Kolkata"),
+            cash_on_hand=Decimal("100"),
+            position_quantity=1,
+            close_liquidation_equity=Decimal("1100"),
+            ohlc_low_liquidation_stress_equity=Decimal("900"),
+        ),
+    )
+
+    metrics = liquidation_drawdown_metrics(observations, initial_equity=Decimal("1000"))
+
+    # First bar low is compared with the initial 1000, not its later 1200 close. The 1200 close
+    # then becomes the peak for the next bar, so 900 is a 25% low-stress drawdown.
+    assert metrics.ohlc_low_liquidation_stress_max_drawdown_pct == Decimal("25.00")
