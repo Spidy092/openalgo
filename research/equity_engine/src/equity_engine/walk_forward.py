@@ -8,7 +8,7 @@ import pandas as pd
 
 from .candidate_grid import StrategyDefinition
 from .costs import CostProvider
-from .event_simulator import FillAssumptions, IntradaySimulationConfig
+from .event_simulator import FillAssumptions, IntradaySimulationConfig, SessionExitResolver
 from .models import Exchange
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact, rank_candidates
 
@@ -97,6 +97,7 @@ def run_walk_forward_selection(
     exchange: Exchange,
     cost_provider: CostProvider,
     fills: FillAssumptions,
+    session_policy: SessionExitResolver,
     simulation_config: IntradaySimulationConfig,
 ) -> list[WalkForwardResult]:
     """Select a candidate only on each train window, then evaluate it untouched on test data."""
@@ -122,6 +123,7 @@ def run_walk_forward_selection(
                     exchange=exchange,
                     cost_provider=cost_provider,
                     fills=fills,
+                    session_policy=session_policy,
                     config=simulation_config,
                 )
             )
@@ -138,6 +140,7 @@ def run_walk_forward_selection(
             exchange=exchange,
             cost_provider=cost_provider,
             fills=fills,
+            session_policy=session_policy,
             config=simulation_config,
         )
         results.append(
