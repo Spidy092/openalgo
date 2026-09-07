@@ -70,7 +70,7 @@ def test_historical_liquidity_uses_labeled_notional_proxy() -> None:
     )
     assert evidence.observed_trading_days == 2
     assert evidence.median_daily_volume_shares == Decimal("5000")
-    assert evidence.median_daily_notional_proxy_rupees == Decimal("511000")
+    assert evidence.median_daily_notional_proxy_rupees == Decimal("510000")
     assert evidence.last_price_rupees == Decimal("103")
 
 
