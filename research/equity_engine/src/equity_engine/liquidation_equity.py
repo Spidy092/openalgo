@@ -13,7 +13,7 @@ from .models import Exchange, OrderSpec, Product, Side
 @dataclass(frozen=True)
 class EquityObservation:
     timestamp: pd.Timestamp
-    realized_cash: Decimal
+    cash_on_hand: Decimal
     position_quantity: int
     close_liquidation_equity: Decimal
     ohlc_low_liquidation_stress_equity: Decimal
@@ -81,12 +81,12 @@ def build_liquidation_equity_curve(
         raise ValueError("simulation trades must be chronological")
 
     observations: list[EquityObservation] = []
-    realized_cash = simulation.initial_cash
+    realized_account_value = simulation.initial_cash
     trade_index = 0
 
     for timestamp, row in frame.iterrows():
         while trade_index < len(trades) and trades[trade_index].exit_timestamp <= timestamp:
-            realized_cash += trades[trade_index].net_pnl
+            realized_account_value += trades[trade_index].net_pnl
             trade_index += 1
 
         active = None
@@ -96,18 +96,19 @@ def build_liquidation_equity_curve(
                 active = candidate
 
         if active is None:
-            close_equity = realized_cash
-            low_equity = realized_cash
+            cash_on_hand = realized_account_value
+            close_equity = realized_account_value
+            low_equity = realized_account_value
             quantity = 0
         else:
             quantity = active.quantity
-            cash_after_entry = (
-                realized_cash
+            cash_on_hand = (
+                realized_account_value
                 - active.fill_entry_price * quantity
                 - active.entry_cost
             )
             close_equity = _liquidation_equity(
-                cash_after_entry=cash_after_entry,
+                cash_after_entry=cash_on_hand,
                 quantity=quantity,
                 reference_price=Decimal(str(row["close"])),
                 tick_size=active.entry_tick_size_rupees,
@@ -117,7 +118,7 @@ def build_liquidation_equity_curve(
                 fills=fills,
             )
             low_equity = _liquidation_equity(
-                cash_after_entry=cash_after_entry,
+                cash_after_entry=cash_on_hand,
                 quantity=quantity,
                 reference_price=Decimal(str(row["low"])),
                 tick_size=active.entry_tick_size_rupees,
@@ -130,7 +131,7 @@ def build_liquidation_equity_curve(
         observations.append(
             EquityObservation(
                 timestamp=timestamp,
-                realized_cash=realized_cash,
+                cash_on_hand=cash_on_hand,
                 position_quantity=quantity,
                 close_liquidation_equity=close_equity,
                 ohlc_low_liquidation_stress_equity=low_equity,
