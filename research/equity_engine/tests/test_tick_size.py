@@ -1,8 +1,15 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from equity_engine.instrument_master import build_nse_equity_master
-from equity_engine.tick_size import expected_nse_cm_tick_size_rupees, verify_instrument_tick_size
+from equity_engine.tick_size import (
+    EffectiveDatedTickSizePolicy,
+    TickSizePoint,
+    expected_nse_cm_tick_size_rupees,
+    verify_instrument_tick_size,
+)
 
 
 def _instrument(raw_tick: str):
@@ -60,3 +67,40 @@ def test_converted_upstox_tick_must_match_nse_reference_tier() -> None:
     )
     assert mismatch.passed is False
     assert mismatch.expected_rupees == Decimal("0.10")
+
+
+def test_effective_dated_policy_uses_latest_verified_point_only() -> None:
+    policy = EffectiveDatedTickSizePolicy(
+        [
+            TickSizePoint(
+                effective_from=date(2025, 4, 15),
+                tick_size_rupees=Decimal("0.05"),
+                source="security-master-2025-04",
+            ),
+            TickSizePoint(
+                effective_from=date(2026, 9, 1),
+                tick_size_rupees=Decimal("0.10"),
+                source="security-master-2026-09",
+            ),
+        ]
+    )
+
+    assert policy.tick_size(date(2025, 4, 15)) == Decimal("0.05")
+    assert policy.tick_size(date(2026, 8, 31)) == Decimal("0.05")
+    assert policy.tick_size(date(2026, 9, 1)) == Decimal("0.10")
+    assert policy.tick_size(date(2026, 9, 7)) == Decimal("0.10")
+
+
+def test_effective_dated_policy_fails_before_earliest_verified_point() -> None:
+    policy = EffectiveDatedTickSizePolicy(
+        [
+            TickSizePoint(
+                effective_from=date(2025, 4, 15),
+                tick_size_rupees=Decimal("0.05"),
+                source="security-master-2025-04",
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="no verified tick-size evidence"):
+        policy.tick_size(date(2025, 4, 14))
