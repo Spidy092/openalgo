@@ -12,6 +12,11 @@ from equity_engine.stress import FrictionScenario, run_friction_stress
 from equity_engine.tick_size import FixedTickSizePolicy
 
 
+class _SyntheticEligibilityPolicy:
+    def is_eligible(self, trade_date: date) -> bool:
+        return True
+
+
 def _frame() -> pd.DataFrame:
     index = pd.DatetimeIndex(
         [
@@ -49,6 +54,7 @@ def test_worse_friction_cannot_improve_exact_pnl() -> None:
         cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
         session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
         tick_size_policy=_tick_policy(),
+        trading_eligibility_policy=_SyntheticEligibilityPolicy(),
         config=IntradaySimulationConfig(initial_cash=Decimal("1000"), max_trades_per_day=1),
         scenarios=[
             FrictionScenario(
@@ -86,6 +92,7 @@ def test_stress_requires_named_explicit_scenarios() -> None:
             cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
             session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
             tick_size_policy=_tick_policy(),
+            trading_eligibility_policy=_SyntheticEligibilityPolicy(),
             config=IntradaySimulationConfig(initial_cash=Decimal("1000"), max_trades_per_day=1),
             scenarios=[],
         )
