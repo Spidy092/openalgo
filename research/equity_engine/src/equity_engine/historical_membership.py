@@ -9,11 +9,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class HistoricalTradingStatus:
-    """Point-in-time exchange eligibility evidence for one security and trade date.
-
-    The booleans are intentionally populated by an exchange-file adapter. This model does not
-    infer historical eligibility from today's broker instrument master.
-    """
+    """Point-in-time exchange eligibility evidence for one security and trade date."""
 
     trade_date: date
     instrument_key: str
@@ -41,13 +37,37 @@ class HistoricalMembershipAssessment:
         return not self.missing_dates
 
 
+class HistoricalTradingEligibilityPolicy:
+    """Per-day entry permission derived only from point-in-time exchange evidence."""
+
+    def __init__(self, assessment: HistoricalMembershipAssessment) -> None:
+        if not assessment.complete:
+            raise ValueError(
+                "cannot build trading eligibility policy from incomplete membership evidence"
+            )
+        self._instrument_key = assessment.instrument_key
+        self._requested = frozenset(assessment.requested_dates)
+        self._eligible = frozenset(assessment.eligible_dates)
+
+    @property
+    def instrument_key(self) -> str:
+        return self._instrument_key
+
+    def is_eligible(self, trade_date: date) -> bool:
+        if trade_date not in self._requested:
+            raise ValueError(
+                f"no point-in-time trading eligibility evidence for {trade_date}"
+            )
+        return trade_date in self._eligible
+
+
 def assess_historical_membership(
     *,
     instrument_key: str,
     trading_dates: Iterable[date],
     statuses: Iterable[HistoricalTradingStatus],
 ) -> HistoricalMembershipAssessment:
-    """Require point-in-time evidence for every requested trade date; no current-list fallback."""
+    """Require point-in-time evidence for every requested trading date."""
 
     if not instrument_key:
         raise ValueError("instrument_key is required")
