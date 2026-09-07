@@ -79,6 +79,10 @@ def _rank_value(item: CrossSectionalEvaluation, metric: RankingMetric) -> Decima
         return metrics.net_return_pct
     if metric is RankingMetric.REALIZED_MAX_DRAWDOWN_PCT:
         return -metrics.realized_max_drawdown_pct
+    if metric is RankingMetric.CLOSE_LIQUIDATION_MAX_DRAWDOWN_PCT:
+        return -metrics.close_liquidation_max_drawdown_pct
+    if metric is RankingMetric.OHLC_LOW_LIQUIDATION_STRESS_MAX_DRAWDOWN_PCT:
+        return -metrics.ohlc_low_liquidation_stress_max_drawdown_pct
     if metric is RankingMetric.PROFIT_FACTOR:
         # None is deliberately not treated as infinity: it covers both no-loss and undefined
         # cases. Callers wanting a no-loss tie-break must define another explicit metric.
