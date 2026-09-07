@@ -13,6 +13,7 @@ from .event_simulator import (
     IntradaySimulationResult,
     SessionExitResolver,
     TickSizeResolver,
+    TradingEligibilityResolver,
     simulate_long_intraday,
 )
 from .models import Exchange
@@ -100,9 +101,10 @@ def evaluate_candidate_exact(
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
     tick_size_policy: TickSizeResolver,
+    trading_eligibility_policy: TradingEligibilityResolver,
     config: IntradaySimulationConfig,
 ) -> CandidateEvaluation:
-    """Run one strategy candidate through the Decimal event-driven simulator."""
+    """Run one strategy candidate through the point-in-time Decimal simulator."""
 
     if not candidate_id:
         raise ValueError("candidate_id is required")
@@ -117,6 +119,7 @@ def evaluate_candidate_exact(
         fills=fills,
         session_policy=session_policy,
         tick_size_policy=tick_size_policy,
+        trading_eligibility_policy=trading_eligibility_policy,
         config=config,
     )
     return CandidateEvaluation(
