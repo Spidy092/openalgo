@@ -8,6 +8,7 @@ from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.event_simulator import FillAssumptions, IntradaySimulationConfig
 from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
+from equity_engine.tick_size import FixedTickSizePolicy
 from equity_engine.tournament import RankingMetric
 from equity_engine.walk_forward import make_walk_forward_windows, run_walk_forward_selection
 
@@ -22,9 +23,7 @@ def _multi_day_frame(days: int) -> pd.DataFrame:
         if trading_day.weekday() < 5:
             base = 100.0 + created
             for hhmm, value in (("09:15", base), ("09:20", base + 0.2), ("15:20", base + 0.5)):
-                timestamps.append(
-                    pd.Timestamp(f"{trading_day.date()} {hhmm}", tz="Asia/Kolkata")
-                )
+                timestamps.append(pd.Timestamp(f"{trading_day.date()} {hhmm}", tz="Asia/Kolkata"))
                 prices.append(value)
             created += 1
         trading_day += pd.Timedelta(days=1)
@@ -54,7 +53,6 @@ def test_walk_forward_windows_are_chronological_and_embargoed() -> None:
     assert len(windows) == 2
     for window in windows:
         assert max(window.train_dates) < min(window.test_dates)
-        # One observed trading day is deliberately excluded between train and test.
         all_dates = sorted(set(frame.index.date))
         train_end_idx = all_dates.index(max(window.train_dates))
         test_start_idx = all_dates.index(min(window.test_dates))
@@ -81,13 +79,11 @@ def test_walk_forward_selects_only_from_train_and_evaluates_on_test() -> None:
         fills=FillAssumptions(
             slippage_bps_per_leg=Decimal("0"),
             half_spread_bps_per_leg=Decimal("0"),
-            tick_size=Decimal("0.05"),
         ),
-        # This fixture models a non-CAS NSE cash stock. Normal continuous trading ends at
-        # 15:30, and the explicit 10-minute research buffer gives a 15:20 simulator exit.
-        session_policy=NSEEquitySessionPolicy(
-            cas_eligible=False,
-            exit_buffer_minutes=10,
+        session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
+        tick_size_policy=FixedTickSizePolicy(
+            tick_size_rupees=Decimal("0.05"),
+            source="synthetic-test",
         ),
         simulation_config=IntradaySimulationConfig(
             initial_cash=Decimal("1000"),
