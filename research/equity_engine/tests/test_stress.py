@@ -9,6 +9,7 @@ from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
 from equity_engine.strategies import first_bar_hold_baseline
 from equity_engine.stress import FrictionScenario, run_friction_stress
+from equity_engine.tick_size import FixedTickSizePolicy
 
 
 def _frame() -> pd.DataFrame:
@@ -32,6 +33,10 @@ def _frame() -> pd.DataFrame:
     )
 
 
+def _tick_policy() -> FixedTickSizePolicy:
+    return FixedTickSizePolicy(tick_size_rupees=Decimal("0.05"), source="synthetic-test")
+
+
 def test_worse_friction_cannot_improve_exact_pnl() -> None:
     frame = _frame()
     signals = first_bar_hold_baseline(frame, session_open=time(9, 15))
@@ -43,6 +48,7 @@ def test_worse_friction_cannot_improve_exact_pnl() -> None:
         exchange=Exchange.NSE,
         cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
         session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
+        tick_size_policy=_tick_policy(),
         config=IntradaySimulationConfig(initial_cash=Decimal("1000"), max_trades_per_day=1),
         scenarios=[
             FrictionScenario(
@@ -50,7 +56,6 @@ def test_worse_friction_cannot_improve_exact_pnl() -> None:
                 fills=FillAssumptions(
                     slippage_bps_per_leg=Decimal("0"),
                     half_spread_bps_per_leg=Decimal("0"),
-                    tick_size=Decimal("0.05"),
                 ),
             ),
             FrictionScenario(
@@ -58,7 +63,6 @@ def test_worse_friction_cannot_improve_exact_pnl() -> None:
                 fills=FillAssumptions(
                     slippage_bps_per_leg=Decimal("10"),
                     half_spread_bps_per_leg=Decimal("10"),
-                    tick_size=Decimal("0.05"),
                 ),
             ),
         ],
@@ -81,6 +85,7 @@ def test_stress_requires_named_explicit_scenarios() -> None:
             exchange=Exchange.NSE,
             cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
             session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
+            tick_size_policy=_tick_policy(),
             config=IntradaySimulationConfig(initial_cash=Decimal("1000"), max_trades_per_day=1),
             scenarios=[],
         )
