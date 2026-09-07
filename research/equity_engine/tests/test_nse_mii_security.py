@@ -10,6 +10,7 @@ from equity_engine.nse_mii_security import (
     NSE_MII_WEBSITE_AVAILABLE_FROM,
     NseMiiEligibilitySemantics,
     NseMiiSecurityMasterParser,
+    equity_candidate_rows,
     to_historical_trading_status,
     to_tick_size_point,
 )
@@ -113,16 +114,45 @@ def test_verified_website_source_does_not_claim_pre_2024_history() -> None:
         )
 
 
-def test_bad_isin_and_bad_bid_interval_fail_instead_of_being_repaired() -> None:
-    with pytest.raises(ValueError, match="invalid/blank ISIN"):
-        NseMiiSecurityMasterParser().parse_bytes(
-            _gzip_csv([_row(ISIN="")]),
-            filename="NSE_CM_security_07092026.csv.gz",
-        )
+def test_non_equity_row_can_be_audited_without_valid_equity_identity() -> None:
+    payload = _gzip_csv(
+        [
+            _row(
+                TckrSymb="OTHER",
+                SctySrs="BE",
+                ISIN="",
+                NewBrdLotQty="",
+                BidIntrvl="",
+            ),
+            _row(),
+        ]
+    )
+    snapshot = NseMiiSecurityMasterParser().parse_bytes(
+        payload, filename="NSE_CM_security_07092026.csv.gz"
+    )
+    assert len(snapshot.rows) == 2
+    assert snapshot.rows[0].isin is None
+    assert snapshot.rows[0].board_lot_quantity is None
+    assert snapshot.rows[0].bid_interval_raw is None
 
+    candidates = equity_candidate_rows(snapshot, semantics=_semantics())
+    assert len(candidates) == 1
+    assert candidates[0].symbol == "TEST"
+
+
+def test_in_scope_equity_with_bad_identity_fails_at_promotion_boundary() -> None:
+    snapshot = NseMiiSecurityMasterParser().parse_bytes(
+        _gzip_csv([_row(ISIN="")]),
+        filename="NSE_CM_security_07092026.csv.gz",
+    )
+    with pytest.raises(ValueError, match="invalid/blank ISIN"):
+        equity_candidate_rows(snapshot, semantics=_semantics())
+
+
+def test_malformed_nonblank_bid_interval_is_source_corruption() -> None:
     with pytest.raises(ValueError, match="invalid BidIntrvl"):
         NseMiiSecurityMasterParser().parse_bytes(
-            _gzip_csv([_row(BidIntrvl="not-a-number")]),
+            _gzip_csv([_row(SctySrs="BE", BidIntrvl="not-a-number")]),
             filename="NSE_CM_security_07092026.csv.gz",
         )
 
@@ -172,4 +202,17 @@ def test_bid_interval_conversion_requires_explicit_sourced_scale() -> None:
             row,
             bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
             scale_source="",
+        )
+
+
+def test_blank_bid_interval_cannot_be_promoted_to_tick_evidence() -> None:
+    row = NseMiiSecurityMasterParser().parse_bytes(
+        _gzip_csv([_row(SctySrs="BE", BidIntrvl="")]),
+        filename="NSE_CM_security_07092026.csv.gz",
+    ).rows[0]
+    with pytest.raises(ValueError, match="blank BidIntrvl"):
+        to_tick_size_point(
+            row,
+            bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
+            scale_source="synthetic-test-scale",
         )
