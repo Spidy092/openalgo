@@ -12,6 +12,7 @@ from .event_simulator import (
     IntradaySimulationConfig,
     IntradaySimulationResult,
     SessionExitResolver,
+    TickSizeResolver,
     simulate_long_intraday,
 )
 from .models import Exchange
@@ -98,6 +99,7 @@ def evaluate_candidate_exact(
     cost_provider: CostProvider,
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
+    tick_size_policy: TickSizeResolver,
     config: IntradaySimulationConfig,
 ) -> CandidateEvaluation:
     """Run one strategy candidate through the Decimal event-driven simulator."""
@@ -114,6 +116,7 @@ def evaluate_candidate_exact(
         cost_provider=cost_provider,
         fills=fills,
         session_policy=session_policy,
+        tick_size_policy=tick_size_policy,
         config=config,
     )
     return CandidateEvaluation(
@@ -136,8 +139,6 @@ def rank_candidates(
     if metric is RankingMetric.NET_RETURN_PCT:
         return sorted(evaluations, key=lambda item: item.metrics.net_return_pct, reverse=True)
     if metric is RankingMetric.PROFIT_FACTOR:
-        # Undefined PF means there were no realized losing trades. Do not silently treat that as
-        # infinity; place it after candidates with a defined PF and inspect sample size separately.
         return sorted(
             evaluations,
             key=lambda item: (
