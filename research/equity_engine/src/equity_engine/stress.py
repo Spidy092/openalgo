@@ -11,6 +11,7 @@ from .event_simulator import (
     IntradaySimulationConfig,
     SessionExitResolver,
     TickSizeResolver,
+    TradingEligibilityResolver,
 )
 from .models import Exchange
 from .strategies import StrategySignals
@@ -61,10 +62,15 @@ def run_friction_stress(
     cost_provider: CostProvider,
     session_policy: SessionExitResolver,
     tick_size_policy: TickSizeResolver,
+    trading_eligibility_policy: TradingEligibilityResolver,
     config: IntradaySimulationConfig,
     scenarios: list[FrictionScenario],
 ) -> StressResult:
-    """Evaluate identical signals under caller-supplied spread/slippage assumptions."""
+    """Evaluate identical signals under caller-supplied spread/slippage assumptions.
+
+    Point-in-time exchange tradability remains mandatory in every friction scenario so a
+    favorable fill assumption can never bypass a historical suspension/ineligibility date.
+    """
 
     if not scenarios:
         raise ValueError("at least one friction scenario is required")
@@ -84,6 +90,7 @@ def run_friction_stress(
             fills=scenario.fills,
             session_policy=session_policy,
             tick_size_policy=tick_size_policy,
+            trading_eligibility_policy=trading_eligibility_policy,
             config=config,
         )
         evaluations.append((scenario.name, evaluation))
