@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
+
+
+class DrawdownBasis(StrEnum):
+    REALIZED_CLOSED_TRADES = "realized_closed_trades"
+    CLOSE_LIQUIDATION = "close_liquidation"
+    OHLC_LOW_LIQUIDATION_STRESS = "ohlc_low_liquidation_stress"
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,7 @@ class ResearchEvidence:
     trade_count: int
     profit_factor: Decimal
     max_drawdown_pct: Decimal
+    drawdown_basis: DrawdownBasis
     walk_forward_windows: int
     max_cost_reconciliation_error_inr: Decimal | None
     held_out_test_present: bool
@@ -72,6 +80,11 @@ def evaluate_promotion_gate(
             "unpriced cost components remain: " + ", ".join(evidence.unpriced_cost_components)
         )
 
+    if evidence.drawdown_basis is not DrawdownBasis.OHLC_LOW_LIQUIDATION_STRESS:
+        violations.append(
+            "promotion drawdown must use OHLC-low liquidation stress; "
+            f"received {evidence.drawdown_basis.value}"
+        )
     if evidence.trade_count < thresholds.min_trades:
         violations.append(
             f"trade count {evidence.trade_count} is below required {thresholds.min_trades}"
