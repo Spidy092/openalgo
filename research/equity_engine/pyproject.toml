@@ -1,0 +1,37 @@
+[project]
+name = "openalgo-equity-research"
+version = "0.1.0"
+description = "Evidence-first NSE equity strategy research layer for OpenAlgo"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "httpx==0.28.1",
+  "numpy==2.4.4",
+  "openalgo==2.0.3",
+  "pandas==2.3.3",
+  "pyarrow==23.0.1",
+  "pydantic==2.13.4",
+  "vectorbt==1.1.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+  "pytest-timeout==2.4.0",
+  "ruff>=0.14.14",
+]
+
+[build-system]
+requires = ["setuptools>=83", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-v --timeout=30"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
