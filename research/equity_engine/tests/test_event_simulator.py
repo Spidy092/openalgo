@@ -1,4 +1,4 @@
-from datetime import date, time
+from datetime import date
 from decimal import Decimal
 
 import pandas as pd
@@ -11,6 +11,7 @@ from equity_engine.event_simulator import (
     IntradaySimulationConfig,
     simulate_long_intraday,
 )
+from equity_engine.market_sessions import NSEEquitySessionPolicy
 from equity_engine.models import Exchange
 
 
@@ -40,6 +41,16 @@ def _fills() -> FillAssumptions:
     )
 
 
+def _session_policy() -> NSEEquitySessionPolicy:
+    # Non-CAS stock: continuous session ends at 15:30. Explicit 10-minute research buffer
+    # produces a 15:20 exit cutoff for these tests.
+    return NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10)
+
+
+def _config() -> IntradaySimulationConfig:
+    return IntradaySimulationConfig(initial_cash=Decimal("1000"), max_trades_per_day=2)
+
+
 def test_signal_at_close_executes_at_next_bar_open_with_exact_costs() -> None:
     frame = _frame(
         [
@@ -61,11 +72,8 @@ def test_signal_at_close_executes_at_next_bar_open_with_exact_costs() -> None:
         exchange=Exchange.NSE,
         cost_provider=_provider(),
         fills=_fills(),
-        config=IntradaySimulationConfig(
-            initial_cash=Decimal("1000"),
-            session_exit_time=time(15, 20),
-            max_trades_per_day=2,
-        ),
+        session_policy=_session_policy(),
+        config=_config(),
     )
 
     assert len(result.trades) == 1
@@ -101,11 +109,8 @@ def test_cutoff_forces_same_day_exit() -> None:
         exchange=Exchange.NSE,
         cost_provider=_provider(),
         fills=_fills(),
-        config=IntradaySimulationConfig(
-            initial_cash=Decimal("1000"),
-            session_exit_time=time(15, 20),
-            max_trades_per_day=2,
-        ),
+        session_policy=_session_policy(),
+        config=_config(),
     )
 
     assert len(result.trades) == 1
@@ -134,11 +139,8 @@ def test_yesterdays_final_signal_is_not_executed_at_next_days_open() -> None:
         exchange=Exchange.NSE,
         cost_provider=_provider(),
         fills=_fills(),
-        config=IntradaySimulationConfig(
-            initial_cash=Decimal("1000"),
-            session_exit_time=time(15, 20),
-            max_trades_per_day=2,
-        ),
+        session_policy=_session_policy(),
+        config=_config(),
     )
 
     assert result.trades == ()
@@ -165,9 +167,6 @@ def test_incomplete_session_fails_instead_of_hiding_overnight_position() -> None
             exchange=Exchange.NSE,
             cost_provider=_provider(),
             fills=_fills(),
-            config=IntradaySimulationConfig(
-                initial_cash=Decimal("1000"),
-                session_exit_time=time(15, 20),
-                max_trades_per_day=2,
-            ),
+            session_policy=_session_policy(),
+            config=_config(),
         )
