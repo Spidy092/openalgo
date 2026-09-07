@@ -6,7 +6,12 @@ from decimal import Decimal
 import pandas as pd
 
 from .costs import CostProvider
-from .event_simulator import FillAssumptions, IntradaySimulationConfig, SessionExitResolver
+from .event_simulator import (
+    FillAssumptions,
+    IntradaySimulationConfig,
+    SessionExitResolver,
+    TickSizeResolver,
+)
 from .models import Exchange
 from .strategies import StrategySignals
 from .tournament import CandidateEvaluation, evaluate_candidate_exact
@@ -55,15 +60,11 @@ def run_friction_stress(
     exchange: Exchange,
     cost_provider: CostProvider,
     session_policy: SessionExitResolver,
+    tick_size_policy: TickSizeResolver,
     config: IntradaySimulationConfig,
     scenarios: list[FrictionScenario],
 ) -> StressResult:
-    """Evaluate identical signals under caller-supplied spread/slippage assumptions.
-
-    No friction scenario is inferred. The research experiment must provide and document each one.
-    This makes it impossible to silently switch from a realistic assumption to a favorable one
-    after seeing the result.
-    """
+    """Evaluate identical signals under caller-supplied spread/slippage assumptions."""
 
     if not scenarios:
         raise ValueError("at least one friction scenario is required")
@@ -82,6 +83,7 @@ def run_friction_stress(
             cost_provider=cost_provider,
             fills=scenario.fills,
             session_policy=session_policy,
+            tick_size_policy=tick_size_policy,
             config=config,
         )
         evaluations.append((scenario.name, evaluation))
