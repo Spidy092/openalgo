@@ -87,6 +87,19 @@ class CostQuote:
         return self.source is CostSource.BROKER_QUOTE
 
     @property
+    def total(self) -> Decimal:
+        """Cash-impacting cost total.
+
+        For an authoritative broker quote, the broker's reported total wins over the local sum
+        of components because the broker may apply component-level rounding. Components remain
+        available for audit and reconciliation.
+        """
+
+        if self.authoritative and self.broker_reported_total is not None:
+            return self.broker_reported_total
+        return self.charges.total
+
+    @property
     def reconciliation_error(self) -> Decimal | None:
         if self.broker_reported_total is None:
             return None
@@ -111,12 +124,14 @@ class RoundTripResult:
     exit: OrderSpec
     entry_charges: ChargeBreakdown
     exit_charges: ChargeBreakdown
+    entry_cost_total: Decimal
+    exit_cost_total: Decimal
     modeled_execution_friction: Decimal
     gross_pnl: Decimal
 
     @property
     def transaction_costs(self) -> Decimal:
-        return self.entry_charges.total + self.exit_charges.total
+        return self.entry_cost_total + self.exit_cost_total
 
     @property
     def net_pnl(self) -> Decimal:
