@@ -150,10 +150,10 @@ def simulate_long_intraday(
 ) -> IntradaySimulationResult:
     """Simulate long-only intraday trades with point-in-time market structure.
 
-    Signals are generated at each bar close and consumed only on the next bar. A signal from
-    the final bar of one session is never carried into the next session. Session cutoff, tick
-    size and exchange trading eligibility are resolved for each trade date. Missing eligibility
-    evidence fails through the supplied resolver instead of falling back to today's broker list.
+    Tick evidence is resolved lazily only when an exchange-eligible entry is actually evaluated.
+    This avoids demanding tick evidence on pre-listing/ineligible dates. An intraday position uses
+    its entry-date tick for its same-session exit; tick size cannot change within that position's
+    trading date in this daily reference model.
     """
 
     violations = validate_ohlcv_frame(frame)
@@ -178,9 +178,6 @@ def simulate_long_intraday(
         previous_day = previous_ts.date()
         current_day = current_ts.date()
         session_exit_time = session_policy.exit_time(current_day)
-        current_tick_size = tick_size_policy.tick_size(current_day)
-        if current_tick_size <= 0:
-            raise ValueError(f"non-positive tick size for {current_day}")
         current_open = _as_decimal(frame.iloc[i]["open"])
 
         if position is not None and position["entry_timestamp"].date() != current_day:
@@ -191,11 +188,12 @@ def simulate_long_intraday(
             should_exit_signal = previous_day == current_day and bool(exits.iloc[i - 1])
             if should_exit_cutoff or should_exit_signal:
                 reference_exit = current_open
+                exit_tick_size = position["entry_tick_size_rupees"]
                 fill_exit = _modeled_fill_price(
                     reference_exit,
                     side=Side.SELL,
                     assumptions=fills,
-                    tick_size=current_tick_size,
+                    tick_size=exit_tick_size,
                 )
                 quantity = int(position["quantity"])
                 exit_order = OrderSpec(
@@ -227,7 +225,7 @@ def simulate_long_intraday(
                         fill_entry_price=fill_entry,
                         fill_exit_price=fill_exit,
                         entry_tick_size_rupees=position["entry_tick_size_rupees"],
-                        exit_tick_size_rupees=current_tick_size,
+                        exit_tick_size_rupees=exit_tick_size,
                         entry_cost=entry_cost,
                         exit_cost=exit_quote.total,
                         gross_reference_pnl=gross_reference_pnl,
@@ -259,6 +257,10 @@ def simulate_long_intraday(
         if day_trade_count >= config.max_trades_per_day:
             rejected.append(RejectedSignal(current_ts, "daily trade limit reached"))
             continue
+
+        current_tick_size = tick_size_policy.tick_size(current_day)
+        if current_tick_size <= 0:
+            raise ValueError(f"non-positive tick size for {current_day}")
 
         reference_entry = current_open
         fill_entry = _modeled_fill_price(
