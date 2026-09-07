@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import date, time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import StrEnum
+from typing import Protocol
 
 import pandas as pd
 
@@ -13,6 +14,11 @@ from .provenance import validate_ohlcv_frame
 from .sizing import max_affordable_buy_quantity
 
 _BPS = Decimal("10000")
+
+
+class SessionExitResolver(Protocol):
+    def exit_time(self, trade_date: date) -> time:
+        """Return the explicit same-day exit cutoff for this instrument/date."""
 
 
 class ExitReason(StrEnum):
@@ -40,7 +46,6 @@ class FillAssumptions:
 @dataclass(frozen=True)
 class IntradaySimulationConfig:
     initial_cash: Decimal
-    session_exit_time: time
     max_trades_per_day: int
 
     def __post_init__(self) -> None:
@@ -126,14 +131,15 @@ def simulate_long_intraday(
     exchange: Exchange,
     cost_provider: CostProvider,
     fills: FillAssumptions,
+    session_policy: SessionExitResolver,
     config: IntradaySimulationConfig,
 ) -> IntradaySimulationResult:
     """Simulate long-only intraday trades with next-bar execution.
 
-    Signals are assumed to be generated at each bar close and are consumed only on the next bar.
-    A signal from the final bar of one session is never carried into the next session. Positions
-    must be closed at or before the configured session cutoff; incomplete session data fails
-    rather than silently creating an overnight position.
+    Signals are generated at each bar close and consumed only on the next bar. A signal from
+    the final bar of one session is never carried into the next session. The exit cutoff is
+    resolved for each trading date/instrument by `session_policy`, allowing historical market
+    structure changes (including NSE CAS) and special-session overrides to be represented.
     """
 
     violations = validate_ohlcv_frame(frame)
@@ -160,6 +166,7 @@ def simulate_long_intraday(
         current_ts = frame.index[i]
         previous_day = previous_ts.date()
         current_day = current_ts.date()
+        session_exit_time = session_policy.exit_time(current_day)
         current_open = _as_decimal(frame.iloc[i]["open"])
 
         if position is not None and position["entry_timestamp"].date() != current_day:
@@ -168,7 +175,7 @@ def simulate_long_intraday(
             )
 
         if position is not None:
-            should_exit_cutoff = current_ts.time() >= config.session_exit_time
+            should_exit_cutoff = current_ts.time() >= session_exit_time
             should_exit_signal = previous_day == current_day and bool(exits.iloc[i - 1])
             if should_exit_cutoff or should_exit_signal:
                 reference_exit = current_open
@@ -226,7 +233,7 @@ def simulate_long_intraday(
         if previous_day != current_day:
             # Do not execute yesterday's final close signal at today's open.
             continue
-        if current_ts.time() >= config.session_exit_time:
+        if current_ts.time() >= session_exit_time:
             if bool(entries.iloc[i - 1]):
                 rejected.append(RejectedSignal(current_ts, "entry at/after session cutoff"))
             continue
@@ -269,7 +276,6 @@ def simulate_long_intraday(
         entry_quote = cost_provider.quote(entry_order)
         required_cash = entry_order.notional + entry_quote.total
         if required_cash > cash:
-            # Defensive re-check in case a non-deterministic broker quote changed during sizing.
             rejected.append(RejectedSignal(current_ts, "entry quote changed beyond available cash"))
             continue
 
