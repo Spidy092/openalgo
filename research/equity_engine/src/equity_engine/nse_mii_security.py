@@ -22,9 +22,6 @@ NSE_MII_SECURITY_ARCHIVE_PATTERN = (
     "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_{ddmmyyyy}.csv.gz"
 )
 
-# Fields used by this research engine. The parser is header-driven: these exact ISO tags must
-# be present. Additional columns are preserved as an upstream schema extension and do not affect
-# field lookup. Missing required columns fail closed rather than falling back to column numbers.
 _REQUIRED_FIELDS = (
     "FinInstrmId",
     "TckrSymb",
@@ -51,10 +48,11 @@ class NseMiiSecurityRow:
     symbol: str
     series: str
     name: str
-    isin: str
-    board_lot_quantity: int
+    raw_isin: str
+    isin: str | None
+    board_lot_quantity: int | None
     security_type_flag: str
-    bid_interval_raw: Decimal
+    bid_interval_raw: Decimal | None
     call_auction_indicator: str
     permitted_to_trade_raw: str
     normal_market_status_raw: str
@@ -64,8 +62,8 @@ class NseMiiSecurityRow:
 
     @property
     def instrument_key(self) -> str:
-        """Stable internal NSE-equity identity keyed by ISIN, compatible with our Upstox join."""
-
+        if self.isin is None:
+            raise ValueError("cannot construct equity instrument key without a valid ISIN")
         return f"NSE_EQ|{self.isin}"
 
 
@@ -80,12 +78,7 @@ class NseMiiSecuritySnapshot:
 
 @dataclass(frozen=True)
 class NseMiiEligibilitySemantics:
-    """Explicit interpretation contract for raw NSE MII codes.
-
-    There are deliberately no defaults. The experiment must populate these values from an
-    effective-dated NSE specification/circular. Unknown raw values fail instead of being treated
-    as eligible or ineligible by guesswork.
-    """
+    """Explicit interpretation contract for raw NSE MII codes; there are no defaults."""
 
     normal_equity_series: frozenset[str]
     permitted_to_trade_values: frozenset[str]
@@ -124,11 +117,11 @@ class NseMiiEligibilitySemantics:
 
 
 class NseMiiSecurityMasterParser:
-    """Strict parser for a dated NSE CM MII security-master gzip CSV.
+    """Strict transport/schema parser for a dated NSE CM MII security-master gzip CSV.
 
-    This class validates transport/file structure and parses raw fields. It intentionally does not
-    decide what NSE status codes mean and does not assume the unit of `BidIntrvl`; those are
-    separate, explicit, effective-dated research decisions.
+    The master contains many instrument types. Rows are retained even when they are not usable
+    cash-equity candidates. Money-critical completeness (valid ISIN, lot, tick and market codes)
+    is enforced only when a row is promoted into the equity universe.
     """
 
     def __init__(
@@ -174,6 +167,30 @@ class NseMiiSecurityMasterParser:
             ddmmyyyy=report_date.strftime("%d%m%Y")
         )
 
+    @staticmethod
+    def _optional_positive_int(raw: str, *, field: str, row_number: int) -> int | None:
+        if raw == "":
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"row {row_number} has invalid {field}") from exc
+        if value <= 0:
+            raise ValueError(f"row {row_number} has non-positive {field}")
+        return value
+
+    @staticmethod
+    def _optional_positive_decimal(raw: str, *, field: str, row_number: int) -> Decimal | None:
+        if raw == "":
+            return None
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"row {row_number} has invalid {field}") from exc
+        if not value.is_finite() or value <= 0:
+            raise ValueError(f"row {row_number} has non-positive {field}")
+        return value
+
     def parse_bytes(self, payload: bytes, *, filename: str) -> NseMiiSecuritySnapshot:
         if not isinstance(payload, bytes) or not payload:
             raise ValueError("NSE MII security payload must be non-empty bytes")
@@ -210,7 +227,6 @@ class NseMiiSecurityMasterParser:
             )
 
         rows: list[NseMiiSecurityRow] = []
-        seen_identity: set[tuple[str, str]] = set()
         try:
             for source_row_number, raw in enumerate(reader, start=2):
                 if len(rows) >= self.maximum_rows:
@@ -221,46 +237,23 @@ class NseMiiSecurityMasterParser:
                     )
                 values = {field: (raw.get(field) or "").strip() for field in _REQUIRED_FIELDS}
 
-                isin = values["ISIN"].upper()
-                if _ISIN.fullmatch(isin) is None:
-                    raise ValueError(f"row {source_row_number} has invalid/blank ISIN")
-                series = values["SctySrs"].upper()
-                symbol = values["TckrSymb"].upper()
-                if not symbol or not series:
-                    raise ValueError(f"row {source_row_number} has blank symbol/series")
-
-                try:
-                    board_lot = int(values["NewBrdLotQty"])
-                except ValueError as exc:
-                    raise ValueError(
-                        f"row {source_row_number} has invalid NewBrdLotQty"
-                    ) from exc
-                if board_lot <= 0:
-                    raise ValueError(f"row {source_row_number} has non-positive board lot")
-
-                try:
-                    bid_interval_raw = Decimal(values["BidIntrvl"])
-                except InvalidOperation as exc:
-                    raise ValueError(
-                        f"row {source_row_number} has invalid BidIntrvl"
-                    ) from exc
-                if not bid_interval_raw.is_finite() or bid_interval_raw <= 0:
-                    raise ValueError(f"row {source_row_number} has non-positive BidIntrvl")
-
-                identity = (isin, series)
-                if identity in seen_identity:
-                    raise ValueError(
-                        f"duplicate NSE MII security identity {isin}/{series} in one snapshot"
-                    )
-                seen_identity.add(identity)
+                raw_isin = values["ISIN"].upper()
+                isin = raw_isin if _ISIN.fullmatch(raw_isin) is not None else None
+                board_lot = self._optional_positive_int(
+                    values["NewBrdLotQty"], field="NewBrdLotQty", row_number=source_row_number
+                )
+                bid_interval_raw = self._optional_positive_decimal(
+                    values["BidIntrvl"], field="BidIntrvl", row_number=source_row_number
+                )
 
                 rows.append(
                     NseMiiSecurityRow(
                         report_date=report_date,
                         financial_instrument_id=values["FinInstrmId"],
-                        symbol=symbol,
-                        series=series,
+                        symbol=values["TckrSymb"].upper(),
+                        series=values["SctySrs"].upper(),
                         name=values["FinInstrmNm"],
+                        raw_isin=raw_isin,
                         isin=isin,
                         board_lot_quantity=board_lot,
                         security_type_flag=values["SctyTpFlg"],
@@ -287,13 +280,49 @@ class NseMiiSecurityMasterParser:
         )
 
 
+def equity_candidate_rows(
+    snapshot: NseMiiSecuritySnapshot,
+    *,
+    semantics: NseMiiEligibilitySemantics,
+) -> tuple[NseMiiSecurityRow, ...]:
+    """Return only explicitly in-scope equity series, requiring complete equity identity fields."""
+
+    candidates: list[NseMiiSecurityRow] = []
+    seen: set[tuple[str, str]] = set()
+    for row in snapshot.rows:
+        if row.series not in semantics.normal_equity_series:
+            continue
+        if not row.symbol:
+            raise ValueError(f"equity row {row.source_row_number} has blank symbol")
+        if row.isin is None:
+            raise ValueError(
+                f"equity row {row.source_row_number} has invalid/blank ISIN {row.raw_isin!r}"
+            )
+        if row.board_lot_quantity is None:
+            raise ValueError(f"equity row {row.source_row_number} has blank board lot")
+        if row.bid_interval_raw is None:
+            raise ValueError(f"equity row {row.source_row_number} has blank BidIntrvl")
+        identity = (row.isin, row.series)
+        if identity in seen:
+            raise ValueError(
+                f"ambiguous duplicate equity identity {row.isin}/{row.series} in one snapshot"
+            )
+        seen.add(identity)
+        candidates.append(row)
+    return tuple(candidates)
+
+
 def to_historical_trading_status(
     row: NseMiiSecurityRow,
     *,
     semantics: NseMiiEligibilitySemantics,
 ) -> HistoricalTradingStatus:
-    """Interpret one raw NSE row only under an explicit, sourced semantics contract."""
+    """Interpret an in-scope equity row only under an explicit, sourced semantics contract."""
 
+    if row.series not in semantics.normal_equity_series:
+        raise ValueError(f"row series {row.series!r} is outside configured normal equity series")
+    if row.isin is None:
+        raise ValueError("equity row does not have a valid ISIN")
     if row.permitted_to_trade_raw not in semantics.known_permitted_to_trade_values:
         raise ValueError(
             f"unknown PrtdToTrad value {row.permitted_to_trade_raw!r} on {row.report_date}"
@@ -309,7 +338,6 @@ def to_historical_trading_status(
             f"{row.normal_market_status_raw!r} on {row.report_date}"
         )
 
-    normal_equity = row.series in semantics.normal_equity_series
     listed_or_permitted = row.permitted_to_trade_raw in semantics.permitted_to_trade_values
     normal_market_eligible = (
         row.normal_market_eligibility_raw in semantics.normal_market_eligible_values
@@ -321,7 +349,7 @@ def to_historical_trading_status(
         trade_date=row.report_date,
         instrument_key=row.instrument_key,
         listed_on_nse=listed_or_permitted,
-        normal_equity=normal_equity,
+        normal_equity=True,
         tradeable_in_normal_market=normal_market_eligible and normal_status_tradeable,
         source=f"{row.source_url} | semantics={semantics.source}",
     )
@@ -335,6 +363,8 @@ def to_tick_size_point(
 ) -> TickSizePoint:
     """Convert `BidIntrvl` only with an explicit sourced scale; no implicit paise assumption."""
 
+    if row.bid_interval_raw is None:
+        raise ValueError("cannot resolve tick size from blank BidIntrvl")
     if bid_interval_scale_rupees_per_raw_unit <= 0:
         raise ValueError("BidIntrvl scale must be positive")
     if not scale_source.strip():
