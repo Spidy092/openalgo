@@ -26,6 +26,11 @@ class TickSizeResolver(Protocol):
         """Return verified rupee tick size applicable on this trade date."""
 
 
+class TradingEligibilityResolver(Protocol):
+    def is_eligible(self, trade_date: date) -> bool:
+        """Return whether a new position may be opened on this date."""
+
+
 class ExitReason(StrEnum):
     SIGNAL = "signal"
     SESSION_CUTOFF = "session_cutoff"
@@ -140,14 +145,15 @@ def simulate_long_intraday(
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
     tick_size_policy: TickSizeResolver,
+    trading_eligibility_policy: TradingEligibilityResolver,
     config: IntradaySimulationConfig,
 ) -> IntradaySimulationResult:
-    """Simulate long-only intraday trades with next-bar execution and dated market structure.
+    """Simulate long-only intraday trades with point-in-time market structure.
 
     Signals are generated at each bar close and consumed only on the next bar. A signal from
-    the final bar of one session is never carried into the next session. Session cutoff and tick
-    size are resolved for each trade date so current market structure is not projected backward
-    across a historical dataset.
+    the final bar of one session is never carried into the next session. Session cutoff, tick
+    size and exchange trading eligibility are resolved for each trade date. Missing eligibility
+    evidence fails through the supplied resolver instead of falling back to today's broker list.
     """
 
     violations = validate_ohlcv_frame(frame)
@@ -241,6 +247,12 @@ def simulate_long_intraday(
                 rejected.append(RejectedSignal(current_ts, "entry at/after session cutoff"))
             continue
         if not bool(entries.iloc[i - 1]):
+            continue
+
+        if not trading_eligibility_policy.is_eligible(current_day):
+            rejected.append(
+                RejectedSignal(current_ts, "exchange not eligible for new entry on trade date")
+            )
             continue
 
         day_trade_count = trades_by_day.get(current_day, 0)
