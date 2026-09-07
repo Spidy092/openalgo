@@ -160,6 +160,36 @@ def _max_drawdown_pct(values: tuple[Decimal, ...], *, initial_equity: Decimal) -
     return maximum
 
 
+def _ohlc_low_stress_drawdown_pct(
+    observations: tuple[EquityObservation, ...],
+    *,
+    initial_equity: Decimal,
+) -> Decimal:
+    """Compare each bar low to equity peaks known before that low can occur.
+
+    The current bar's close is allowed to become a peak only *after* the current low stress is
+    measured. This preserves chronology without inventing the unknown ordering of high/low within
+    the bar.
+    """
+
+    if initial_equity <= 0:
+        raise ValueError("initial_equity must be positive")
+    peak_before_bar = initial_equity
+    maximum = Decimal("0")
+    for observation in observations:
+        if peak_before_bar > 0:
+            drawdown = (
+                (peak_before_bar - observation.ohlc_low_liquidation_stress_equity)
+                / peak_before_bar
+                * Decimal("100")
+            )
+            if drawdown > maximum:
+                maximum = drawdown
+        if observation.close_liquidation_equity > peak_before_bar:
+            peak_before_bar = observation.close_liquidation_equity
+    return maximum
+
+
 def liquidation_drawdown_metrics(
     observations: tuple[EquityObservation, ...],
     *,
@@ -168,14 +198,13 @@ def liquidation_drawdown_metrics(
     if not observations:
         raise ValueError("equity observations cannot be empty")
     close_values = tuple(item.close_liquidation_equity for item in observations)
-    low_values = tuple(item.ohlc_low_liquidation_stress_equity for item in observations)
     return LiquidationDrawdownMetrics(
         close_liquidation_max_drawdown_pct=_max_drawdown_pct(
             close_values,
             initial_equity=initial_equity,
         ),
-        ohlc_low_liquidation_stress_max_drawdown_pct=_max_drawdown_pct(
-            low_values,
+        ohlc_low_liquidation_stress_max_drawdown_pct=_ohlc_low_stress_drawdown_pct(
+            observations,
             initial_equity=initial_equity,
         ),
     )
