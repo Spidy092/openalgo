@@ -31,6 +31,7 @@ def _manifest(frame: pd.DataFrame) -> MarketDataManifest:
         symbol="TEST",
         timezone="Asia/Kolkata",
         interval="5m",
+        timestamp_semantics="candle_start",
         start=frame.index[0].to_pydatetime(),
         end=frame.index[-1].to_pydatetime(),
         retrieved_at=datetime(2026, 9, 7, tzinfo=timezone.utc),
