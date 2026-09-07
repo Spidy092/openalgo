@@ -9,7 +9,9 @@ dependencies = [
   # research environment isolated from OpenAlgo's production NumPy pin.
   "numpy==2.4.6",
   "openalgo==2.0.3",
-  "pandas==2.3.3",
+  # VectorBT 1.1.0 package metadata requires pandas >=3.0.3,<4.0.
+  # 3.0.3 is a non-yanked release; production OpenAlgo remains on its own pin.
+  "pandas==3.0.3",
   "pyarrow==23.0.1",
   "pydantic==2.13.4",
   "vectorbt==1.1.0",
