@@ -24,22 +24,25 @@ def shift_close_generated_signals(
     *,
     lag_bars: int,
 ) -> tuple[pd.Series, pd.Series]:
-    """Move close-generated signals to a later executable bar.
+    """Move close-generated signals to later bars without carrying across sessions.
 
-    VectorBT documentation explicitly warns that signals generated with the close price must be
-    shifted forward so execution uses a price that comes after the signal. We require at least
-    one bar of lag rather than making same-bar close execution an option.
+    Signals are assumed to be generated from information known only at each bar close. They must
+    therefore execute on a later bar. For intraday research we additionally forbid a signal from
+    the final bar of one trading day from becoming an order on the next trading day.
     """
 
     if lag_bars < 1:
         raise ValueError("close-generated signals require lag_bars >= 1")
     if not entries.index.equals(exits.index):
         raise ValueError("entry and exit signal indexes must match")
+    if entries.index.tz is None:
+        raise ValueError("intraday screening requires timezone-aware timestamps")
 
-    return (
-        entries.astype(bool).shift(lag_bars, fill_value=False),
-        exits.astype(bool).shift(lag_bars, fill_value=False),
-    )
+    dates = pd.Series(entries.index.date, index=entries.index)
+    same_session = dates.eq(dates.shift(lag_bars))
+    shifted_entries = entries.astype(bool).shift(lag_bars, fill_value=False) & same_session
+    shifted_exits = exits.astype(bool).shift(lag_bars, fill_value=False) & same_session
+    return shifted_entries, shifted_exits
 
 
 def _decimal_or_none(value: object) -> Decimal | None:
@@ -55,6 +58,7 @@ def _decimal_or_none(value: object) -> Decimal | None:
 def screen_long_signals(
     *,
     close: pd.Series,
+    execution_price: pd.Series,
     entries_at_close: pd.Series,
     exits_at_close: pd.Series,
     signal_lag_bars: int,
@@ -65,9 +69,10 @@ def screen_long_signals(
 ) -> VectorBTScreeningResult:
     """Fast candidate screening only; not an exact brokerage/P&L validator.
 
-    Fee/slippage rates are mandatory caller inputs: there are deliberately no silent defaults.
-    Strategies surviving this stage must be re-priced by the Decimal event-driven simulator and
-    broker cost reconciliation before any promotion decision.
+    `close` is the mark-to-market series. `execution_price` is a separate, explicit order-price
+    series (normally bar open for next-bar execution). Fees/slippage are mandatory caller inputs.
+    Surviving strategies must still be re-priced by the Decimal event-driven simulator and broker
+    cost reconciliation before any promotion decision.
     """
 
     if screening_cash <= 0:
@@ -78,12 +83,16 @@ def screen_long_signals(
         raise ValueError("screening_slippage_rate cannot be negative")
     if close.empty:
         raise ValueError("close series cannot be empty")
+    if not close.index.equals(execution_price.index):
+        raise ValueError("close and execution_price must share the same index")
     if not close.index.equals(entries_at_close.index) or not close.index.equals(
         exits_at_close.index
     ):
-        raise ValueError("close, entries and exits must share the same index")
-    if close.isna().any():
-        raise ValueError("close series contains missing values")
+        raise ValueError("prices, entries and exits must share the same index")
+    if close.isna().any() or execution_price.isna().any():
+        raise ValueError("price series contain missing values")
+    if (close <= 0).any() or (execution_price <= 0).any():
+        raise ValueError("price series must be positive")
 
     shifted_entries, shifted_exits = shift_close_generated_signals(
         entries_at_close,
@@ -98,6 +107,7 @@ def screen_long_signals(
         close.astype(float),
         entries=shifted_entries,
         exits=shifted_exits,
+        price=execution_price.astype(float),
         init_cash=float(screening_cash),
         direction="longonly",
         fees=float(screening_fee_rate),
