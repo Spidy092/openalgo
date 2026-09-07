@@ -21,6 +21,11 @@ class SessionExitResolver(Protocol):
         """Return the explicit same-day exit cutoff for this instrument/date."""
 
 
+class TickSizeResolver(Protocol):
+    def tick_size(self, trade_date: date) -> Decimal:
+        """Return verified rupee tick size applicable on this trade date."""
+
+
 class ExitReason(StrEnum):
     SIGNAL = "signal"
     SESSION_CUTOFF = "session_cutoff"
@@ -28,19 +33,16 @@ class ExitReason(StrEnum):
 
 @dataclass(frozen=True)
 class FillAssumptions:
-    """Explicit execution-friction assumptions; there are no defaults."""
+    """Explicit execution-friction assumptions; tick size is resolved separately by date."""
 
     slippage_bps_per_leg: Decimal
     half_spread_bps_per_leg: Decimal
-    tick_size: Decimal
 
     def __post_init__(self) -> None:
         if self.slippage_bps_per_leg < 0:
             raise ValueError("slippage_bps_per_leg cannot be negative")
         if self.half_spread_bps_per_leg < 0:
             raise ValueError("half_spread_bps_per_leg cannot be negative")
-        if self.tick_size <= 0:
-            raise ValueError("tick_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,8 @@ class TradeRecord:
     reference_exit_price: Decimal
     fill_entry_price: Decimal
     fill_exit_price: Decimal
+    entry_tick_size_rupees: Decimal
+    exit_tick_size_rupees: Decimal
     entry_cost: Decimal
     exit_cost: Decimal
     gross_reference_pnl: Decimal
@@ -103,6 +107,8 @@ def _as_decimal(value: object) -> Decimal:
 
 
 def _round_to_tick_adverse(price: Decimal, *, tick_size: Decimal, side: Side) -> Decimal:
+    if tick_size <= 0:
+        raise ValueError("resolved tick size must be positive")
     units = price / tick_size
     rounding = ROUND_CEILING if side is Side.BUY else ROUND_FLOOR
     return units.to_integral_value(rounding=rounding) * tick_size
@@ -113,13 +119,14 @@ def _modeled_fill_price(
     *,
     side: Side,
     assumptions: FillAssumptions,
+    tick_size: Decimal,
 ) -> Decimal:
     friction_bps = assumptions.slippage_bps_per_leg + assumptions.half_spread_bps_per_leg
     multiplier = Decimal("1") + (
         friction_bps / _BPS if side is Side.BUY else -friction_bps / _BPS
     )
     raw = reference_price * multiplier
-    return _round_to_tick_adverse(raw, tick_size=assumptions.tick_size, side=side)
+    return _round_to_tick_adverse(raw, tick_size=tick_size, side=side)
 
 
 def simulate_long_intraday(
@@ -132,14 +139,15 @@ def simulate_long_intraday(
     cost_provider: CostProvider,
     fills: FillAssumptions,
     session_policy: SessionExitResolver,
+    tick_size_policy: TickSizeResolver,
     config: IntradaySimulationConfig,
 ) -> IntradaySimulationResult:
-    """Simulate long-only intraday trades with next-bar execution.
+    """Simulate long-only intraday trades with next-bar execution and dated market structure.
 
     Signals are generated at each bar close and consumed only on the next bar. A signal from
-    the final bar of one session is never carried into the next session. The exit cutoff is
-    resolved for each trading date/instrument by `session_policy`, allowing historical market
-    structure changes (including NSE CAS) and special-session overrides to be represented.
+    the final bar of one session is never carried into the next session. Session cutoff and tick
+    size are resolved for each trade date so current market structure is not projected backward
+    across a historical dataset.
     """
 
     violations = validate_ohlcv_frame(frame)
@@ -147,9 +155,7 @@ def simulate_long_intraday(
         raise ValueError("invalid OHLCV frame: " + "; ".join(violations))
     if frame.index.tz is None:
         raise ValueError("intraday frame must use timezone-aware timestamps")
-    if not frame.index.equals(entries_at_close.index) or not frame.index.equals(
-        exits_at_close.index
-    ):
+    if not frame.index.equals(entries_at_close.index) or not frame.index.equals(exits_at_close.index):
         raise ValueError("frame, entries and exits must share the same index")
 
     entries = entries_at_close.astype(bool)
@@ -158,7 +164,6 @@ def simulate_long_intraday(
     trades: list[TradeRecord] = []
     rejected: list[RejectedSignal] = []
     trades_by_day: dict[object, int] = {}
-
     position: dict[str, object] | None = None
 
     for i in range(1, len(frame)):
@@ -167,12 +172,13 @@ def simulate_long_intraday(
         previous_day = previous_ts.date()
         current_day = current_ts.date()
         session_exit_time = session_policy.exit_time(current_day)
+        current_tick_size = tick_size_policy.tick_size(current_day)
+        if current_tick_size <= 0:
+            raise ValueError(f"non-positive tick size for {current_day}")
         current_open = _as_decimal(frame.iloc[i]["open"])
 
         if position is not None and position["entry_timestamp"].date() != current_day:
-            raise ValueError(
-                "simulation would carry an intraday position overnight; verify session data/cutoff"
-            )
+            raise ValueError("simulation would carry an intraday position overnight; verify session data/cutoff")
 
         if position is not None:
             should_exit_cutoff = current_ts.time() >= session_exit_time
@@ -183,6 +189,7 @@ def simulate_long_intraday(
                     reference_exit,
                     side=Side.SELL,
                     assumptions=fills,
+                    tick_size=current_tick_size,
                 )
                 quantity = int(position["quantity"])
                 exit_order = OrderSpec(
@@ -213,25 +220,21 @@ def simulate_long_intraday(
                         reference_exit_price=reference_exit,
                         fill_entry_price=fill_entry,
                         fill_exit_price=fill_exit,
+                        entry_tick_size_rupees=position["entry_tick_size_rupees"],
+                        exit_tick_size_rupees=current_tick_size,
                         entry_cost=entry_cost,
                         exit_cost=exit_quote.total,
                         gross_reference_pnl=gross_reference_pnl,
                         execution_friction_cost=execution_friction_cost,
                         net_pnl=net_pnl,
-                        exit_reason=(
-                            ExitReason.SESSION_CUTOFF
-                            if should_exit_cutoff
-                            else ExitReason.SIGNAL
-                        ),
+                        exit_reason=(ExitReason.SESSION_CUTOFF if should_exit_cutoff else ExitReason.SIGNAL),
                     )
                 )
                 position = None
 
         if position is not None:
             continue
-
         if previous_day != current_day:
-            # Do not execute yesterday's final close signal at today's open.
             continue
         if current_ts.time() >= session_exit_time:
             if bool(entries.iloc[i - 1]):
@@ -250,6 +253,7 @@ def simulate_long_intraday(
             reference_entry,
             side=Side.BUY,
             assumptions=fills,
+            tick_size=current_tick_size,
         )
         size = max_affordable_buy_quantity(
             instrument_token=instrument_token,
@@ -260,9 +264,7 @@ def simulate_long_intraday(
             cost_provider=cost_provider,
         )
         if size.quantity <= 0:
-            rejected.append(
-                RejectedSignal(current_ts, "insufficient cash after modeled entry charges")
-            )
+            rejected.append(RejectedSignal(current_ts, "insufficient cash after modeled entry charges"))
             continue
 
         entry_order = OrderSpec(
@@ -285,14 +287,13 @@ def simulate_long_intraday(
             "quantity": size.quantity,
             "reference_entry_price": reference_entry,
             "fill_entry_price": fill_entry,
+            "entry_tick_size_rupees": current_tick_size,
             "entry_cost": entry_quote.total,
         }
         trades_by_day[current_day] = day_trade_count + 1
 
     if position is not None:
-        raise ValueError(
-            "dataset ended with an open intraday position; include bars through the session cutoff"
-        )
+        raise ValueError("dataset ended with an open intraday position; include bars through the session cutoff")
 
     return IntradaySimulationResult(
         initial_cash=config.initial_cash,
