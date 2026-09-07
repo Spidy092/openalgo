@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 
 import pandas as pd
@@ -12,11 +13,15 @@ from .event_simulator import (
     IntradaySimulationConfig,
     SessionExitResolver,
     TickSizeResolver,
-    TradingEligibilityResolver,
+)
+from .historical_membership import (
+    HistoricalMembershipAssessment,
+    HistoricalTradingEligibilityPolicy,
+    filter_frame_to_eligible_dates,
 )
 from .models import Exchange
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact
-from .universe_builder import ResearchUniverseBuildResult
+from .universe_builder import ResearchUniverseAudit, ResearchUniverseBuildResult
 
 
 @dataclass(frozen=True)
@@ -27,8 +32,8 @@ class CrossSectionalInstrumentInput:
     symbol: str
     frame: pd.DataFrame
     dataset_fingerprint: str
+    historical_membership: HistoricalMembershipAssessment
     tick_size_policy: TickSizeResolver
-    trading_eligibility_policy: TradingEligibilityResolver
     session_policy: SessionExitResolver
 
 
@@ -55,7 +60,7 @@ class CrossSectionalTournamentResult:
     same `capital_per_evaluation` solely to make candidate comparisons like-for-like.
     """
 
-    selection_cutoff: object
+    selection_cutoff: date
     ranking_metric: RankingMetric
     min_trade_count: int
     capital_per_evaluation: Decimal
@@ -73,17 +78,17 @@ def _rank_value(item: CrossSectionalEvaluation, metric: RankingMetric) -> Decima
     if metric is RankingMetric.NET_RETURN_PCT:
         return metrics.net_return_pct
     if metric is RankingMetric.REALIZED_MAX_DRAWDOWN_PCT:
-        # Lower drawdown is better; negate so all ranking paths sort descending.
         return -metrics.realized_max_drawdown_pct
     if metric is RankingMetric.PROFIT_FACTOR:
-        # `None` is deliberately not treated as infinity: it covers both no-loss and undefined
-        # cases. Trade-count eligibility is handled separately, and callers wanting a no-loss
-        # tie-break must define a different explicit metric rather than receiving a hidden rule.
+        # None is deliberately not treated as infinity: it covers both no-loss and undefined
+        # cases. Callers wanting a no-loss tie-break must define another explicit metric.
         return metrics.profit_factor if metrics.profit_factor is not None else Decimal("-1")
     raise ValueError(f"unsupported ranking metric: {metric}")
 
 
-def _audit_by_instrument(universe: ResearchUniverseBuildResult) -> dict[str, object]:
+def _audit_by_instrument(
+    universe: ResearchUniverseBuildResult,
+) -> dict[str, ResearchUniverseAudit]:
     audits = {audit.instrument_key: audit for audit in universe.audits}
     if len(audits) != len(universe.audits):
         raise ValueError("universe result contains duplicate instrument audits")
@@ -101,11 +106,11 @@ def run_cross_sectional_tournament(
     fills: FillAssumptions,
     simulation_config: IntradaySimulationConfig,
 ) -> CrossSectionalTournamentResult:
-    """Evaluate every universe-approved stock × strategy pair with exact modeled costs.
+    """Evaluate every frozen-universe stock × strategy pair with exact modeled costs.
 
-    The supplied instrument set must equal the universe builder's eligible set exactly. This is a
-    hard anti-cherry-picking boundary: callers cannot remove a weak eligible stock after seeing its
-    performance, nor add a stock that failed the historical universe gate.
+    The supplied instrument set must equal the universe builder's eligible set exactly. Strategy
+    signal generation is performed only on dates that the frozen point-in-time membership marks
+    exchange-eligible, so suspended/not-yet-listed days cannot influence later indicators.
     """
 
     if min_trade_count <= 0:
@@ -130,7 +135,9 @@ def run_cross_sectional_tournament(
             details.append("missing eligible instruments: " + ", ".join(missing))
         if unexpected:
             details.append("unexpected/ineligible instruments: " + ", ".join(unexpected))
-        raise ValueError("instrument set does not match frozen research universe; " + "; ".join(details))
+        raise ValueError(
+            "instrument set does not match frozen research universe; " + "; ".join(details)
+        )
 
     audits = _audit_by_instrument(universe)
     evaluations: list[CrossSectionalEvaluation] = []
@@ -146,20 +153,39 @@ def run_cross_sectional_tournament(
             raise ValueError(
                 f"dataset fingerprint changed after universe selection for {instrument.instrument_key}"
             )
+        if instrument.historical_membership.instrument_key != instrument.instrument_key:
+            raise ValueError(
+                f"historical membership belongs to another instrument for {instrument.instrument_key}"
+            )
+        if not instrument.historical_membership.complete:
+            raise ValueError(
+                f"historical membership is incomplete for {instrument.instrument_key}"
+            )
         if instrument.frame.empty:
             raise ValueError(f"tournament frame is empty for {instrument.instrument_key}")
         if instrument.frame.index.tz is None:
             raise ValueError(f"tournament frame is timezone-naive for {instrument.instrument_key}")
         if instrument.frame.index.max().date() > universe.selection_cutoff:
             raise ValueError(
-                f"tournament lookahead detected for {instrument.instrument_key}: data extends beyond selection cutoff"
+                f"tournament lookahead detected for {instrument.instrument_key}: "
+                "data extends beyond selection cutoff"
             )
 
+        eligible_frame = filter_frame_to_eligible_dates(
+            instrument.frame,
+            instrument.historical_membership,
+        )
+        if eligible_frame.empty:
+            raise ValueError(
+                f"frozen universe instrument {instrument.instrument_key} has no eligible simulation rows"
+            )
+        trading_policy = HistoricalTradingEligibilityPolicy(instrument.historical_membership)
+
         for definition in sorted(candidates, key=lambda item: item.candidate_id):
-            signals = definition.build_signals(instrument.frame)
+            signals = definition.build_signals(eligible_frame)
             candidate = evaluate_candidate_exact(
                 candidate_id=definition.candidate_id,
-                frame=instrument.frame,
+                frame=eligible_frame,
                 signals=signals,
                 instrument_token=instrument.instrument_key,
                 exchange=Exchange.NSE,
@@ -167,7 +193,7 @@ def run_cross_sectional_tournament(
                 fills=fills,
                 session_policy=instrument.session_policy,
                 tick_size_policy=instrument.tick_size_policy,
-                trading_eligibility_policy=instrument.trading_eligibility_policy,
+                trading_eligibility_policy=trading_policy,
                 config=simulation_config,
             )
             wrapped = CrossSectionalEvaluation(
