@@ -13,6 +13,14 @@ from equity_engine.tournament import RankingMetric
 from equity_engine.walk_forward import make_walk_forward_windows, run_walk_forward_selection
 
 
+class _SyntheticEligibilityPolicy:
+    def __init__(self, ineligible_dates: set[date] | None = None) -> None:
+        self._ineligible_dates = ineligible_dates or set()
+
+    def is_eligible(self, trade_date: date) -> bool:
+        return trade_date not in self._ineligible_dates
+
+
 def _multi_day_frame(days: int) -> pd.DataFrame:
     timestamps: list[pd.Timestamp] = []
     prices: list[float] = []
@@ -85,6 +93,7 @@ def test_walk_forward_selects_only_from_train_and_evaluates_on_test() -> None:
             tick_size_rupees=Decimal("0.05"),
             source="synthetic-test",
         ),
+        trading_eligibility_policy=_SyntheticEligibilityPolicy(),
         simulation_config=IntradaySimulationConfig(
             initial_cash=Decimal("1000"),
             max_trades_per_day=1,
@@ -95,3 +104,41 @@ def test_walk_forward_selects_only_from_train_and_evaluates_on_test() -> None:
     assert all(item.selected_candidate_id == "baseline:first-bar-hold" for item in results)
     assert all(item.train_evaluation.metrics.trade_count > 0 for item in results)
     assert all(item.test_evaluation.metrics.trade_count > 0 for item in results)
+
+
+def test_walk_forward_test_window_respects_ineligible_dates() -> None:
+    frame = _multi_day_frame(6)
+    windows = make_walk_forward_windows(
+        frame,
+        train_trading_days=3,
+        test_trading_days=2,
+        step_trading_days=2,
+        embargo_trading_days=0,
+    )
+    blocked_day = windows[0].test_dates[0]
+    results = run_walk_forward_selection(
+        frame=frame,
+        windows=[windows[0]],
+        candidates=[baseline_definition(session_open=time(9, 15))],
+        ranking_metric=RankingMetric.NET_RETURN_PCT,
+        instrument_token="NSE_EQ|TEST",
+        exchange=Exchange.NSE,
+        cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
+        fills=FillAssumptions(
+            slippage_bps_per_leg=Decimal("0"),
+            half_spread_bps_per_leg=Decimal("0"),
+        ),
+        session_policy=NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=10),
+        tick_size_policy=FixedTickSizePolicy(
+            tick_size_rupees=Decimal("0.05"),
+            source="synthetic-test",
+        ),
+        trading_eligibility_policy=_SyntheticEligibilityPolicy(ineligible_dates={blocked_day}),
+        simulation_config=IntradaySimulationConfig(
+            initial_cash=Decimal("1000"),
+            max_trades_per_day=1,
+        ),
+    )
+
+    rejected = results[0].test_evaluation.simulation.rejected_signals
+    assert any(item.timestamp.date() == blocked_day and "exchange not eligible" in item.reason for item in rejected)
