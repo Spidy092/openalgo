@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from .historical_membership import HistoricalMembershipAssessment
 from .instrument_master import EquityInstrument
-from .tick_size import TickSizeVerification
+from .tick_size import TickCoverageAssessment, TickSizeVerification
 
 
 @dataclass(frozen=True)
@@ -87,44 +88,43 @@ class CorporateActionAssessment:
 
 @dataclass(frozen=True)
 class UniverseDecision:
+    instrument_key: str
     eligible: bool
     violations: tuple[str, ...]
 
 
-def _static_violations(instrument: EquityInstrument) -> list[str]:
-    violations: list[str] = []
-    if instrument.exchange != "NSE" or instrument.segment != "NSE_EQ":
-        violations.append("instrument is not NSE cash equity")
-    if instrument.instrument_type != "EQ":
-        violations.append(f"instrument_type {instrument.instrument_type!r} is not EQ")
-    if instrument.security_type != "NORMAL":
-        violations.append(f"security_type {instrument.security_type!r} is not NORMAL")
-    if not instrument.mis_eligible:
-        violations.append("instrument is not present in Upstox NSE MIS list")
-    if instrument.suspended:
-        violations.append("instrument is present in Upstox suspended list")
-    if instrument.tick_size_rupees <= 0:
-        violations.append("resolved tick size is unavailable")
-    return violations
-
-
 def evaluate_research_universe_candidate(
     *,
-    instrument: EquityInstrument,
+    instrument_key: str,
     liquidity: HistoricalLiquidityEvidence,
     corporate_actions: CorporateActionAssessment,
-    tick_size_verification: TickSizeVerification,
+    historical_membership: HistoricalMembershipAssessment,
+    tick_coverage: TickCoverageAssessment,
     thresholds: ResearchUniverseThresholds,
 ) -> UniverseDecision:
-    """Eligibility for historical strategy research; no guessed spread or tick conversion."""
+    """Historical eligibility uses only point-in-time exchange evidence, never today's broker list."""
 
-    violations = _static_violations(instrument)
+    if not instrument_key:
+        raise ValueError("instrument_key is required")
+    violations: list[str] = []
 
-    if not tick_size_verification.passed:
+    if historical_membership.instrument_key != instrument_key:
+        violations.append("historical membership belongs to a different instrument")
+    if not historical_membership.complete:
         violations.append(
-            "tick-size verification failed: "
-            f"observed ₹{tick_size_verification.observed_rupees} vs "
-            f"expected ₹{tick_size_verification.expected_rupees}"
+            "point-in-time exchange evidence is missing for: "
+            + ", ".join(day.isoformat() for day in historical_membership.missing_dates)
+        )
+    if not historical_membership.eligible_dates:
+        violations.append("instrument has no eligible historical trading dates in the research window")
+
+    eligible_dates = set(historical_membership.eligible_dates)
+    if set(tick_coverage.requested_dates) != eligible_dates:
+        violations.append("tick-size coverage was not evaluated on exactly the eligible historical dates")
+    if not tick_coverage.complete:
+        violations.append(
+            "verified historical tick size is missing for: "
+            + ", ".join(day.isoformat() for day in tick_coverage.missing_dates)
         )
 
     if not liquidity.source_complete:
@@ -151,22 +151,51 @@ def evaluate_research_universe_candidate(
             + ", ".join(corporate_actions.blocking_events)
         )
 
-    return UniverseDecision(eligible=not violations, violations=tuple(violations))
+    return UniverseDecision(
+        instrument_key=instrument_key,
+        eligible=not violations,
+        violations=tuple(violations),
+    )
 
 
 def evaluate_live_universe_candidate(
     *,
     research_decision: UniverseDecision,
+    current_instrument: EquityInstrument,
+    current_tick_verification: TickSizeVerification,
     spread: LiveSpreadEvidence,
     thresholds: LiveUniverseThresholds,
 ) -> UniverseDecision:
+    """Add today's broker eligibility and measured spread only after historical research passes."""
+
     violations = list(research_decision.violations)
-    if not research_decision.eligible and not violations:
-        violations.append("research universe decision did not pass")
+    if current_instrument.instrument_key != research_decision.instrument_key:
+        violations.append("current broker instrument does not match research instrument")
+    if current_instrument.exchange != "NSE" or current_instrument.segment != "NSE_EQ":
+        violations.append("current instrument is not NSE cash equity")
+    if current_instrument.instrument_type != "EQ":
+        violations.append(f"current instrument_type {current_instrument.instrument_type!r} is not EQ")
+    if current_instrument.security_type != "NORMAL":
+        violations.append(f"current security_type {current_instrument.security_type!r} is not NORMAL")
+    if not current_instrument.mis_eligible:
+        violations.append("instrument is not present in current Upstox NSE MIS list")
+    if current_instrument.suspended:
+        violations.append("instrument is present in current Upstox suspended list")
+    if not current_tick_verification.passed:
+        violations.append(
+            "current tick-size verification failed: "
+            f"observed ₹{current_tick_verification.observed_rupees} vs "
+            f"expected ₹{current_tick_verification.expected_rupees}"
+        )
     if not spread.source_complete:
         violations.append("live spread evidence is incomplete")
     if spread.spread_observations < thresholds.min_spread_observations:
         violations.append("insufficient live spread observations")
     if spread.median_spread_bps > thresholds.max_median_spread_bps:
         violations.append("median bid/ask spread exceeds allowed threshold")
-    return UniverseDecision(eligible=not violations, violations=tuple(violations))
+
+    return UniverseDecision(
+        instrument_key=research_decision.instrument_key,
+        eligible=not violations,
+        violations=tuple(violations),
+    )
