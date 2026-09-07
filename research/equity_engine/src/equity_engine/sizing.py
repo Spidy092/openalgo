@@ -65,13 +65,13 @@ def max_affordable_buy_quantity(
             price=price,
         )
         quote = cost_provider.quote(order)
-        required = order.notional + quote.charges.total
+        required = order.notional + quote.total
 
         if required <= cash_limit:
             best = PositionSize(
                 quantity=quantity,
                 notional=order.notional,
-                entry_charges=quote.charges.total,
+                entry_charges=quote.total,
                 cash_required=required,
                 cash_remaining=cash_limit - required,
             )
