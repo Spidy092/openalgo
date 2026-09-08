@@ -24,6 +24,43 @@ Research pipeline:
 10. Reconcile estimated transaction costs against the broker's authoritative Brokerage Details API.
 11. Require explicit human approval before enabling any live capital.
 
+## Historical batch-data workflow
+
+The first exact point-in-time research boundary is `2024-07-01` through `2026-07-31`. NSE CM semantics before 2024-07-01 are not projected backward, and the August-2026 Closing Auction Session regime is kept outside this first normal-session batch.
+
+Build the dated NSE universe:
+
+```bash
+python scripts/nse_universe_batch.py \
+  --start 2024-07-01 \
+  --end 2026-07-31 \
+  --output-dir data/nse_universe_batch
+```
+
+The batch uses sourced NSE Capital Market holiday calendars, excludes explicitly identified Muhurat/special sessions from the normal-session research pass, caches every raw `NSE_CM_security_DDMMYYYY.csv.gz`, writes a SHA-256 sidecar, materializes one dated Parquet universe per session, and writes `nse_universe_manifest.json`. A missing snapshot on a declared trading date, cache hash mismatch, unknown schema/code, or unresolved eligible duplicate fails closed. Re-running resumes from verified cache. `--refresh-existing` re-downloads cached dates only to verify that the archive payload has not changed; a differing payload is never silently overwritten.
+
+Plan the full 5-minute Upstox acquisition without downloading it:
+
+```bash
+python scripts/upstox_history_batch.py \
+  --universe-manifest data/nse_universe_batch/nse_universe_manifest.json
+```
+
+This reports the full-universe candidate count, estimated Upstox request count, estimated rows/storage, and explicitly reports that the ₹1,000 affordability prefilter has not yet been applied. NSE reference masters do not contain historical market prices, so the program refuses to infer affordability from them.
+
+Actual 5-minute acquisition is deliberately blocked until a separate point-in-time affordability/liquidity step produces an explicit candidate JSON file. Execution requires both `--candidate-file` and `--prefilter-evidence`; it reads `UPSTOX_ACCESS_TOKEN` from the environment, rate-limits/retries transient market-data requests, fingerprints every dataset, saves Parquet + manifest, resumes verified artifacts, and never writes the token to artifacts.
+
+Example candidate-file execution after that prefilter exists:
+
+```bash
+python scripts/upstox_history_batch.py \
+  --candidate-file data/candidates.json \
+  --prefilter-evidence data/candidates.audit.json \
+  --execute
+```
+
+Neither batch CLI contains a live-order path.
+
 ## Two independent research tracks
 
 ### Intraday
@@ -89,48 +126,6 @@ Every experiment must record at least:
 - dataset fingerprint
 
 Do not silently forward-fill missing market bars.
-
-## Historical NSE acquisition
-
-The production reference-data path starts at **2024-07-01**, the verified NSE Master Data v1.5
-semantics boundary, and initially ends at **2026-07-31**. August 2026 CAS behavior is intentionally
-outside this run and requires a separate effective-dated validation.
-
-The resumable batch command downloads only NSE cash-market trading dates, caches and hashes each
-official `NSE_CM_security_DDMMYYYY.csv.gz` payload, applies the strict parser and dated semantics,
-and writes one auditable daily JSON plus a compact date-indexed manifest:
-
-```bash
-python scripts/nse_universe_batch.py \
-  --start 2024-07-01 \
-  --end 2026-07-31 \
-  --output-dir data/nse_universe \
-  --affordability-price-file data/affordability_prices.json \
-  --dry-run
-```
-
-The optional price file is caller-supplied evidence used only to avoid scheduling unaffordable
-Upstox downloads. Without it, the fail-closed manifest schedules zero candidates and reports the
-number of eligible instruments whose affordability remains unknown rather than guessing. A price
-file is a JSON object keyed by `instrument_key`, for example:
-`{"NSE_EQ|INE001A01036": "100.00"}`.
-
-After reviewing that report, the authenticated candle stage uses the same manifest and never
-schedules an instrument that is absent from the point-in-time eligible universe or fails the ₹1,000
-screen:
-
-```bash
-export UPSTOX_ACCESS_TOKEN
-python scripts/upstox_history_batch.py \
-  --universe-manifest data/nse_universe/nse_universe_manifest.json \
-  --price-file data/affordability_prices.json \
-  --output-dir data/upstox_history \
-  --dry-run
-```
-
-Remove `--dry-run` only after reviewing the candidate/request report. Candle datasets are saved as
-Parquet with a per-instrument manifest and SHA-256 fingerprint. Both stages are read-only with
-respect to the broker and carry an explicit `live_orders_called: false` marker.
 
 ## Anti-overfitting policy
 

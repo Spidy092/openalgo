@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
-from equity_engine.nse_batch import (
-    NseBatchAcquisitionError,
-    NseHistoricalUniverseBatch,
-    load_affordability_prices,
+from equity_engine.nse_batch_universe import NseBatchUniverseBuilder
+from equity_engine.nse_calendar import nse_cm_normal_session_calendar
+from equity_engine.nse_semantics import (
+    EffectiveDatedNseCmSemanticsPolicy,
+    nse_cm_master_data_v15_semantics,
 )
 
 
@@ -23,64 +24,61 @@ def _parse_date(value: str) -> date:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Acquire official NSE CM MII snapshots and materialize a resumable point-in-time "
-            "NSE_EQ universe."
+            "Build a cached point-in-time NSE CM equity universe across sourced normal-session dates."
         )
     )
     parser.add_argument("--start", type=_parse_date, default=date(2024, 7, 1))
     parser.add_argument("--end", type=_parse_date, default=date(2026, 7, 31))
-    parser.add_argument("--output-dir", default="data/nse_universe")
-    parser.add_argument("--affordability-price-file", type=Path)
-    parser.add_argument("--cash-limit", type=Decimal, default=Decimal(1000))
-    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--output-dir", default="data/nse_universe_batch")
     parser.add_argument(
-        "--dry-run",
+        "--refresh-existing",
         action="store_true",
-        help="print the date/screen/request report; no broker or order endpoint is called",
+        help="re-download cached dates only to verify the archive payload has not changed",
     )
     args = parser.parse_args()
 
-    prices = None
-    price_digest = None
-    if args.affordability_price_file is not None:
-        prices, price_digest = load_affordability_prices(args.affordability_price_file)
-
-    batch = NseHistoricalUniverseBatch(output_dir=Path(args.output_dir))
-    try:
-        result = batch.run(
-            start=args.start,
-            end=args.end,
-            resume=args.resume,
-            refresh=args.refresh,
-            affordability_prices=prices,
-            affordability_price_file_sha256=price_digest,
-            cash_limit=args.cash_limit,
+    if args.start < date(2024, 7, 1):
+        parser.error("exact NSE CM semantics are intentionally bounded to 2024-07-01 or later")
+    if args.end > date(2026, 7, 31):
+        parser.error(
+            "initial batch is capped at 2026-07-31; Aug-2026 CAS regime is validated separately"
         )
-    except NseBatchAcquisitionError as exc:
-        print(json.dumps({"status": "failed", "manifest": str(exc.manifest_path)}, indent=2))
-        return 2
 
-    report = dict(result.manifest)
-    report["status"] = "dry_run_complete" if args.dry_run else "complete"
-    report["report"] = {
-        "trading_dates_found": len(report["trading_dates"]),
-        "snapshots_available": report["completed_dates"],
-        "unique_instruments": report["dry_run_screen"]["unique_eligible_instruments"],
-        "eligible_counts_by_date": {
-            key: value.get("eligible_records", 0)
-            for key, value in report["dates"].items()
-            if value.get("status") == "complete"
-        },
-        "candidate_count_after_1000_rupee_affordability_filter": report["dry_run_screen"][
-            "candidate_count_after_affordability_filter"
+    calendar = nse_cm_normal_session_calendar(start=args.start, end=args.end)
+    policy = EffectiveDatedNseCmSemanticsPolicy([nse_cm_master_data_v15_semantics()])
+    result = NseBatchUniverseBuilder(
+        output_dir=Path(args.output_dir),
+        semantics_policy=policy,
+    ).build(
+        calendar=calendar,
+        start=args.start,
+        end=args.end,
+        refresh_existing=args.refresh_existing,
+    )
+
+    output = {
+        "status": "success" if result.passed else "failed",
+        "start": result.start.isoformat(),
+        "end": result.end.isoformat(),
+        "trading_dates_found": len(result.normal_trading_dates),
+        "completed_snapshots": len(result.days),
+        "failed_snapshots": len(result.failures),
+        "holiday_dates_excluded": len(result.holiday_dates),
+        "special_session_dates_excluded": [
+            day.isoformat() for day in result.excluded_special_session_dates
         ],
-        "estimated_api_request_count": report["dry_run_screen"]["estimated_api_request_count_5m"],
-        "estimated_storage_bytes": report["dry_run_screen"]["estimated_storage_bytes"],
+        "unique_instruments": result.unique_instruments,
+        "unique_eligible_instruments": result.unique_eligible_instruments,
+        "manifest": result.manifest_path,
+        "failures": [asdict(item) for item in result.failures],
+        "next_gate": (
+            "plan 5-minute Upstox acquisition; full execution still requires an explicit "
+            "historical affordability/liquidity prefilter candidate file"
+        ),
         "live_orders_called": False,
     }
-    print(json.dumps(report, indent=2, sort_keys=True, default=str))
-    return 0
+    print(json.dumps(output, indent=2, default=str))
+    return 0 if result.passed else 1
 
 
 if __name__ == "__main__":
