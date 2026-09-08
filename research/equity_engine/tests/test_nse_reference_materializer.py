@@ -41,49 +41,51 @@ def _semantics() -> NseMiiEligibilitySemantics:
     )
 
 
-def _snapshot(day: date, *, include_target: bool = True, status: str = "2", tick: str = "5"):
+def _target_row(
+    *,
+    symbol: str = "TEST",
+    isin: str = "INE001A01036",
+    financial_instrument_id: str = "1594",
+    permitted: str = "0",
+    status: str = "2",
+    eligibility: str = "1",
+    tick: str = "5",
+) -> dict[str, str]:
+    return {
+        "FinInstrmId": financial_instrument_id,
+        "TckrSymb": symbol,
+        "SctySrs": "EQ",
+        "FinInstrmNm": f"{symbol} LIMITED",
+        "ISIN": isin,
+        "NewBrdLotQty": "1",
+        "SctyTpFlg": "0",
+        "BidIntrvl": tick,
+        "CallAuctnInd": "1",
+        "PrtdToTrad": permitted,
+        "SctyStsNrmlMkt": status,
+        "ElgbltyNrmlMkt": eligibility,
+    }
+
+
+def _snapshot_rows(day: date, rows: list[dict[str, str]]):
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=_HEADER, lineterminator="\n")
     writer.writeheader()
-    if include_target:
-        writer.writerow(
-            {
-                "FinInstrmId": "1594",
-                "TckrSymb": "TEST",
-                "SctySrs": "EQ",
-                "FinInstrmNm": "TEST LIMITED",
-                "ISIN": "INE001A01036",
-                "NewBrdLotQty": "1",
-                "SctyTpFlg": "0",
-                "BidIntrvl": tick,
-                "CallAuctnInd": "1",
-                "PrtdToTrad": "0",
-                "SctyStsNrmlMkt": status,
-                "ElgbltyNrmlMkt": "1",
-            }
-        )
-    else:
-        writer.writerow(
-            {
-                "FinInstrmId": "9999",
-                "TckrSymb": "OTHER",
-                "SctySrs": "EQ",
-                "FinInstrmNm": "OTHER LIMITED",
-                "ISIN": "INE002A01034",
-                "NewBrdLotQty": "1",
-                "SctyTpFlg": "0",
-                "BidIntrvl": "5",
-                "CallAuctnInd": "1",
-                "PrtdToTrad": "0",
-                "SctyStsNrmlMkt": "2",
-                "ElgbltyNrmlMkt": "1",
-            }
-        )
+    writer.writerows(rows)
     payload = gzip.compress(output.getvalue().encode("utf-8"))
     return NseMiiSecurityMasterParser().parse_bytes(
         payload,
         filename=f"NSE_CM_security_{day.strftime('%d%m%Y')}.csv.gz",
     )
+
+
+def _snapshot(day: date, *, include_target: bool = True, status: str = "2", tick: str = "5"):
+    rows = (
+        [_target_row(status=status, tick=tick)]
+        if include_target
+        else [_target_row(symbol="OTHER", isin="INE002A01034")]
+    )
+    return _snapshot_rows(day, rows)
 
 
 def test_existing_snapshot_with_absent_isin_is_explicitly_ineligible_not_missing() -> None:
@@ -165,6 +167,89 @@ def test_unknown_status_on_present_target_row_fails_materialization() -> None:
             isin="INE001A01036",
             trading_dates=[d1],
             snapshots=[_snapshot(d1, status="99")],
+            semantics=_semantics(),
+            bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
+            scale_source="synthetic-test-scale",
+        )
+
+
+def test_reference_accepts_two_ineligible_duplicate_eq_rows_and_preserves_audit() -> None:
+    day = date(2026, 9, 7)
+    evidence = materialize_nse_historical_reference(
+        isin="INE287A01015",
+        trading_dates=[day],
+        snapshots=[
+            _snapshot_rows(
+                day,
+                [
+                    _target_row(
+                        symbol="BECREL",
+                        isin="INE287A01015",
+                        financial_instrument_id="19384",
+                        permitted="1",
+                        status="3",
+                        eligibility="0",
+                    ),
+                    _target_row(
+                        symbol="BESTCROMP",
+                        isin="INE287A01015",
+                        financial_instrument_id="410",
+                        permitted="1",
+                        status="1",
+                        eligibility="0",
+                    ),
+                ],
+            )
+        ],
+        semantics=_semantics(),
+        bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
+        scale_source="synthetic-test-scale",
+    )
+
+    assert evidence.membership.ineligible_dates == (day,)
+    assert evidence.membership.eligible_dates == ()
+    assert [row.symbol for row in evidence.rejected_duplicate_rows] == ["BESTCROMP"]
+    assert evidence.statuses[0].instrument_key == "NSE_EQ|INE287A01015"
+
+
+def test_reference_selects_unique_eligible_duplicate_row() -> None:
+    day = date(2026, 9, 7)
+    evidence = materialize_nse_historical_reference(
+        isin="INE001A01036",
+        trading_dates=[day],
+        snapshots=[
+            _snapshot_rows(
+                day,
+                [
+                    _target_row(symbol="BLOCKED", eligibility="0"),
+                    _target_row(symbol="OPEN", financial_instrument_id="410"),
+                ],
+            )
+        ],
+        semantics=_semantics(),
+        bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
+        scale_source="synthetic-test-scale",
+    )
+
+    assert evidence.membership.eligible_dates == (day,)
+    assert evidence.rejected_duplicate_rows[0].symbol == "BLOCKED"
+
+
+def test_reference_still_rejects_two_eligible_duplicate_rows() -> None:
+    day = date(2026, 9, 7)
+    with pytest.raises(ValueError, match="duplicate normal-equity instrument"):
+        materialize_nse_historical_reference(
+            isin="INE001A01036",
+            trading_dates=[day],
+            snapshots=[
+                _snapshot_rows(
+                    day,
+                    [
+                        _target_row(symbol="ONE"),
+                        _target_row(symbol="TWO", financial_instrument_id="410"),
+                    ],
+                )
+            ],
             semantics=_semantics(),
             bid_interval_scale_rupees_per_raw_unit=Decimal("0.01"),
             scale_source="synthetic-test-scale",

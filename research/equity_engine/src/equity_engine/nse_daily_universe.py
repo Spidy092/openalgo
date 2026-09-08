@@ -5,7 +5,11 @@ from datetime import date
 from decimal import Decimal
 
 from .historical_membership import HistoricalTradingStatus
-from .nse_mii_security import NseMiiSecurityRow, NseMiiSecuritySnapshot
+from .nse_mii_security import (
+    NseMiiSecurityRow,
+    NseMiiSecuritySnapshot,
+    resolve_nse_equity_rows,
+)
 from .nse_semantics import (
     EffectiveDatedNseCmSemanticsPolicy,
     interpret_nse_mii_equity_row,
@@ -44,6 +48,7 @@ class NseDailyEquityUniverse:
     snapshot_sha256: str
     semantics_source: str
     records: tuple[NseDailyEquityUniverseRecord, ...]
+    rejected_duplicate_rows: tuple[NseMiiSecurityRow, ...] = ()
 
     @property
     def eligible_records(self) -> tuple[NseDailyEquityUniverseRecord, ...]:
@@ -82,7 +87,8 @@ def materialize_nse_daily_equity_universe(
 
     semantics = semantics_policy.resolve(snapshot.report_date)
     records: list[NseDailyEquityUniverseRecord] = []
-    seen_instruments: set[str] = set()
+    rejected_duplicate_rows: list[NseMiiSecurityRow] = []
+    rows_by_instrument: dict[str, list[NseMiiSecurityRow]] = {}
 
     for row in snapshot.rows:
         if row.series not in semantics.normal_equity_series:
@@ -92,14 +98,19 @@ def materialize_nse_daily_equity_universe(
         if row.is_placeholder:
             continue
         _validate_equity_row(row)
-        status = interpret_nse_mii_equity_row(row, semantics=semantics)
-        tick_point = tick_point_from_nse_mii_price_field(row, semantics=semantics)
         instrument_key = row.instrument_key
-        if instrument_key in seen_instruments:
-            raise ValueError(
-                f"duplicate normal-equity instrument {instrument_key} in snapshot {snapshot.report_date}"
-            )
-        seen_instruments.add(instrument_key)
+        rows_by_instrument.setdefault(instrument_key, []).append(row)
+
+    for rows in rows_by_instrument.values():
+        resolution = resolve_nse_equity_rows(
+            rows,
+            status_resolver=lambda row: interpret_nse_mii_equity_row(row, semantics=semantics),
+        )
+        rejected_duplicate_rows.extend(resolution.rejected_duplicate_rows)
+        row = resolution.selected_row
+        instrument_key = row.instrument_key
+        status = resolution.selected_status
+        tick_point = tick_point_from_nse_mii_price_field(row, semantics=semantics)
         records.append(
             NseDailyEquityUniverseRecord(
                 report_date=snapshot.report_date,
@@ -132,4 +143,5 @@ def materialize_nse_daily_equity_universe(
         snapshot_sha256=snapshot.payload_sha256,
         semantics_source=semantics.source,
         records=tuple(records),
+        rejected_duplicate_rows=tuple(rejected_duplicate_rows),
     )

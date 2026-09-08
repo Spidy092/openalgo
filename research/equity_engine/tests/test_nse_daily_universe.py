@@ -123,6 +123,55 @@ def test_daily_universe_still_rejects_nonplaceholder_invalid_equity_isin() -> No
         )
 
 
+def test_daily_universe_accepts_two_ineligible_duplicate_eq_rows_and_preserves_audit() -> None:
+    snapshot = _snapshot(
+        [
+            _row(
+                symbol="BECREL",
+                isin="INE287A01015",
+                status="3",
+                eligibility="0",
+            ),
+            _row(
+                symbol="BESTCROMP",
+                isin="INE287A01015",
+                status="1",
+                eligibility="0",
+            ),
+        ],
+        day=date(2026, 9, 7),
+    )
+
+    universe = materialize_nse_daily_equity_universe(
+        snapshot=snapshot,
+        semantics_policy=_policy(),
+    )
+
+    assert [record.symbol for record in universe.eligible_records] == []
+    assert [record.symbol for record in universe.ineligible_records] == ["BECREL"]
+    assert [row.symbol for row in universe.rejected_duplicate_rows] == ["BESTCROMP"]
+    assert universe.records[0].instrument_key == "NSE_EQ|INE287A01015"
+
+
+def test_daily_universe_selects_unique_eligible_duplicate_row() -> None:
+    snapshot = _snapshot(
+        [
+            _row(symbol="BLOCKED", isin="INE001A01036", eligibility="0"),
+            _row(symbol="OPEN", isin="INE001A01036"),
+        ]
+    )
+
+    universe = materialize_nse_daily_equity_universe(
+        snapshot=snapshot,
+        semantics_policy=_policy(),
+    )
+
+    assert [record.symbol for record in universe.eligible_records] == ["OPEN"]
+    assert [record.symbol for record in universe.records] == ["OPEN"]
+    assert universe.records[0].instrument_key == f"NSE_EQ|{universe.records[0].isin}"
+    assert [row.symbol for row in universe.rejected_duplicate_rows] == ["BLOCKED"]
+
+
 def test_daily_universe_refuses_semantics_before_verified_boundary() -> None:
     snapshot = _snapshot(
         [_row(symbol="TEST", isin="INE001A01036")],
@@ -146,7 +195,7 @@ def test_unknown_code_blocks_entire_daily_universe_instead_of_silently_dropping_
         )
 
 
-def test_duplicate_isin_in_normal_equity_scope_is_ambiguous() -> None:
+def test_daily_universe_still_rejects_two_eligible_duplicate_eq_rows() -> None:
     snapshot = _snapshot(
         [
             _row(symbol="ONE", isin="INE001A01036"),

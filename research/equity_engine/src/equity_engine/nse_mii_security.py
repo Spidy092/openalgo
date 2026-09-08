@@ -8,7 +8,7 @@ import gzip
 import hashlib
 import io
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .historical_membership import HistoricalTradingStatus
 from .tick_size import TickSizePoint
@@ -81,6 +81,15 @@ class NseMiiSecuritySnapshot:
     payload_sha256: str
     header: tuple[str, ...]
     rows: tuple[NseMiiSecurityRow, ...]
+
+
+@dataclass(frozen=True)
+class NseEquityRowResolution:
+    """Eligibility-aware selection plus source rows rejected as duplicates."""
+
+    selected_row: NseMiiSecurityRow
+    selected_status: HistoricalTradingStatus
+    rejected_duplicate_rows: tuple[NseMiiSecurityRow, ...]
 
 
 @dataclass(frozen=True)
@@ -321,6 +330,49 @@ def equity_candidate_rows(
         seen.add(identity)
         candidates.append(row)
     return tuple(candidates)
+
+
+def resolve_nse_equity_rows(
+    rows: Iterable[NseMiiSecurityRow],
+    *,
+    status_resolver: Callable[[NseMiiSecurityRow], HistoricalTradingStatus],
+) -> NseEquityRowResolution:
+    """Resolve duplicate EQ rows without choosing between multiple eligible rows.
+
+    A dated instrument with no eligible rows is represented by the earliest source row as its
+    canonical ineligible record. That representative is only a stable carrier for the shared
+    identity/date and audit fields; every other duplicate remains in rejected_duplicate_rows.
+    """
+
+    candidates = tuple(rows)
+    if not candidates:
+        raise ValueError("at least one NSE normal-equity row is required for resolution")
+
+    evaluated = tuple((row, status_resolver(row)) for row in candidates)
+    eligible = tuple(item for item in evaluated if item[1].eligible)
+    if len(eligible) > 1:
+        instrument_key = candidates[0].instrument_key
+        report_date = candidates[0].report_date
+        details = ", ".join(
+            f"row={row.source_row_number}/symbol={row.symbol}/id={row.financial_instrument_id}"
+            for row, _ in eligible
+        )
+        raise ValueError(
+            f"duplicate normal-equity instrument {instrument_key} on {report_date}: "
+            f"multiple eligible rows ({details})"
+        )
+
+    selected = eligible[0] if eligible else min(
+        evaluated,
+        key=lambda item: item[0].source_row_number,
+    )
+    selected_row, selected_status = selected
+    rejected = tuple(row for row, _ in evaluated if row is not selected_row)
+    return NseEquityRowResolution(
+        selected_row=selected_row,
+        selected_status=selected_status,
+        rejected_duplicate_rows=rejected,
+    )
 
 
 def to_historical_trading_status(

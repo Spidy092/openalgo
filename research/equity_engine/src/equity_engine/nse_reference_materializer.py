@@ -15,6 +15,7 @@ from .nse_mii_security import (
     NseMiiEligibilitySemantics,
     NseMiiSecurityRow,
     NseMiiSecuritySnapshot,
+    resolve_nse_equity_rows,
     to_historical_trading_status,
     to_tick_size_point,
 )
@@ -34,6 +35,7 @@ class NseHistoricalReferenceEvidence:
     statuses: tuple[HistoricalTradingStatus, ...]
     tick_points: tuple[TickSizePoint, ...]
     snapshot_hashes: tuple[tuple[date, str], ...]
+    rejected_duplicate_rows: tuple[NseMiiSecurityRow, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -49,7 +51,11 @@ def _matching_equity_rows(
     return tuple(
         row
         for row in snapshot.rows
-        if row.isin == isin and row.series in semantics.normal_equity_series
+        if (
+            row.isin == isin
+            and row.series in semantics.normal_equity_series
+            and not row.is_placeholder
+        )
     )
 
 
@@ -91,6 +97,7 @@ def materialize_nse_historical_reference(
     statuses: list[HistoricalTradingStatus] = []
     tick_points: list[TickSizePoint] = []
     hashes: list[tuple[date, str]] = []
+    rejected_duplicate_rows: list[NseMiiSecurityRow] = []
 
     for trade_date in requested:
         snapshot = by_date.get(trade_date)
@@ -102,15 +109,6 @@ def materialize_nse_historical_reference(
             isin=normalized_isin,
             semantics=semantics,
         )
-        if len(matches) > 1:
-            details = ", ".join(
-                f"row={row.source_row_number}/series={row.series}/id={row.financial_instrument_id}"
-                for row in matches
-            )
-            raise ValueError(
-                f"ambiguous NSE normal-equity rows for {normalized_isin} on {trade_date}: {details}"
-            )
-
         if not matches:
             statuses.append(
                 HistoricalTradingStatus(
@@ -127,13 +125,20 @@ def materialize_nse_historical_reference(
             )
             continue
 
-        row = matches[0]
-        if row.isin is None or row.board_lot_quantity is None or row.bid_interval_raw is None:
-            raise ValueError(
-                f"in-scope NSE equity row is structurally incomplete on {trade_date} "
-                f"(source row {row.source_row_number})"
-            )
-        statuses.append(to_historical_trading_status(row, semantics=semantics))
+        for row in matches:
+            if row.isin is None or row.board_lot_quantity is None or row.bid_interval_raw is None:
+                raise ValueError(
+                    f"in-scope NSE equity row is structurally incomplete on {trade_date} "
+                    f"(source row {row.source_row_number})"
+                )
+
+        resolution = resolve_nse_equity_rows(
+            matches,
+            status_resolver=lambda row: to_historical_trading_status(row, semantics=semantics),
+        )
+        rejected_duplicate_rows.extend(resolution.rejected_duplicate_rows)
+        row = resolution.selected_row
+        statuses.append(resolution.selected_status)
         tick_points.append(
             to_tick_size_point(
                 row,
@@ -155,4 +160,5 @@ def materialize_nse_historical_reference(
         statuses=tuple(statuses),
         tick_points=tuple(tick_points),
         snapshot_hashes=tuple(hashes),
+        rejected_duplicate_rows=tuple(rejected_duplicate_rows),
     )
