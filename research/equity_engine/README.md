@@ -90,6 +90,48 @@ Every experiment must record at least:
 
 Do not silently forward-fill missing market bars.
 
+## Historical NSE acquisition
+
+The production reference-data path starts at **2024-07-01**, the verified NSE Master Data v1.5
+semantics boundary, and initially ends at **2026-07-31**. August 2026 CAS behavior is intentionally
+outside this run and requires a separate effective-dated validation.
+
+The resumable batch command downloads only NSE cash-market trading dates, caches and hashes each
+official `NSE_CM_security_DDMMYYYY.csv.gz` payload, applies the strict parser and dated semantics,
+and writes one auditable daily JSON plus a compact date-indexed manifest:
+
+```bash
+python scripts/nse_universe_batch.py \
+  --start 2024-07-01 \
+  --end 2026-07-31 \
+  --output-dir data/nse_universe \
+  --affordability-price-file data/affordability_prices.json \
+  --dry-run
+```
+
+The optional price file is caller-supplied evidence used only to avoid scheduling unaffordable
+Upstox downloads. Without it, the fail-closed manifest schedules zero candidates and reports the
+number of eligible instruments whose affordability remains unknown rather than guessing. A price
+file is a JSON object keyed by `instrument_key`, for example:
+`{"NSE_EQ|INE001A01036": "100.00"}`.
+
+After reviewing that report, the authenticated candle stage uses the same manifest and never
+schedules an instrument that is absent from the point-in-time eligible universe or fails the ₹1,000
+screen:
+
+```bash
+export UPSTOX_ACCESS_TOKEN
+python scripts/upstox_history_batch.py \
+  --universe-manifest data/nse_universe/nse_universe_manifest.json \
+  --price-file data/affordability_prices.json \
+  --output-dir data/upstox_history \
+  --dry-run
+```
+
+Remove `--dry-run` only after reviewing the candidate/request report. Candle datasets are saved as
+Parquet with a per-instrument manifest and SHA-256 fingerprint. Both stages are read-only with
+respect to the broker and carry an explicit `live_orders_called: false` marker.
+
 ## Anti-overfitting policy
 
 A candidate is rejected if any of these are missing:
