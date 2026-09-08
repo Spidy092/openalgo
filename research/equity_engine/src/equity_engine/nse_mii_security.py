@@ -39,6 +39,7 @@ _REQUIRED_FIELDS = (
 
 _FILENAME = re.compile(r"NSE_CM_security_(\d{8})\.csv\.gz\Z")
 _ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\Z")
+_PLACEHOLDER_ISIN_PREFIX = "DUMMY"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,12 @@ class NseMiiSecurityRow:
         if self.isin is None:
             raise ValueError("cannot construct equity instrument key without a valid ISIN")
         return f"NSE_EQ|{self.isin}"
+
+    @property
+    def is_placeholder(self) -> bool:
+        """Whether NSE marked this row with its non-ISIN placeholder sentinel."""
+
+        return self.raw_isin.startswith(_PLACEHOLDER_ISIN_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -291,6 +298,10 @@ def equity_candidate_rows(
     seen: set[tuple[str, str]] = set()
     for row in snapshot.rows:
         if row.series not in semantics.normal_equity_series:
+            continue
+        # NSE uses DUMMY... in the ISIN field for exchange test/legacy placeholders. These rows
+        # are retained in the parsed snapshot for auditability, but cannot become EQ identities.
+        if row.is_placeholder:
             continue
         if not row.symbol:
             raise ValueError(f"equity row {row.source_row_number} has blank symbol")

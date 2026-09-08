@@ -94,6 +94,35 @@ def test_daily_universe_keeps_ineligible_rows_for_audit_and_filters_candidates()
     assert by_symbol["NOPERM"].eligible is False
 
 
+def test_daily_universe_skips_nse_dummy_placeholder_before_equity_validation() -> None:
+    snapshot = _snapshot(
+        [
+            _row(symbol="011NSETEST", isin="DUMMYSAN005", permitted="0", status="6"),
+            _row(symbol="AB10BKINAV", isin="DUMMY0000339", permitted="0", status="1"),
+            _row(symbol="OPEN", isin="INE001A01036"),
+        ]
+    )
+
+    universe = materialize_nse_daily_equity_universe(
+        snapshot=snapshot,
+        semantics_policy=_policy(),
+    )
+
+    assert [record.symbol for record in universe.records] == ["OPEN"]
+    assert snapshot.rows[0].is_placeholder is True
+    assert snapshot.rows[1].is_placeholder is True
+
+
+def test_daily_universe_still_rejects_nonplaceholder_invalid_equity_isin() -> None:
+    snapshot = _snapshot([_row(symbol="BROKEN", isin="NOT-AN-ISIN")])
+
+    with pytest.raises(ValueError, match="invalid/blank ISIN"):
+        materialize_nse_daily_equity_universe(
+            snapshot=snapshot,
+            semantics_policy=_policy(),
+        )
+
+
 def test_daily_universe_refuses_semantics_before_verified_boundary() -> None:
     snapshot = _snapshot(
         [_row(symbol="TEST", isin="INE001A01036")],

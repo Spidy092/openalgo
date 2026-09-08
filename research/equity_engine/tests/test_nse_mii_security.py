@@ -140,6 +140,34 @@ def test_non_equity_row_can_be_audited_without_valid_equity_identity() -> None:
     assert candidates[0].symbol == "TEST"
 
 
+def test_equity_candidate_rows_skips_nse_dummy_placeholder() -> None:
+    snapshot = NseMiiSecurityMasterParser().parse_bytes(
+        _gzip_csv(
+            [
+                _row(TckrSymb="011NSETEST", FinInstrmNm="011NSETEST", ISIN="DUMMYSAN005"),
+                _row(),
+            ]
+        ),
+        filename="NSE_CM_security_07092026.csv.gz",
+    )
+
+    candidates = equity_candidate_rows(snapshot, semantics=_semantics())
+
+    assert [row.symbol for row in candidates] == ["TEST"]
+    assert snapshot.rows[0].is_placeholder is True
+
+
+def test_nse_dummy_placeholder_wins_over_structural_isin_shape() -> None:
+    snapshot = NseMiiSecurityMasterParser().parse_bytes(
+        _gzip_csv([_row(ISIN="DUMMY0000339")]),
+        filename="NSE_CM_security_07092026.csv.gz",
+    )
+
+    assert snapshot.rows[0].isin == "DUMMY0000339"
+    assert snapshot.rows[0].is_placeholder is True
+    assert equity_candidate_rows(snapshot, semantics=_semantics()) == ()
+
+
 def test_in_scope_equity_with_bad_identity_fails_at_promotion_boundary() -> None:
     snapshot = NseMiiSecurityMasterParser().parse_bytes(
         _gzip_csv([_row(ISIN="")]),

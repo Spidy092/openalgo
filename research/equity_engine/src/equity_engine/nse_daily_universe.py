@@ -87,6 +87,10 @@ def materialize_nse_daily_equity_universe(
     for row in snapshot.rows:
         if row.series not in semantics.normal_equity_series:
             continue
+        # The official CM schema uses DUMMY... as a non-ISIN placeholder marker for exchange
+        # test/legacy rows. Keep strict validation for every other in-scope row.
+        if row.is_placeholder:
+            continue
         _validate_equity_row(row)
         status = interpret_nse_mii_equity_row(row, semantics=semantics)
         tick_point = tick_point_from_nse_mii_price_field(row, semantics=semantics)
