@@ -28,8 +28,7 @@ NSE_CM_HOLIDAY_SOURCES = {
     ),
 }
 
-# Capital Market trading holidays. Weekend holidays are harmless if included because
-# calendar construction checks weekday first. These values are intentionally effective-dated
+# Capital Market trading holidays. These values are intentionally effective-dated
 # evidence, not a generic Indian holiday calendar.
 _NSE_CM_HOLIDAYS = {
     2024: frozenset(
@@ -125,10 +124,10 @@ def nse_cm_normal_session_calendar(*, start: date, end: date) -> CalendarEvidenc
     special: list[date] = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
-            if current in _NSE_CM_EXCLUDED_SPECIAL_SESSIONS:
-                special.append(current)
-            elif current in _NSE_CM_HOLIDAYS[current.year]:
+        if current in _NSE_CM_EXCLUDED_SPECIAL_SESSIONS:
+            special.append(current)
+        elif current.weekday() < 5:
+            if current in _NSE_CM_HOLIDAYS[current.year]:
                 holidays.append(current)
             else:
                 trading.append(current)
