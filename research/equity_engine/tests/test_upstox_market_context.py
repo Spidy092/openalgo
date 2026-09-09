@@ -1,9 +1,12 @@
+import httpx
+
 from equity_engine.upstox_market_context import UpstoxFullQuoteV3Client
 
 
 class _Response:
     def __init__(self, payload: dict) -> None:
         self._payload = payload
+        self.status_code = 200
 
     def raise_for_status(self) -> None:
         return None
@@ -102,3 +105,62 @@ def test_missing_requested_quote_fails_closed() -> None:
         assert "did not return requested instruments" in str(exc)
     else:
         raise AssertionError("missing quote should fail closed")
+
+
+def test_partial_quote_batches_are_sorted_and_capped_at_500() -> None:
+    requested = [f"NSE_EQ|INE{i:09d}" for i in range(1001)]
+    calls: list[list[str]] = []
+
+    def handler(request):
+        keys = request.url.params["instrument_key"].split(",")
+        calls.append(keys)
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    f"NSE_EQ:{key.split('|', 1)[1]}": {
+                        "instrument_token": key,
+                        "last_price": 100,
+                        "timestamp": "2026-09-09T10:00:00+05:30",
+                        "cas_eligible": False,
+                    }
+                    for key in keys
+                },
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = UpstoxFullQuoteV3Client(access_token="secret-token", client=client).fetch_partial_by_instrument_token(
+        list(reversed(requested))
+    )
+
+    assert result.request_count == 3
+    assert [len(chunk) for chunk in calls] == [500, 500, 1]
+    assert calls[0] == sorted(calls[0])
+    assert len(result.quotes) == len(requested)
+    assert not result.failures
+
+
+def test_partial_quote_result_preserves_missing_quote_reason_without_token() -> None:
+    requested = ["NSE_EQ|INE000000001", "NSE_EQ|INE000000002"]
+    fake = _Client(
+        {
+            "status": "success",
+            "data": {
+                "first": {
+                    "instrument_token": requested[0],
+                    "last_price": 100,
+                    "timestamp": "2026-09-09T10:00:00+05:30",
+                    "cas_eligible": False,
+                }
+            },
+        }
+    )
+
+    result = UpstoxFullQuoteV3Client(
+        access_token="secret-token", client=fake
+    ).fetch_partial_by_instrument_token(requested)
+
+    assert result.failures == {requested[1]: "missing_quote"}
+    assert "secret-token" not in repr(result)

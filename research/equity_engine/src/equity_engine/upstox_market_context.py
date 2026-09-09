@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
 
 import httpx
 
@@ -12,7 +13,34 @@ UPSTOX_FULL_QUOTE_V3_URL = "https://api.upstox.com/v3/market-quote/quotes"
 UPSTOX_FULL_QUOTE_V3_DOC = (
     "https://upstox.com/developer/api-documentation/get-full-market-quote-v3/"
 )
-_MAX_INSTRUMENTS_PER_REQUEST = 500
+MAX_INSTRUMENTS_PER_REQUEST = 500
+
+
+@dataclass(frozen=True)
+class QuoteBatchResult:
+    """Sanitized result of a read-only quote batch.
+
+    ``failures`` contains stable category names only.  Response bodies, headers and
+    authentication material are intentionally not retained in the result.
+    """
+
+    requested_instrument_keys: tuple[str, ...]
+    quotes: dict[str, dict[str, object]]
+    failures: dict[str, str]
+    request_count: int
+
+    def __post_init__(self) -> None:
+        requested = set(self.requested_instrument_keys)
+        if len(requested) != len(self.requested_instrument_keys):
+            raise ValueError("requested_instrument_keys contain duplicates")
+        if set(self.quotes) - requested:
+            raise ValueError("quote result contains an unrequested instrument")
+        if set(self.failures) - requested:
+            raise ValueError("quote failures contain an unrequested instrument")
+        if set(self.quotes) & set(self.failures):
+            raise ValueError("an instrument cannot be both a quote success and failure")
+        if self.request_count < 0:
+            raise ValueError("request_count cannot be negative")
 
 
 def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
@@ -25,7 +53,7 @@ def _decimal(value: object, *, field: str) -> Decimal:
         result = Decimal(str(value))
     except Exception as exc:  # pragma: no cover - defensive parser boundary
         raise ValueError(f"invalid numeric field {field}: {value!r}") from exc
-    if result <= 0:
+    if not result.is_finite() or result <= 0:
         raise ValueError(f"{field} must be positive")
     return result
 
@@ -53,7 +81,7 @@ class UpstoxFullQuoteV3Client:
             raise ValueError("instrument_keys contain duplicates")
 
         by_token: dict[str, dict[str, object]] = {}
-        for chunk in _chunks(instrument_keys, _MAX_INSTRUMENTS_PER_REQUEST):
+        for chunk in _chunks(instrument_keys, MAX_INSTRUMENTS_PER_REQUEST):
             params = {"instrument_key": ",".join(chunk)}
             headers = {
                 "Accept": "application/json",
@@ -94,6 +122,105 @@ class UpstoxFullQuoteV3Client:
         if missing:
             raise RuntimeError("Upstox did not return requested instruments: " + ", ".join(missing))
         return by_token
+
+    def fetch_partial_by_instrument_token(
+        self, instrument_keys: list[str]
+    ) -> QuoteBatchResult:
+        """Fetch deterministic quote batches while retaining per-key failure evidence.
+
+        This method is for current-market measurement only.  It makes no trading calls and
+        never stores the bearer token.  The pre-existing ``fetch_by_instrument_token`` remains
+        strict for market-context construction.
+        """
+
+        if not instrument_keys:
+            raise ValueError("instrument_keys cannot be empty")
+        if len(set(instrument_keys)) != len(instrument_keys):
+            raise ValueError("instrument_keys contain duplicates")
+
+        requested = tuple(sorted(instrument_keys))
+        by_token: dict[str, dict[str, object]] = {}
+        failures: dict[str, str] = {}
+        request_count = 0
+
+        for chunk in _chunks(list(requested), MAX_INSTRUMENTS_PER_REQUEST):
+            request_count += 1
+            params = {"instrument_key": ",".join(chunk)}
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self._access_token}",
+            }
+            try:
+                if self._client is not None:
+                    response = self._client.get(
+                        UPSTOX_FULL_QUOTE_V3_URL,
+                        params=params,
+                        headers=headers,
+                        timeout=self._timeout_seconds,
+                    )
+                else:
+                    response = httpx.get(
+                        UPSTOX_FULL_QUOTE_V3_URL,
+                        params=params,
+                        headers=headers,
+                        timeout=self._timeout_seconds,
+                    )
+                status_code = response.status_code
+                response.raise_for_status()
+                payload = response.json()
+            except httpx.HTTPStatusError:
+                reason = f"http_status_{status_code}"
+                failures.update({key: reason for key in chunk})
+                continue
+            except (httpx.RequestError, ValueError, TypeError):
+                failures.update({key: "transport_or_payload_error" for key in chunk})
+                continue
+
+            if not isinstance(payload, dict) or payload.get("status") != "success":
+                failures.update({key: "unsuccessful_response" for key in chunk})
+                continue
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                failures.update({key: "missing_data_object" for key in chunk})
+                continue
+
+            returned_in_chunk: set[str] = set()
+            malformed = False
+            for quote in data.values():
+                if not isinstance(quote, dict):
+                    malformed = True
+                    continue
+                token = quote.get("instrument_token")
+                if not isinstance(token, str) or not token:
+                    malformed = True
+                    continue
+                if token not in chunk:
+                    continue
+                if token in by_token or token in returned_in_chunk:
+                    failures[token] = "duplicate_quote"
+                    by_token.pop(token, None)
+                    continue
+                returned_in_chunk.add(token)
+                by_token[token] = quote
+
+            if malformed:
+                for key in chunk:
+                    if key not in by_token:
+                        failures.setdefault(key, "malformed_quote")
+            for key in chunk:
+                if key not in by_token:
+                    failures.setdefault(key, "missing_quote")
+
+        for key in requested:
+            if key not in by_token:
+                failures.setdefault(key, "missing_quote")
+
+        return QuoteBatchResult(
+            requested_instrument_keys=requested,
+            quotes=dict(sorted(by_token.items())),
+            failures=dict(sorted(failures.items())),
+            request_count=request_count,
+        )
 
     def build_market_snapshot(
         self,

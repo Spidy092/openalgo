@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-import gzip
-import json
-from typing import Mapping
 
 import httpx
 
@@ -23,6 +24,7 @@ UPSTOX_SUSPENDED_URL = (
 class InstrumentFilePayload:
     url: str
     rows: tuple[Mapping[str, object], ...]
+    sha256: str
     etag: str | None
     last_modified: str | None
 
@@ -60,6 +62,7 @@ class UpstoxPublicInstrumentFiles:
         return InstrumentFilePayload(
             url=url,
             rows=tuple(rows),
+            sha256=hashlib.sha256(response.content).hexdigest(),
             etag=response.headers.get("etag"),
             last_modified=response.headers.get("last-modified"),
         )

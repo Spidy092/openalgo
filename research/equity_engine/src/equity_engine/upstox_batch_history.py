@@ -16,6 +16,8 @@ from .provenance import FINGERPRINT_SCHEMA
 from .upstox_history import UpstoxHistoricalDataProvider
 
 _TRANSIENT_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+UPSTOX_MINUTE_MAX_CALENDAR_DAYS = 28
+UPSTOX_DAILY_MAX_CALENDAR_DAYS = 3650
 
 
 class _HttpGetter(Protocol):
@@ -122,8 +124,27 @@ class HistoricalBatchRunResult:
         return not self.failures and bool(self.items)
 
 
+def historical_request_limit_days(interval: str) -> int:
+    """Return the documented V3 maximum calendar span for an interval family."""
+
+    normalized = interval.strip().lower()
+    if normalized in {"1m", "5m", "15m", "minutes"}:
+        return UPSTOX_MINUTE_MAX_CALENDAR_DAYS
+    if normalized in {"daily", "1d", "days"}:
+        return UPSTOX_DAILY_MAX_CALENDAR_DAYS
+    raise ValueError(f"unsupported historical interval family: {interval}")
+
+
+def historical_request_count(*, start: date, end: date, interval: str) -> int:
+    if start > end:
+        raise ValueError("start must be on or before end")
+    return math.ceil(
+        ((end - start).days + 1) / historical_request_limit_days(interval)
+    )
+
+
 def _chunk_count(start: date, end: date) -> int:
-    return math.ceil(((end - start).days + 1) / 28)
+    return historical_request_count(start=start, end=end, interval="minutes")
 
 
 def plan_historical_batch(
