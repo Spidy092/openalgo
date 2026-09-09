@@ -43,7 +43,19 @@ def _instrument(*, mis: bool = True, suspended: bool = False):
         as_of_date=date(2026, 9, 7),
         bod_rows=[row],
         mis_rows=[{"instrument_key": KEY}] if mis else [],
-        suspended_rows=[{"instrument_key": KEY}] if suspended else [],
+        suspended_rows=(
+            [
+                {
+                    "segment": "NSE_EQ",
+                    "exchange": "NSE",
+                    "instrument_key": KEY,
+                    "instrument_type": "EQ",
+                    "exchange_token": "123",
+                }
+            ]
+            if suspended
+            else []
+        ),
         tick_size_scale_rupees_per_raw_unit=Decimal("0.01"),
     )
     return snapshot.instruments[0]
@@ -189,7 +201,7 @@ def test_live_gate_rejects_current_suspension_and_insufficient_spread_samples() 
         ),
     )
     assert live.eligible is False
-    assert any("current Upstox suspended" in violation for violation in live.violations)
+    assert any("current Upstox suspension status" in violation for violation in live.violations)
     assert "insufficient live spread observations" in live.violations
 
 

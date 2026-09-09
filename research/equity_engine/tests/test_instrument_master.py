@@ -25,14 +25,22 @@ def _row(key: str, *, instrument_type: str = "EQ", security_type: str = "NORMAL"
     }
 
 
-def test_master_joins_bod_mis_and_suspended_by_instrument_key() -> None:
+def test_master_joins_bod_mis_and_resolves_exact_suspension_identity() -> None:
     normal = "NSE_EQ|INE000000001"
     suspended = "NSE_EQ|INE000000002"
     snapshot = build_nse_equity_master(
         as_of_date=date(2026, 9, 7),
         bod_rows=[_row(normal), _row(suspended)],
         mis_rows=[{"instrument_key": normal}, {"instrument_key": suspended}],
-        suspended_rows=[{"instrument_key": suspended}],
+        suspended_rows=[
+            {
+                "segment": "NSE_EQ",
+                "exchange": "NSE",
+                "instrument_key": suspended,
+                "instrument_type": "EQ",
+                "exchange_token": "123",
+            }
+        ],
         tick_size_scale_rupees_per_raw_unit=Decimal("0.01"),
     )
 
@@ -40,6 +48,8 @@ def test_master_joins_bod_mis_and_suspended_by_instrument_key() -> None:
     assert by_key[normal].mis_eligible is True
     assert by_key[normal].suspended is False
     assert by_key[suspended].suspended is True
+    assert by_key[suspended].suspension_status == "SUSPENDED_EXACT"
+    assert by_key[suspended].live_tradability_proven is False
     assert by_key[normal].tick_size_raw == Decimal("5.0")
     assert by_key[normal].tick_size_rupees == Decimal("0.050")
     assert snapshot.source_digest

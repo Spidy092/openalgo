@@ -28,6 +28,7 @@ def _row(
         "isin": key.split("|", 1)[1],
         "instrument_type": "EQ",
         "instrument_key": key,
+        "exchange_token": 2885,
         "lot_size": lot_size,
         "freeze_quantity": 100000,
         "tick_size": 5,
@@ -232,11 +233,17 @@ def test_suspended_key_only_variant_does_not_false_positive() -> None:
     item = artifact.instruments[0]
 
     assert item.suspended is False
+    assert item.suspension_status == "SUSPENSION_CONFLICT"
     assert item.candidate is True
+    assert item.research_candidate is True
+    assert item.live_tradability_proven is False
     assert item.suspension_match_count == 0
+    assert item.exact_token_match_count == 0
     assert item.suspension_variant_row_count == 6
     assert artifact.suspension_match_count == 0
     assert artifact.suspension_key_variant_count == 1
+    assert artifact.conflict_count == 1
+    assert artifact.live_orders_called is False
 
 
 def test_exact_suspended_eq_identity_is_rejected() -> None:
@@ -248,18 +255,24 @@ def test_exact_suspended_eq_identity_is_rejected() -> None:
     item = artifact.instruments[0]
 
     assert item.suspended is True
+    assert item.suspension_status == "SUSPENDED_EXACT"
     assert item.candidate is False
+    assert item.research_candidate is False
+    assert item.live_tradability_proven is False
     assert item.suspension_match_count == 1
+    assert item.exact_token_match_count == 1
     assert item.suspension_ambiguous is False
     assert "suspended_exact_identity" in item.exclusion_reasons
     assert artifact.suspension_match_count == 1
+    assert artifact.exact_suspended_count == 1
 
 
 def test_duplicate_exact_suspended_identity_fails_closed() -> None:
     key = "NSE_EQ|INE002A01018"
     bod = _row(key, symbol="RELIANCE")
     duplicate_a = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
-    duplicate_b = _suspended_variant(bod, instrument_type="EQ", exchange_token=9999)
+    duplicate_b = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    duplicate_b["trading_symbol"] = "RELIANCE-ALT"
 
     artifact = _artifact(
         rows=[bod],
@@ -269,11 +282,15 @@ def test_duplicate_exact_suspended_identity_fails_closed() -> None:
     item = artifact.instruments[0]
 
     assert item.suspended is True
+    assert item.suspension_status == "AMBIGUOUS_EXACT"
     assert item.suspension_ambiguous is True
     assert item.suspension_match_count == 2
+    assert item.exact_token_match_count == 2
     assert item.candidate is False
+    assert item.live_tradability_proven is False
     assert "ambiguous_suspended_identity" in item.exclusion_reasons
     assert artifact.suspension_ambiguous_count == 1
+    assert artifact.ambiguous_exact_count == 1
 
 
 def test_reliance_shape_and_mis_intersection_are_resolved_by_identity() -> None:
@@ -287,7 +304,12 @@ def test_reliance_shape_and_mis_intersection_are_resolved_by_identity() -> None:
 
     assert artifact.gate_counts["current_mis_eligible"] == 1
     assert artifact.gate_counts["current_suspended"] == 0
+    assert artifact.gate_counts["suspension_conflicts"] == 1
     assert artifact.instruments[0].candidate is True
+    assert artifact.instruments[0].suspension_status == "SUSPENSION_CONFLICT"
+    assert artifact.instruments[0].live_tradability_proven is False
+    assert artifact.instruments[0].current_exchange_token == "2885"
+    assert artifact.instruments[0].exact_token_match_count == 0
 
 
 def test_suspension_evidence_is_deterministic() -> None:
@@ -302,6 +324,50 @@ def test_suspension_evidence_is_deterministic() -> None:
 
     assert first.fingerprint == second.fingerprint
     assert first.to_dict() == second.to_dict()
+    assert first.to_dict()["suspension_identity_policy"] == (
+        "segment+instrument_key+exchange_token;"
+        "exchange+instrument_type consistency guards"
+    )
+    assert first.to_dict()["suspended_source_hash"] == "suspended-sha"
+
+
+def test_no_suspended_segment_key_record_is_explicit() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    unrelated_segment = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    unrelated_segment["segment"] = "BSE_EQ"
+
+    artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=[unrelated_segment])
+    item = artifact.instruments[0]
+
+    assert item.suspension_status == "NO_SUSPENSION_RECORD"
+    assert item.same_key_variant_count == 0
+    assert item.live_tradability_proven is True
+    assert artifact.no_record_count == 1
+
+
+def test_exact_token_instrument_type_mismatch_is_a_conflict() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    mismatched = _suspended_variant(bod, instrument_type="AF", exchange_token=2885)
+
+    artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=[mismatched])
+    item = artifact.instruments[0]
+
+    assert item.suspension_status == "SUSPENSION_CONFLICT"
+    assert item.exact_token_match_count == 1
+    assert item.suspension_match_count == 0
+    assert item.live_tradability_proven is False
+
+
+def test_exchange_token_is_scoped_by_segment_and_instrument_key() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    token_only = {"exchange_token": 2885, "instrument_type": "EQ"}
+
+    artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=[token_only])
+
+    assert artifact.instruments[0].suspension_status == "NO_SUSPENSION_RECORD"
 
 
 def test_no_mis_membership_is_not_an_intraday_candidate() -> None:

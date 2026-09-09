@@ -13,6 +13,16 @@ from .costs import CostProvider
 from .instrument_master import build_nse_equity_master
 from .models import Exchange, OrderSpec, Product, Side
 from .sizing import max_affordable_buy_quantity
+from .suspension_identity import (
+    AMBIGUOUS_EXACT,
+    NO_SUSPENSION_RECORD,
+    SUSPENDED_EXACT,
+    SUSPENSION_CONFLICT,
+    SUSPENSION_IDENTITY_POLICY,
+    field_text,
+    resolve_suspension,
+    row_evidence,
+)
 from .upstox_batch_history import historical_request_limit_days
 from .upstox_instruments import InstrumentFilePayload
 from .upstox_market_context import (
@@ -28,20 +38,7 @@ DEFAULT_TICK_SIZE_SCALE_RUPEES_PER_RAW_UNIT = Decimal("0.01")
 DEFAULT_ESTIMATED_BYTES_PER_ROW = 256
 APPROVED_CAPITALS = (Decimal("1000.00"), Decimal("10000.00"))
 _ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\Z")
-SUSPENSION_MATCH_POLICY = "instrument_key+segment+exchange+instrument_type+isin"
-_SUSPENSION_IDENTITY_FIELDS = ("instrument_key", "segment", "exchange", "instrument_type", "isin")
-_SUSPENSION_EVIDENCE_FIELDS = (
-    "segment",
-    "exchange",
-    "isin",
-    "instrument_key",
-    "instrument_type",
-    "security_type",
-    "trading_symbol",
-    "series",
-    "lot_size",
-    "exchange_token",
-)
+SUSPENSION_MATCH_POLICY = SUSPENSION_IDENTITY_POLICY
 
 
 @dataclass(frozen=True)
@@ -87,10 +84,16 @@ class CurrentInstrumentMeasurement:
     minimum_tradable_quantity_source: str | None
     mis_eligible: bool
     suspended: bool
+    current_exchange_token: str | None
+    suspension_status: str
     suspension_match_count: int
     suspension_ambiguous: bool
     suspension_variant_row_count: int
+    same_key_variant_count: int
+    exact_token_match_count: int
     suspension_evidence: tuple[dict[str, object], ...]
+    research_candidate: bool
+    live_tradability_proven: bool
     cas_eligible: bool | None
     quote_status: str
     quote_failure_reason: str | None
@@ -117,9 +120,13 @@ class CurrentInstrumentMeasurement:
             "minimum_tradable_quantity_source": self.minimum_tradable_quantity_source,
             "mis_eligible": self.mis_eligible,
             "suspended": self.suspended,
+            "current_exchange_token": self.current_exchange_token,
+            "suspension_status": self.suspension_status,
             "suspension_match_count": self.suspension_match_count,
             "suspension_ambiguous": self.suspension_ambiguous,
             "suspension_variant_row_count": self.suspension_variant_row_count,
+            "same_key_variant_count": self.same_key_variant_count,
+            "exact_token_match_count": self.exact_token_match_count,
             "suspension_evidence": list(self.suspension_evidence),
             "cas_eligible": self.cas_eligible,
             "quote_status": self.quote_status,
@@ -128,6 +135,8 @@ class CurrentInstrumentMeasurement:
             "quote_timestamp": self.quote_timestamp,
             "price_source": self.price_source,
             "candidate": self.candidate,
+            "research_candidate": self.research_candidate,
+            "live_tradability_proven": self.live_tradability_proven,
             "candidate_after_max_last_price": self.candidate_after_max_last_price,
             "exclusion_reasons": list(self.exclusion_reasons),
             "capital_measurements": [item.to_dict() for item in self.capital_measurements],
@@ -147,6 +156,10 @@ class CurrentMarketCalibrationArtifact:
     suspension_match_count: int
     suspension_ambiguous_count: int
     suspension_key_variant_count: int
+    exact_suspended_count: int
+    conflict_count: int
+    no_record_count: int
+    ambiguous_exact_count: int
     gate_counts: dict[str, int]
     quote_request_count: int
     quote_success_count: int
@@ -166,6 +179,12 @@ class CurrentMarketCalibrationArtifact:
     live_orders_called: bool = False
     schema_version: str = CURRENT_MARKET_SCHEMA_VERSION
 
+    @property
+    def suspension_identity_policy(self) -> str:
+        """Explicit name for the policy; the older match name is retained for compatibility."""
+
+        return self.suspension_match_policy
+
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
@@ -177,9 +196,14 @@ class CurrentMarketCalibrationArtifact:
             "suspended_duplicate_key_count": self.suspended_duplicate_key_count,
             "suspended_duplicate_isin_count": self.suspended_duplicate_isin_count,
             "suspension_match_policy": self.suspension_match_policy,
+            "suspension_identity_policy": self.suspension_identity_policy,
             "suspension_match_count": self.suspension_match_count,
             "suspension_ambiguous_count": self.suspension_ambiguous_count,
             "suspension_key_variant_count": self.suspension_key_variant_count,
+            "exact_suspended_count": self.exact_suspended_count,
+            "conflict_count": self.conflict_count,
+            "no_record_count": self.no_record_count,
+            "ambiguous_exact_count": self.ambiguous_exact_count,
             "gate_counts": dict(sorted(self.gate_counts.items())),
             "quote_requests": {
                 "instrument_count": self.quote_request_count,
@@ -240,51 +264,6 @@ def _positive_integral(value: object) -> int | None:
     if parsed is None or parsed != parsed.to_integral_value():
         return None
     return int(parsed)
-
-
-@dataclass(frozen=True)
-class SuspensionResolution:
-    same_key_rows: tuple[Mapping[str, object], ...]
-    matching_rows: tuple[Mapping[str, object], ...]
-
-    @property
-    def ambiguous(self) -> bool:
-        return len(self.matching_rows) > 1
-
-
-def _suspension_identity(row: Mapping[str, object]) -> tuple[str, ...]:
-    return tuple(_text(row, field) for field in _SUSPENSION_IDENTITY_FIELDS)
-
-
-def _suspension_row_evidence(row: Mapping[str, object]) -> dict[str, object]:
-    return {field: row.get(field) for field in _SUSPENSION_EVIDENCE_FIELDS}
-
-
-def _suspension_sort_key(row: Mapping[str, object]) -> tuple[str, ...]:
-    return tuple(str(row.get(field, "")) for field in _SUSPENSION_EVIDENCE_FIELDS)
-
-
-def _resolve_suspension(
-    row: Mapping[str, object], suspended_rows: Sequence[Mapping[str, object]]
-) -> SuspensionResolution:
-    key = _text(row, "instrument_key")
-    same_key_rows = tuple(
-        sorted(
-            (
-                suspended_row
-                for suspended_row in suspended_rows
-                if key and _text(suspended_row, "instrument_key") == key
-            ),
-            key=_suspension_sort_key,
-        )
-    )
-    identity = _suspension_identity(row)
-    matching_rows = tuple(
-        suspended_row
-        for suspended_row in same_key_rows
-        if _suspension_identity(suspended_row) == identity
-    )
-    return SuspensionResolution(same_key_rows=same_key_rows, matching_rows=matching_rows)
 
 
 def _row_gate_reasons(row: Mapping[str, object]) -> list[str]:
@@ -521,9 +500,12 @@ def measure_current_market(
     minimum_quantities: list[int] = []
     cas_counts = Counter({"cas_eligible": 0, "non_cas": 0, "unknown": 0})
     exclusion_counts: Counter[str] = Counter()
-    suspension_match_keys: set[str] = set()
-    suspension_ambiguous_keys: set[str] = set()
-    suspension_variant_keys: set[str] = set()
+    suspension_status_keys: dict[str, set[str]] = {
+        SUSPENDED_EXACT: set(),
+        SUSPENSION_CONFLICT: set(),
+        NO_SUSPENSION_RECORD: set(),
+        AMBIGUOUS_EXACT: set(),
+    }
 
     for row in bod_rows:
         reasons = _row_gate_reasons(row)
@@ -535,16 +517,11 @@ def measure_current_market(
             reasons.append("duplicate_instrument_key")
 
         mis_eligible = key in mis_keys
-        suspension = _resolve_suspension(row, suspended_rows)
-        suspended_value = bool(suspension.matching_rows) or suspension.ambiguous
+        suspension = resolve_suspension(row, suspended_rows)
+        suspended_value = suspension.status in {SUSPENDED_EXACT, AMBIGUOUS_EXACT}
         strict_row = not _row_gate_reasons(row)
         if strict_row and key:
-            if suspension.matching_rows:
-                suspension_match_keys.add(key)
-            elif suspension.same_key_rows:
-                suspension_variant_keys.add(key)
-            if suspension.ambiguous:
-                suspension_ambiguous_keys.add(key)
+            suspension_status_keys[suspension.status].add(key)
         tick_raw = _positive_decimal(row.get("tick_size"))
         tick_rupees = (
             tick_raw * tick_size_scale_rupees_per_raw_unit if tick_raw is not None else None
@@ -613,15 +590,22 @@ def measure_current_market(
                 quote_failures += 1
             cas_counts["unknown"] += 1
 
-        if suspension.ambiguous:
+        if suspension.status == AMBIGUOUS_EXACT:
             reasons.append("ambiguous_suspended_identity")
-        elif suspension.matching_rows:
+        elif suspension.status == SUSPENDED_EXACT:
             reasons.append("suspended_exact_identity")
+        elif suspension.status == SUSPENSION_CONFLICT:
+            reasons.append("suspension_identity_conflict")
         reasons = tuple(sorted(set(reasons)))
         for reason in reasons:
             exclusion_counts[reason] += 1
-        candidate = measurement_ready and mis_eligible and not suspended_value
-        candidate_after_max = candidate and (
+        research_candidate = (
+            measurement_ready
+            and mis_eligible
+            and suspension.status not in {SUSPENDED_EXACT, AMBIGUOUS_EXACT}
+        )
+        candidate = research_candidate
+        candidate_after_max = research_candidate and (
             max_last_price_rupees is None or reference_price <= max_last_price_rupees
         )
         instruments.append(
@@ -641,12 +625,16 @@ def measure_current_market(
                 ),
                 mis_eligible=mis_eligible,
                 suspended=suspended_value,
-                suspension_match_count=len(suspension.matching_rows),
-                suspension_ambiguous=suspension.ambiguous,
-                suspension_variant_row_count=len(suspension.same_key_rows),
+                current_exchange_token=(field_text(row, "exchange_token") or None),
+                suspension_status=suspension.status,
+                suspension_match_count=len(suspension.exact_identity_rows),
+                suspension_ambiguous=suspension.status == AMBIGUOUS_EXACT,
+                suspension_variant_row_count=len(suspension.same_segment_key_rows),
+                same_key_variant_count=len(suspension.same_segment_key_rows),
+                exact_token_match_count=len(suspension.exact_token_rows),
                 suspension_evidence=tuple(
-                    _suspension_row_evidence(suspended_row)
-                    for suspended_row in suspension.same_key_rows
+                    row_evidence(suspended_row)
+                    for suspended_row in suspension.same_segment_key_rows
                 ),
                 cas_eligible=cas_value,
                 quote_status="success" if measurement_ready else "failure",
@@ -656,6 +644,12 @@ def measure_current_market(
                 price_source=price_source,
                 candidate=candidate,
                 candidate_after_max_last_price=candidate_after_max,
+                research_candidate=research_candidate,
+                live_tradability_proven=(
+                    measurement_ready
+                    and mis_eligible
+                    and suspension.status == NO_SUSPENSION_RECORD
+                ),
                 exclusion_reasons=reasons,
                 capital_measurements=tuple(capital_measurements),
             )
@@ -690,12 +684,25 @@ def measure_current_market(
         "current_mis_eligible": sum(
             not _row_gate_reasons(row) and _text(row, "instrument_key") in mis_keys for row in bod_rows
         ),
-        "current_suspended": len(suspension_match_keys | suspension_ambiguous_keys),
-        "current_suspended_ambiguous": len(suspension_ambiguous_keys),
+        "current_suspended": len(
+            suspension_status_keys[SUSPENDED_EXACT] | suspension_status_keys[AMBIGUOUS_EXACT]
+        ),
+        "current_suspended_exact": len(suspension_status_keys[SUSPENDED_EXACT]),
+        "current_suspended_ambiguous": len(suspension_status_keys[AMBIGUOUS_EXACT]),
+        "suspension_conflicts": len(suspension_status_keys[SUSPENSION_CONFLICT]),
+        "suspension_no_record": len(suspension_status_keys[NO_SUSPENSION_RECORD]),
         "quote_request_candidates": len(quotes.requested_instrument_keys),
         "quote_usable": quote_successes,
         "quote_unusable": quote_failures,
-        "candidate_current_mis_not_suspended": sum(item.candidate for item in instruments),
+        "research_candidates": sum(item.research_candidate for item in instruments),
+        "live_tradability_proven": sum(
+            item.live_tradability_proven for item in instruments
+        ),
+        # Retained as a compatibility alias.  It now means research candidates
+        # and is not a live-tradability assertion.
+        "candidate_current_mis_not_suspended": sum(
+            item.research_candidate for item in instruments
+        ),
         "candidate_after_nominal_price_filter": sum(
             item.candidate_after_max_last_price for item in instruments
         ),
@@ -705,8 +712,10 @@ def measure_current_market(
     candidate_counts: dict[str, int] = {}
     for capital in sorted(capitals):
         capital_key = str(capital)
-        measured_candidates = [item for item in instruments if item.candidate]
-        measured_after_max = [item for item in instruments if item.candidate_after_max_last_price]
+        measured_candidates = [item for item in instruments if item.research_candidate]
+        measured_after_max = [
+            item for item in instruments if item.candidate_after_max_last_price
+        ]
         by_key = {
             item.instrument_key: item.capital_measurements
             for item in instruments
@@ -739,10 +748,11 @@ def measure_current_market(
         "independent_of_charge_aware_affordability": True,
         "required_for_affordability": False,
         "relationship": "independent_nominal_price_filter",
-        "candidate_count_before": sum(item.candidate for item in instruments),
+        "candidate_count_before": sum(item.research_candidate for item in instruments),
         "candidate_count_after": sum(item.candidate_after_max_last_price for item in instruments),
         "excluded_by_filter": sum(
-            item.candidate and not item.candidate_after_max_last_price for item in instruments
+            item.research_candidate and not item.candidate_after_max_last_price
+            for item in instruments
         ),
     }
     return CurrentMarketCalibrationArtifact(
@@ -759,9 +769,16 @@ def measure_current_market(
         suspended_duplicate_key_count=sum(count > 1 for count in suspended_key_counts.values()),
         suspended_duplicate_isin_count=sum(count > 1 for count in suspended_isin_counts.values()),
         suspension_match_policy=SUSPENSION_MATCH_POLICY,
-        suspension_match_count=len(suspension_match_keys),
-        suspension_ambiguous_count=len(suspension_ambiguous_keys),
-        suspension_key_variant_count=len(suspension_variant_keys),
+        suspension_match_count=len(suspension_status_keys[SUSPENDED_EXACT]),
+        suspension_ambiguous_count=len(suspension_status_keys[AMBIGUOUS_EXACT]),
+        suspension_key_variant_count=len(
+            suspension_status_keys[SUSPENSION_CONFLICT]
+            | suspension_status_keys[AMBIGUOUS_EXACT]
+        ),
+        exact_suspended_count=len(suspension_status_keys[SUSPENDED_EXACT]),
+        conflict_count=len(suspension_status_keys[SUSPENSION_CONFLICT]),
+        no_record_count=len(suspension_status_keys[NO_SUSPENSION_RECORD]),
+        ambiguous_exact_count=len(suspension_status_keys[AMBIGUOUS_EXACT]),
         gate_counts=gate_counts,
         quote_request_count=len(quotes.requested_instrument_keys),
         quote_success_count=quote_successes,

@@ -7,6 +7,13 @@ import hashlib
 import json
 from typing import Iterable, Mapping
 
+from .suspension_identity import (
+    AMBIGUOUS_EXACT,
+    NO_SUSPENSION_RECORD,
+    SUSPENDED_EXACT,
+    resolve_suspension,
+)
+
 
 UPSTOX_INSTRUMENTS_DOC = "https://upstox.com/developer/api-documentation/instruments/"
 
@@ -28,6 +35,11 @@ class EquityInstrument:
     cas_eligible: bool
     mis_eligible: bool
     suspended: bool
+    exchange_token: str | None
+    suspension_status: str
+    suspension_variant_row_count: int
+    exact_token_match_count: int
+    live_tradability_proven: bool
 
 
 @dataclass(frozen=True)
@@ -90,7 +102,6 @@ def build_nse_equity_master(
     mis = list(mis_rows)
     suspended = list(suspended_rows)
     mis_keys = _instrument_keys(mis)
-    suspended_keys = _instrument_keys(suspended)
 
     seen: set[str] = set()
     instruments: list[EquityInstrument] = []
@@ -126,6 +137,8 @@ def build_nse_equity_master(
         if not isinstance(cas_value, bool):
             raise ValueError(f"invalid cas_eligible for {key}")
 
+        suspension = resolve_suspension(row, suspended)
+
         instruments.append(
             EquityInstrument(
                 instrument_key=key,
@@ -142,7 +155,18 @@ def build_nse_equity_master(
                 tick_size_rupees=raw_tick * tick_size_scale_rupees_per_raw_unit,
                 cas_eligible=cas_value,
                 mis_eligible=key in mis_keys,
-                suspended=key in suspended_keys,
+                suspended=suspension.status in {SUSPENDED_EXACT, AMBIGUOUS_EXACT},
+                exchange_token=(
+                    str(row.get("exchange_token")).strip()
+                    if row.get("exchange_token") is not None
+                    else None
+                ),
+                suspension_status=suspension.status,
+                suspension_variant_row_count=len(suspension.same_segment_key_rows),
+                exact_token_match_count=len(suspension.exact_token_rows),
+                live_tradability_proven=(
+                    suspension.status == NO_SUSPENSION_RECORD and key in mis_keys
+                ),
             )
         )
 

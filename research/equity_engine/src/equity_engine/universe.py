@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from .historical_membership import HistoricalMembershipAssessment
 from .instrument_master import EquityInstrument
+from .suspension_identity import NO_SUSPENSION_RECORD
 from .tick_size import TickCoverageAssessment, TickSizeVerification
 
 
@@ -203,8 +204,13 @@ def evaluate_live_universe_candidate(
         )
     if not current_instrument.mis_eligible:
         violations.append("instrument is not present in current Upstox NSE MIS list")
-    if current_instrument.suspended:
-        violations.append("instrument is present in current Upstox suspended list")
+    if current_instrument.suspension_status != NO_SUSPENSION_RECORD:
+        violations.append(
+            "current Upstox suspension status is "
+            f"{current_instrument.suspension_status}; live tradability is not proven"
+        )
+    elif not current_instrument.live_tradability_proven:
+        violations.append("current live tradability is not proven")
     if not current_tick_verification.passed:
         violations.append(
             "current tick-size verification failed: "
