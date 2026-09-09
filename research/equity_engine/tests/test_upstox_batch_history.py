@@ -118,7 +118,9 @@ def test_downloader_saves_manifest_without_token_and_resumes(tmp_path: Path) -> 
     item = first.items[0]
     manifest_text = Path(item.manifest).read_text(encoding="utf-8")
     assert token not in manifest_text
-    assert json.loads(manifest_text)["live_orders_called"] is False
+    manifest = json.loads(manifest_text)
+    assert manifest["live_orders_called"] is False
+    assert manifest["fingerprint_schema"] == "equity-market-data-v2"
 
     second = UpstoxHistoricalBatchDownloader(
         access_token=token,

@@ -9,6 +9,7 @@ from typing import Protocol
 import pandas as pd
 
 from .costs import CostProvider
+from .market_sessions import filter_to_continuous_session
 from .models import Exchange, OrderSpec, Product, Side
 from .provenance import validate_ohlcv_frame
 from .sizing import max_affordable_buy_quantity
@@ -17,6 +18,9 @@ _BPS = Decimal("10000")
 
 
 class SessionExitResolver(Protocol):
+    def continuous_end(self, trade_date: date) -> time:
+        """Return the effective continuous-session end for this instrument/date."""
+
     def exit_time(self, trade_date: date) -> time:
         """Return the explicit same-day exit cutoff for this instrument/date."""
 
@@ -127,9 +131,7 @@ def _modeled_fill_price(
     tick_size: Decimal,
 ) -> Decimal:
     friction_bps = assumptions.slippage_bps_per_leg + assumptions.half_spread_bps_per_leg
-    multiplier = Decimal("1") + (
-        friction_bps / _BPS if side is Side.BUY else -friction_bps / _BPS
-    )
+    multiplier = Decimal("1") + (friction_bps / _BPS if side is Side.BUY else -friction_bps / _BPS)
     raw = reference_price * multiplier
     return _round_to_tick_adverse(raw, tick_size=tick_size, side=side)
 
@@ -161,7 +163,15 @@ def simulate_long_intraday(
         raise ValueError("invalid OHLCV frame: " + "; ".join(violations))
     if frame.index.tz is None:
         raise ValueError("intraday frame must use timezone-aware timestamps")
-    if not frame.index.equals(entries_at_close.index) or not frame.index.equals(exits_at_close.index):
+    continuous_frame = filter_to_continuous_session(frame, session_policy)
+    if not continuous_frame.index.equals(frame.index):
+        raise ValueError(
+            "simulation frame contains non-continuous-session bars; filter raw data before "
+            "strategy execution"
+        )
+    if not frame.index.equals(entries_at_close.index) or not frame.index.equals(
+        exits_at_close.index
+    ):
         raise ValueError("frame, entries and exits must share the same index")
 
     entries = entries_at_close.astype(bool)
@@ -178,15 +188,23 @@ def simulate_long_intraday(
         previous_day = previous_ts.date()
         current_day = current_ts.date()
         session_exit_time = session_policy.exit_time(current_day)
+        continuous_end = session_policy.continuous_end(current_day)
         current_open = _as_decimal(frame.iloc[i]["open"])
 
         if position is not None and position["entry_timestamp"].date() != current_day:
-            raise ValueError("simulation would carry an intraday position overnight; verify session data/cutoff")
+            raise ValueError(
+                "simulation would carry an intraday position overnight; verify session data/cutoff"
+            )
 
         if position is not None:
             should_exit_cutoff = current_ts.time() >= session_exit_time
             should_exit_signal = previous_day == current_day and bool(exits.iloc[i - 1])
             if should_exit_cutoff or should_exit_signal:
+                if current_ts.time() >= continuous_end:
+                    raise ValueError(
+                        "no safe continuous-session exit bar before continuous-session end; "
+                        "refusing to use a post-continuous/CAS bar"
+                    )
                 reference_exit = current_open
                 exit_tick_size = position["entry_tick_size_rupees"]
                 fill_exit = _modeled_fill_price(
@@ -231,7 +249,9 @@ def simulate_long_intraday(
                         gross_reference_pnl=gross_reference_pnl,
                         execution_friction_cost=execution_friction_cost,
                         net_pnl=net_pnl,
-                        exit_reason=(ExitReason.SESSION_CUTOFF if should_exit_cutoff else ExitReason.SIGNAL),
+                        exit_reason=(
+                            ExitReason.SESSION_CUTOFF if should_exit_cutoff else ExitReason.SIGNAL
+                        ),
                     )
                 )
                 position = None
@@ -278,7 +298,9 @@ def simulate_long_intraday(
             cost_provider=cost_provider,
         )
         if size.quantity <= 0:
-            rejected.append(RejectedSignal(current_ts, "insufficient cash after modeled entry charges"))
+            rejected.append(
+                RejectedSignal(current_ts, "insufficient cash after modeled entry charges")
+            )
             continue
 
         entry_order = OrderSpec(
@@ -307,7 +329,10 @@ def simulate_long_intraday(
         trades_by_day[current_day] = day_trade_count + 1
 
     if position is not None:
-        raise ValueError("dataset ended with an open intraday position; include bars through the session cutoff")
+        raise ValueError(
+            "dataset ended with an open intraday position; no safe continuous-session exit bar "
+            "was available before the session cutoff"
+        )
 
     return IntradaySimulationResult(
         initial_cash=config.initial_cash,

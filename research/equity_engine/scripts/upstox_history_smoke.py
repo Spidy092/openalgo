@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 
+from equity_engine.provenance import FINGERPRINT_SCHEMA
 from equity_engine.upstox_history import UpstoxHistoricalDataProvider
 
 
@@ -98,6 +99,7 @@ def main() -> int:
     manifest = {
         "purpose": "authenticated_historical_data_connectivity_smoke_only",
         "not_for_strategy_selection": True,
+        "fingerprint_schema": FINGERPRINT_SCHEMA,
         "instrument": {
             "instrument_key": instrument_key,
             "trading_symbol": trading_symbol,
@@ -123,6 +125,7 @@ def main() -> int:
                 "first_timestamp": str(dataset.frame.index[0]),
                 "last_timestamp": str(dataset.frame.index[-1]),
                 "fingerprint_sha256": dataset.fingerprint,
+                "fingerprint_schema": FINGERPRINT_SCHEMA,
                 "parquet": str(parquet_path),
                 "manifest": str(manifest_path),
                 "live_orders_called": False,

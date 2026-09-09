@@ -6,6 +6,8 @@ import math
 
 import pandas as pd
 
+from .market_sessions import ContinuousSessionPolicy, filter_to_continuous_session
+
 
 @dataclass(frozen=True)
 class VectorBTScreeningResult:
@@ -66,6 +68,7 @@ def screen_long_signals(
     screening_fee_rate: Decimal,
     screening_slippage_rate: Decimal,
     frequency: str,
+    session_policy: ContinuousSessionPolicy,
 ) -> VectorBTScreeningResult:
     """Fast candidate screening only; not an exact brokerage/P&L validator.
 
@@ -89,6 +92,16 @@ def screen_long_signals(
         exits_at_close.index
     ):
         raise ValueError("prices, entries and exits must share the same index")
+    session_index = filter_to_continuous_session(
+        pd.DataFrame(index=close.index),
+        session_policy,
+    ).index
+    close = close.loc[session_index]
+    execution_price = execution_price.loc[session_index]
+    entries_at_close = entries_at_close.loc[session_index]
+    exits_at_close = exits_at_close.loc[session_index]
+    if close.empty:
+        raise ValueError("continuous-session price series cannot be empty")
     if close.isna().any() or execution_price.isna().any():
         raise ValueError("price series contain missing values")
     if (close <= 0).any() or (execution_price <= 0).any():

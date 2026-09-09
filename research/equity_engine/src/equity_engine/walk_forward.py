@@ -15,8 +15,14 @@ from .event_simulator import (
     TickSizeResolver,
     TradingEligibilityResolver,
 )
+from .market_sessions import filter_to_continuous_session
 from .models import Exchange
-from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact, rank_candidates
+from .tournament import (
+    CandidateEvaluation,
+    RankingMetric,
+    evaluate_candidate_exact,
+    rank_candidates,
+)
 
 
 @dataclass(frozen=True)
@@ -101,9 +107,7 @@ def _filter_to_trading_eligible_dates(
         raise ValueError("phase must be train or test")
     dates = tuple(sorted(set(frame.index.date)))
     eligible_dates = {
-        trade_date
-        for trade_date in dates
-        if trading_eligibility_policy.is_eligible(trade_date)
+        trade_date for trade_date in dates if trading_eligibility_policy.is_eligible(trade_date)
     }
     filtered = frame[[d in eligible_dates for d in frame.index.date]].copy()
     if filtered.empty:
@@ -152,6 +156,12 @@ def run_walk_forward_selection(
             window_id=window.window_id,
             phase="test",
         )
+        train_frame = filter_to_continuous_session(train_frame, session_policy)
+        test_frame = filter_to_continuous_session(test_frame, session_policy)
+        if train_frame.empty or test_frame.empty:
+            raise ValueError(
+                f"walk-forward window {window.window_id} has no continuous-session rows"
+            )
 
         train_evaluations: list[CandidateEvaluation] = []
         definition_by_id = {candidate.candidate_id: candidate for candidate in candidates}

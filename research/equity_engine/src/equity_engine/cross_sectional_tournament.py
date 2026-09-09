@@ -20,6 +20,7 @@ from .historical_membership import (
     filter_frame_to_eligible_dates,
 )
 from .models import Exchange
+from .market_sessions import filter_to_continuous_session
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact
 from .universe_builder import ResearchUniverseAudit, ResearchUniverseBuildResult
 
@@ -162,9 +163,7 @@ def run_cross_sectional_tournament(
                 f"historical membership belongs to another instrument for {instrument.instrument_key}"
             )
         if not instrument.historical_membership.complete:
-            raise ValueError(
-                f"historical membership is incomplete for {instrument.instrument_key}"
-            )
+            raise ValueError(f"historical membership is incomplete for {instrument.instrument_key}")
         if instrument.frame.empty:
             raise ValueError(f"tournament frame is empty for {instrument.instrument_key}")
         if instrument.frame.index.tz is None:
@@ -179,6 +178,7 @@ def run_cross_sectional_tournament(
             instrument.frame,
             instrument.historical_membership,
         )
+        eligible_frame = filter_to_continuous_session(eligible_frame, instrument.session_policy)
         if eligible_frame.empty:
             raise ValueError(
                 f"frozen universe instrument {instrument.instrument_key} has no eligible simulation rows"

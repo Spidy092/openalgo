@@ -24,6 +24,7 @@ from .historical_membership import (
     filter_frame_to_eligible_dates,
 )
 from .models import Exchange
+from .market_sessions import filter_to_continuous_session
 from .tick_size import assess_tick_policy_coverage
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact
 from .universe import CorporateActionAssessment
@@ -42,7 +43,9 @@ class DatedCorporateActionEvidence:
 
     def __post_init__(self) -> None:
         if self.window_start > self.window_end:
-            raise ValueError("corporate-action evidence window_start must be on or before window_end")
+            raise ValueError(
+                "corporate-action evidence window_start must be on or before window_end"
+            )
         if not self.source.strip():
             raise ValueError("corporate-action evidence source is required")
 
@@ -145,7 +148,9 @@ def _validate_period_structure(
     frame_dates = set(frame.index.date)
     requested = set(membership.requested_dates)
     if not allowed.issubset(requested):
-        raise ValueError(f"{label} membership does not cover every walk-forward date for {instrument_key}")
+        raise ValueError(
+            f"{label} membership does not cover every walk-forward date for {instrument_key}"
+        )
     if not frame_dates.issubset(allowed):
         raise ValueError(
             f"{label} frame contains dates outside the walk-forward {label} window for {instrument_key}"
@@ -278,11 +283,15 @@ def run_cross_sectional_walk_forward_window(
         selected_test_input.frame,
         selected_test_input.historical_membership,
     )
+    eligible_test_frame = filter_to_continuous_session(
+        eligible_test_frame,
+        selected_test_input.session_policy,
+    )
     if eligible_test_frame.empty:
         raise ValueError(
-            f"selected train winner {winner.instrument_key} has no exchange-eligible test rows"
+            f"selected train winner {selected_test_input.instrument_key} has no "
+            "continuous-session test rows"
         )
-
     # No re-selection here: the train winner's exact strategy definition is frozen before these
     # signals are generated from future data.
     test_signals = selected_definition.build_signals(eligible_test_frame)

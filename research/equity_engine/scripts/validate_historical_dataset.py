@@ -114,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
                 if payload.get("fingerprint_sha256") is not None
                 else None
             ),
+            fingerprint_schema=(
+                str(payload["fingerprint_schema"])
+                if payload.get("fingerprint_schema") is not None
+                else None
+            ),
             manifest_reference=str(args.manifest),
             calendar_evidence=calendar,
         )

@@ -8,11 +8,15 @@ import pandas as pd
 
 from .market_sessions import (
     NSE_CAS_EFFECTIVE_DATE,
-    NSE_NORMAL_CONTINUOUS_START,
     NSEEquitySessionPolicy,
 )
 from .nse_calendar import CalendarEvidence
-from .provenance import MarketDataManifest, dataframe_fingerprint, validate_ohlcv_frame
+from .provenance import (
+    FINGERPRINT_SCHEMA,
+    MarketDataManifest,
+    dataframe_fingerprint,
+    validate_ohlcv_frame,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,9 @@ class IntradaySessionRule:
     end_time: time
     interval_minutes: int
     source_reference: str
+    auxiliary_start_time: time | None = None
+    auxiliary_end_time: time | None = None
+    auxiliary_semantics: str | None = None
 
     def __post_init__(self) -> None:
         if not self.rule_id.strip() or not self.timezone.strip():
@@ -40,6 +47,16 @@ class IntradaySessionRule:
             raise ValueError("session rule interval_minutes must be positive")
         if not self.source_reference.strip():
             raise ValueError("session rule source_reference is required")
+        if (self.auxiliary_start_time is None) != (self.auxiliary_end_time is None):
+            raise ValueError("auxiliary session requires both start and end times")
+        if (
+            self.auxiliary_start_time is not None
+            and self.auxiliary_end_time is not None
+            and self.auxiliary_start_time >= self.auxiliary_end_time
+        ):
+            raise ValueError("auxiliary session start_time must be before end_time")
+        if self.auxiliary_start_time is None and self.auxiliary_semantics is not None:
+            raise ValueError("auxiliary_semantics requires an auxiliary session")
 
     def expected_timestamps(self, trade_date: date) -> pd.DatetimeIndex:
         start = pd.Timestamp(
@@ -65,6 +82,13 @@ class IntradaySessionRule:
             "end_time_exclusive": self.end_time.isoformat(),
             "interval_minutes": self.interval_minutes,
             "source_reference": self.source_reference,
+            "auxiliary_start_time": (
+                self.auxiliary_start_time.isoformat() if self.auxiliary_start_time else None
+            ),
+            "auxiliary_end_time_exclusive": (
+                self.auxiliary_end_time.isoformat() if self.auxiliary_end_time else None
+            ),
+            "auxiliary_semantics": self.auxiliary_semantics,
         }
 
 
@@ -75,6 +99,9 @@ class DailyIntradayValidation:
     first_timestamp: str | None
     last_timestamp: str | None
     duplicate_count: int
+    continuous_session_rows: int
+    cas_auxiliary_rows: int
+    cas_auxiliary_timestamps: tuple[str, ...]
     missing_expected_slots: tuple[str, ...]
     unexpected_timestamps: tuple[str, ...]
     timezone: str | None
@@ -98,6 +125,9 @@ class DailyIntradayValidation:
             "first_timestamp": self.first_timestamp,
             "last_timestamp": self.last_timestamp,
             "duplicate_count": self.duplicate_count,
+            "continuous_session_rows": self.continuous_session_rows,
+            "cas_auxiliary_rows": self.cas_auxiliary_rows,
+            "cas_auxiliary_timestamps": list(self.cas_auxiliary_timestamps),
             "missing_expected_slots": list(self.missing_expected_slots),
             "missing_expected_5_minute_slots": list(self.missing_expected_slots),
             "unexpected_timestamps": list(self.unexpected_timestamps),
@@ -116,6 +146,7 @@ class HistoricalDatasetValidation:
     structural_violations: tuple[str, ...]
     deterministic_data_fingerprint: str
     manifest_fingerprint_reference: str | None
+    fingerprint_schema: str
     manifest_reference: str | None
     timezone: str | None
     calendar_evidence: dict[str, object] | None
@@ -133,6 +164,7 @@ class HistoricalDatasetValidation:
             "structural_violations": list(self.structural_violations),
             "deterministic_data_fingerprint": self.deterministic_data_fingerprint,
             "manifest_fingerprint_reference": self.manifest_fingerprint_reference,
+            "fingerprint_schema": self.fingerprint_schema,
             "manifest_reference": self.manifest_reference,
             "timezone": self.timezone,
             "calendar_evidence": self.calendar_evidence,
@@ -168,10 +200,22 @@ def nse_session_rules_for_calendar(
         rules[trade_date] = IntradaySessionRule(
             rule_id=rule_id,
             timezone=timezone,
-            start_time=NSE_NORMAL_CONTINUOUS_START,
+            start_time=policy.continuous_start(trade_date),
             end_time=end_time,
             interval_minutes=interval_minutes,
             source_reference="nse_cm_normal_session_calendar + NSEEquitySessionPolicy",
+            auxiliary_start_time=(
+                time(15, 15) if rule_id == "nse-cm-cas-continuous-session" else None
+            ),
+            auxiliary_end_time=(
+                time(15, 35) if rule_id == "nse-cm-cas-continuous-session" else None
+            ),
+            auxiliary_semantics=(
+                "broker-observed-CAS-auxiliary-window; provider historical bucket semantics "
+                "unverified"
+                if rule_id == "nse-cm-cas-continuous-session"
+                else None
+            ),
         )
     if special_session_rules:
         rules.update(special_session_rules)
@@ -188,6 +232,7 @@ def validate_intraday_dataset(
     *,
     session_rules: Mapping[date, IntradaySessionRule],
     manifest_fingerprint_reference: str | None = None,
+    fingerprint_schema: str | None = None,
     manifest_reference: str | None = None,
     calendar_evidence: CalendarEvidence | None = None,
 ) -> HistoricalDatasetValidation:
@@ -227,15 +272,32 @@ def validate_intraday_dataset(
             day_frame = frame.iloc[0:0]
 
         rule = session_rules.get(trade_date)
-        actual_index = (
-            pd.DatetimeIndex(day_frame.index) if rule is not None else pd.DatetimeIndex([])
-        )
+        actual_index = pd.DatetimeIndex(day_frame.index)
         expected_index = (
             rule.expected_timestamps(trade_date) if rule is not None else pd.DatetimeIndex([])
         )
-        actual_unique = actual_index.unique()
-        missing = expected_index.difference(actual_unique)
-        unexpected = actual_unique.difference(expected_index)
+        if rule is None:
+            continuous_index = pd.DatetimeIndex([])
+            auxiliary_index = pd.DatetimeIndex([])
+            unexpected = actual_index.unique()
+        else:
+            continuous_mask = [
+                rule.start_time <= timestamp.time() < rule.end_time for timestamp in actual_index
+            ]
+            continuous_index = actual_index[continuous_mask]
+            auxiliary_mask = [
+                rule.auxiliary_start_time is not None
+                and rule.auxiliary_end_time is not None
+                and rule.auxiliary_start_time <= timestamp.time() < rule.auxiliary_end_time
+                for timestamp in actual_index
+            ]
+            auxiliary_index = actual_index[auxiliary_mask]
+            in_declared_window = [
+                continuous or auxiliary
+                for continuous, auxiliary in zip(continuous_mask, auxiliary_mask)
+            ]
+            unexpected = actual_index[~pd.Index(in_declared_window, dtype=bool)].unique()
+        missing = expected_index.difference(continuous_index.unique())
         first = _timestamp_text(day_frame.index[0]) if len(day_frame) else None
         last = _timestamp_text(day_frame.index[-1]) if len(day_frame) else None
         timezone = (
@@ -253,6 +315,9 @@ def validate_intraday_dataset(
                 first_timestamp=first,
                 last_timestamp=last,
                 duplicate_count=int(day_frame.index.duplicated(keep="first").sum()),
+                continuous_session_rows=len(continuous_index),
+                cas_auxiliary_rows=len(auxiliary_index),
+                cas_auxiliary_timestamps=tuple(_timestamp_text(item) for item in auxiliary_index),
                 missing_expected_slots=tuple(_timestamp_text(item) for item in missing),
                 unexpected_timestamps=tuple(_timestamp_text(item) for item in unexpected),
                 timezone=timezone,
@@ -268,6 +333,11 @@ def validate_intraday_dataset(
         structural.append(f"cannot compute deterministic data fingerprint: {exc}")
 
     if manifest_fingerprint_reference is not None and fingerprint:
+        if fingerprint_schema != FINGERPRINT_SCHEMA:
+            structural.append(
+                "fingerprint schema is legacy/unknown; original manifest fingerprint is retained "
+                "but is not comparable to the current deterministic schema"
+            )
         if fingerprint != manifest_fingerprint_reference:
             structural.append(
                 "manifest fingerprint does not match the deterministic data fingerprint; "
@@ -275,6 +345,9 @@ def validate_intraday_dataset(
             )
     elif manifest_fingerprint_reference is None:
         structural.append("manifest has no fingerprint_sha256 reference")
+    effective_fingerprint_schema = fingerprint_schema or "legacy/unknown"
+    if effective_fingerprint_schema not in {FINGERPRINT_SCHEMA, "legacy/unknown"}:
+        structural.append(f"unsupported fingerprint schema: {effective_fingerprint_schema}")
 
     calendar_payload = None
     if calendar_evidence is not None:
@@ -293,6 +366,7 @@ def validate_intraday_dataset(
         structural_violations=tuple(structural),
         deterministic_data_fingerprint=fingerprint,
         manifest_fingerprint_reference=manifest_fingerprint_reference,
+        fingerprint_schema=effective_fingerprint_schema,
         manifest_reference=manifest_reference,
         timezone=frame_tz,
         calendar_evidence=calendar_payload,

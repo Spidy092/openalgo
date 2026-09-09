@@ -12,6 +12,7 @@ from typing import Protocol
 import httpx
 import pandas as pd
 
+from .provenance import FINGERPRINT_SCHEMA
 from .upstox_history import UpstoxHistoricalDataProvider
 
 _TRANSIENT_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -385,6 +386,7 @@ class UpstoxHistoricalBatchDownloader:
                         "request": request,
                         "market_data_manifest": asdict(dataset.manifest),
                         "fingerprint_sha256": dataset.fingerprint,
+                        "fingerprint_schema": FINGERPRINT_SCHEMA,
                         "rows": len(dataset.frame),
                         "live_orders_called": False,
                     }
@@ -413,6 +415,7 @@ class UpstoxHistoricalBatchDownloader:
         batch_manifest = self.output_dir / "upstox_history_batch_manifest.json"
         batch_payload = {
             "schema_version": 1,
+            "fingerprint_schema": FINGERPRINT_SCHEMA,
             "generated_at": datetime.now(UTC).isoformat(),
             "interval_minutes": self.interval_minutes,
             "items": [asdict(item) for item in items],

@@ -9,6 +9,9 @@ from typing import Any
 import pandas as pd
 
 
+FINGERPRINT_SCHEMA = "equity-market-data-v2"
+
+
 @dataclass(frozen=True)
 class MarketDataManifest:
     provider: str

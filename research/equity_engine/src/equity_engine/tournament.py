@@ -16,6 +16,7 @@ from .event_simulator import (
     TradingEligibilityResolver,
     simulate_long_intraday,
 )
+from .market_sessions import filter_to_continuous_session
 from .liquidation_equity import (
     EquityObservation,
     build_liquidation_equity_curve,
@@ -30,9 +31,7 @@ class RankingMetric(StrEnum):
     PROFIT_FACTOR = "profit_factor"
     REALIZED_MAX_DRAWDOWN_PCT = "realized_max_drawdown_pct"
     CLOSE_LIQUIDATION_MAX_DRAWDOWN_PCT = "close_liquidation_max_drawdown_pct"
-    OHLC_LOW_LIQUIDATION_STRESS_MAX_DRAWDOWN_PCT = (
-        "ohlc_low_liquidation_stress_max_drawdown_pct"
-    )
+    OHLC_LOW_LIQUIDATION_STRESS_MAX_DRAWDOWN_PCT = "ohlc_low_liquidation_stress_max_drawdown_pct"
 
 
 @dataclass(frozen=True)
@@ -105,9 +104,7 @@ def _exact_metrics(
         net_pnl=result.net_pnl,
         net_return_pct=net_return,
         realized_max_drawdown_pct=realized_max_drawdown,
-        close_liquidation_max_drawdown_pct=(
-            liquidation.close_liquidation_max_drawdown_pct
-        ),
+        close_liquidation_max_drawdown_pct=(liquidation.close_liquidation_max_drawdown_pct),
         ohlc_low_liquidation_stress_max_drawdown_pct=(
             liquidation.ohlc_low_liquidation_stress_max_drawdown_pct
         ),
@@ -134,6 +131,13 @@ def evaluate_candidate_exact(
 
     if not candidate_id:
         raise ValueError("candidate_id is required")
+
+    continuous_frame = filter_to_continuous_session(frame, session_policy)
+    if not continuous_frame.index.equals(frame.index):
+        raise ValueError(
+            "exact candidate evaluation requires a continuous-session-only frame; "
+            "filter raw market data before building signals"
+        )
 
     simulation = simulate_long_intraday(
         frame=frame,

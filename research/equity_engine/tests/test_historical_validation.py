@@ -12,7 +12,11 @@ from equity_engine.historical_validation import (
     validate_intraday_dataset,
 )
 from equity_engine.nse_calendar import nse_cm_normal_session_calendar
-from equity_engine.provenance import MarketDataManifest, dataframe_fingerprint
+from equity_engine.provenance import (
+    FINGERPRINT_SCHEMA,
+    MarketDataManifest,
+    dataframe_fingerprint,
+)
 
 
 def _frame(index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -68,6 +72,7 @@ def test_complete_day_reports_explicit_coverage() -> None:
         manifest,
         session_rules={index[0].date(): _rule()},
         manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
     )
 
     assert report.passed
@@ -86,6 +91,7 @@ def test_missing_and_unexpected_slots_are_reported() -> None:
         manifest,
         session_rules={index[0].date(): _rule()},
         manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
     )
 
     assert not report.passed
@@ -103,6 +109,7 @@ def test_undeclared_date_fails_closed_instead_of_assuming_normal_session() -> No
         manifest,
         session_rules={},
         manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
     )
 
     assert not report.passed
@@ -126,6 +133,135 @@ def test_calendar_rules_keep_cas_effective_date_explicit() -> None:
     assert rules[datetime(2026, 8, 4).date()].end_time == time(15, 15)
 
 
+def test_cas_auxiliary_bars_are_reported_but_not_required_or_unexpected() -> None:
+    calendar = nse_cm_normal_session_calendar(
+        start=datetime(2026, 9, 8).date(), end=datetime(2026, 9, 8).date()
+    )
+    rules = nse_session_rules_for_calendar(
+        calendar,
+        timezone="Asia/Kolkata",
+        interval_minutes=5,
+        cas_eligible=True,
+    )
+    rule = rules[datetime(2026, 9, 8).date()]
+    index = rule.expected_timestamps(datetime(2026, 9, 8).date()).append(
+        pd.date_range(
+            "2026-09-08 15:15",
+            periods=3,
+            freq="5min",
+            tz="Asia/Kolkata",
+        )
+    )
+    frame = _frame(index)
+    manifest = _manifest(frame)
+
+    report = validate_intraday_dataset(
+        frame,
+        manifest,
+        session_rules=rules,
+        manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
+    )
+
+    assert report.passed
+    assert report.per_day[0].continuous_session_rows == 72
+    assert report.per_day[0].cas_auxiliary_rows == 3
+    assert report.per_day[0].cas_auxiliary_timestamps == (
+        "2026-09-08 15:15:00+05:30",
+        "2026-09-08 15:20:00+05:30",
+        "2026-09-08 15:25:00+05:30",
+    )
+
+
+def test_cas_auxiliary_ohlcv_violation_still_fails() -> None:
+    calendar = nse_cm_normal_session_calendar(
+        start=datetime(2026, 9, 8).date(), end=datetime(2026, 9, 8).date()
+    )
+    rules = nse_session_rules_for_calendar(
+        calendar,
+        timezone="Asia/Kolkata",
+        interval_minutes=5,
+        cas_eligible=True,
+    )
+    index = (
+        rules[datetime(2026, 9, 8).date()]
+        .expected_timestamps(datetime(2026, 9, 8).date())
+        .append(pd.DatetimeIndex([pd.Timestamp("2026-09-08 15:15", tz="Asia/Kolkata")]))
+    )
+    frame = _frame(index)
+    frame.loc[pd.Timestamp("2026-09-08 15:15", tz="Asia/Kolkata"), "close"] = None
+    manifest = _manifest(frame)
+
+    report = validate_intraday_dataset(
+        frame,
+        manifest,
+        session_rules=rules,
+        manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
+    )
+
+    assert not report.passed
+    assert any("missing values" in item for item in report.per_day[0].ohlcv_violations)
+
+
+def test_timestamp_outside_declared_cas_windows_fails() -> None:
+    calendar = nse_cm_normal_session_calendar(
+        start=datetime(2026, 9, 8).date(), end=datetime(2026, 9, 8).date()
+    )
+    rules = nse_session_rules_for_calendar(
+        calendar,
+        timezone="Asia/Kolkata",
+        interval_minutes=5,
+        cas_eligible=True,
+    )
+    index = (
+        rules[datetime(2026, 9, 8).date()]
+        .expected_timestamps(datetime(2026, 9, 8).date())
+        .append(
+            pd.DatetimeIndex(
+                [
+                    pd.Timestamp("2026-09-08 15:35", tz="Asia/Kolkata"),
+                ]
+            )
+        )
+    )
+    frame = _frame(index)
+    manifest = _manifest(frame)
+
+    report = validate_intraday_dataset(
+        frame,
+        manifest,
+        session_rules=rules,
+        manifest_fingerprint_reference=dataframe_fingerprint(frame, manifest),
+        fingerprint_schema=FINGERPRINT_SCHEMA,
+    )
+
+    assert not report.passed
+    assert report.per_day[0].unexpected_timestamps == ("2026-09-08 15:35:00+05:30",)
+
+
+def test_legacy_fingerprint_schema_remains_traceable_and_fails_closed() -> None:
+    index = pd.date_range("2026-09-07 09:15", periods=2, freq="5min", tz="Asia/Kolkata")
+    frame = _frame(index)
+    manifest = _manifest(frame)
+    legacy_fingerprint = "ac63c634da127b2bd3f0ff647de1e33fcb542dcbc934b969218a9db4c2dc62df"
+    current_fingerprint = dataframe_fingerprint(frame, manifest)
+
+    report = validate_intraday_dataset(
+        frame,
+        manifest,
+        session_rules={index[0].date(): _rule()},
+        manifest_fingerprint_reference=legacy_fingerprint,
+        fingerprint_schema=None,
+    )
+
+    assert not report.passed
+    assert report.fingerprint_schema == "legacy/unknown"
+    assert report.manifest_fingerprint_reference == legacy_fingerprint
+    assert report.deterministic_data_fingerprint == current_fingerprint
+    assert any("legacy/unknown" in item for item in report.structural_violations)
+
+
 def test_offline_validation_script_reads_artifact_without_network(tmp_path, capsys) -> None:
     index = pd.date_range("2026-09-07 09:15", periods=75, freq="5min", tz="Asia/Kolkata")
     frame = _frame(index)
@@ -139,6 +275,7 @@ def test_offline_validation_script_reads_artifact_without_network(tmp_path, caps
                 "instrument": {"cas_eligible": False},
                 "dataset_manifest": asdict(manifest),
                 "fingerprint_sha256": dataframe_fingerprint(frame, manifest),
+                "fingerprint_schema": FINGERPRINT_SCHEMA,
             },
             default=str,
         ),
@@ -156,5 +293,8 @@ def test_offline_validation_script_reads_artifact_without_network(tmp_path, caps
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "PASS"
     assert output["rows"] == 75
+    assert output["per_day"][0]["continuous_session_rows"] == 75
+    assert output["per_day"][0]["cas_auxiliary_rows"] == 0
     assert output["strategy_ready"] is False
     assert output["live_orders_called"] is False
+    assert output["fingerprint_schema"] == FINGERPRINT_SCHEMA
