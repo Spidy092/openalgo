@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -10,9 +10,27 @@ from equity_engine.historical_membership import (
     assess_historical_membership,
 )
 from equity_engine.market_sessions import NSEEquitySessionPolicy
+from equity_engine.models import ChargeBreakdown, CostQuote, CostSource, OrderSpec
 from equity_engine.tick_size import FixedTickSizePolicy
 from equity_engine.universe import CorporateActionAssessment, ResearchUniverseThresholds
 from equity_engine.universe_builder import ResearchUniverseCandidateData, build_research_universe
+
+
+class _ZeroChargeProvider:
+    def quote(self, order: OrderSpec) -> CostQuote:
+        return CostQuote(
+            order=order,
+            charges=ChargeBreakdown(
+                brokerage=Decimal("0"),
+                gst=Decimal("0"),
+                stt=Decimal("0"),
+                stamp_duty=Decimal("0"),
+                transaction=Decimal("0"),
+            ),
+            source=CostSource.DOCUMENTED_SNAPSHOT,
+            retrieved_at=datetime(2026, 9, 7),
+            source_refs=("synthetic-zero-charge-test",),
+        )
 
 
 def _frame(day1: str = "2026-08-31", day2: str = "2026-09-01") -> pd.DataFrame:
@@ -211,6 +229,52 @@ def test_minimum_tradable_quantity_is_respected_by_universe_affordability() -> N
 
     assert result.audits[0].affordable_quantity % 10 == 0
     assert result.audits[0].required_capital_rupees == Decimal("1000")
+
+
+@pytest.mark.parametrize(
+    ("reference_price", "expected_eligible"),
+    [
+        (Decimal("999.99"), True),
+        (Decimal("1000.00"), True),
+        (Decimal("1000.01"), False),
+    ],
+)
+def test_required_capital_boundary_is_explicit(
+    reference_price: Decimal,
+    expected_eligible: bool,
+) -> None:
+    frame = _frame(day1="2026-09-01", day2="2026-09-02").iloc[:2].copy()
+    frame[["open", "high", "low", "close"]] = reference_price
+    result = build_research_universe(
+        candidates=[_candidate("NSE_EQ|INE000000010", frame)],
+        selection_cutoff=date(2026, 9, 1),
+        capital_rupees=Decimal("1000.00"),
+        thresholds=_thresholds(min_observed_trading_days=1, max_last_price_rupees=Decimal("2000")),
+        cost_provider=_ZeroChargeProvider(),
+    )
+
+    audit = result.audits[0]
+    assert audit.required_capital_rupees == reference_price
+    assert audit.decision.eligible is expected_eligible
+
+
+def test_broker_balance_does_not_change_explicit_approved_capital_result() -> None:
+    frame = _frame(day1="2026-09-01", day2="2026-09-02").iloc[:2].copy()
+    kwargs = {
+        "candidates": [_candidate("NSE_EQ|INE000000011", frame)],
+        "selection_cutoff": date(2026, 9, 1),
+        "capital_rupees": Decimal("1000.00"),
+        "thresholds": _thresholds(min_observed_trading_days=1),
+        "cost_provider": CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
+    }
+
+    results = []
+    for observed_broker_balance in (Decimal("1000.00"), Decimal("50000.00")):
+        assert observed_broker_balance > 0
+        results.append(build_research_universe(**kwargs))
+
+    assert results[0] == results[1]
+    assert results[0].approved_capital_rupees == Decimal("1000.00")
 
 
 def test_future_intraday_price_cannot_change_earlier_reference_snapshot() -> None:
