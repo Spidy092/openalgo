@@ -40,7 +40,8 @@ def _notionals_arg(value: str) -> tuple[Decimal, ...]:
         notionals = tuple(Decimal(part) for part in parts)
     except (InvalidOperation, ValueError) as exc:
         raise argparse.ArgumentTypeError("--notionals must be comma-separated Decimals") from exc
-    if any(notional <= 0 or notional.is_finite() for notional in notionals):
+    # Check finiteness first: Decimal comparisons with NaN raise InvalidOperation.
+    if any(not notional.is_finite() or notional <= 0 for notional in notionals):
         raise argparse.ArgumentTypeError("--notionals must contain positive finite amounts")
     return notionals
 

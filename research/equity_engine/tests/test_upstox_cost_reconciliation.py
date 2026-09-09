@@ -30,6 +30,15 @@ from equity_engine.upstox_costs import UpstoxBrokerCostProvider
 TOKEN = "secret-token-that-must-not-appear"
 
 
+def _load_reconciliation_cli():
+    script_path = Path(__file__).parents[1] / "scripts" / "upstox_cost_reconciliation.py"
+    spec = importlib.util.spec_from_file_location("upstox_cost_reconciliation_cli", script_path)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    return cli
+
+
 def _broker_quote(order: OrderSpec, total: Decimal) -> CostQuote:
     local = CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)).quote(order)
     return CostQuote(
@@ -313,11 +322,7 @@ def test_evidence_artifact_contains_audit_fields(tmp_path) -> None:
 
 
 def test_configuration_exit_status_and_json_are_safe(capsys, monkeypatch) -> None:
-    script_path = Path(__file__).parents[1] / "scripts" / "upstox_cost_reconciliation.py"
-    spec = importlib.util.spec_from_file_location("upstox_cost_reconciliation_cli", script_path)
-    assert spec is not None and spec.loader is not None
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
+    cli = _load_reconciliation_cli()
     monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
     status = cli.main(
         [
@@ -339,3 +344,20 @@ def test_configuration_exit_status_and_json_are_safe(capsys, monkeypatch) -> Non
 def test_report_type_is_explicit() -> None:
     report = _run()
     assert isinstance(report, ReconciliationReport)
+
+
+@pytest.mark.parametrize("value", ["250,500,750", "250", "500", "750"])
+def test_notionals_parser_accepts_positive_finite_values(value: str) -> None:
+    cli = _load_reconciliation_cli()
+
+    result = cli._notionals_arg(value)
+
+    assert all(item.is_finite() and item > 0 for item in result)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "NaN", "Infinity"])
+def test_notionals_parser_rejects_non_positive_or_non_finite_values(value: str) -> None:
+    cli = _load_reconciliation_cli()
+
+    with pytest.raises(cli.argparse.ArgumentTypeError, match="positive finite"):
+        cli._notionals_arg(value)

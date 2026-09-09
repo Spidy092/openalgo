@@ -6,6 +6,7 @@ from typing import Mapping
 
 
 NSE_CAS_EFFECTIVE_DATE = date(2026, 8, 3)
+NSE_NORMAL_CONTINUOUS_START = time(9, 15)
 NSE_NORMAL_CONTINUOUS_END = time(15, 30)
 NSE_CAS_CONTINUOUS_END = time(15, 15)
 

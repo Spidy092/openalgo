@@ -1,6 +1,8 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from equity_engine.provenance import (
     MarketDataManifest,
@@ -75,3 +77,48 @@ def test_fingerprint_is_stable_and_changes_with_data() -> None:
 
     assert first == second
     assert first != third
+
+
+def test_fingerprint_excludes_retrieval_timestamp() -> None:
+    frame = _frame()
+    manifest = _manifest(frame)
+
+    first = dataframe_fingerprint(frame, manifest)
+    fetched_later = replace(manifest, retrieved_at=datetime(2026, 9, 8, tzinfo=timezone.utc))
+
+    assert first == dataframe_fingerprint(frame, fetched_later)
+
+
+def test_fingerprint_changes_when_timestamp_changes() -> None:
+    frame = _frame()
+    manifest = _manifest(frame)
+    changed = frame.copy()
+    changed.index = changed.index + pd.Timedelta(minutes=5)
+
+    assert dataframe_fingerprint(frame, manifest) != dataframe_fingerprint(changed, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("instrument_token", "NSE_EQ|OTHER"),
+        ("interval", "1m"),
+        ("adjustment_policy", "split-adjusted"),
+    ),
+)
+def test_fingerprint_changes_when_stable_manifest_identity_changes(field: str, value: str) -> None:
+    frame = _frame()
+    manifest = _manifest(frame)
+
+    assert dataframe_fingerprint(frame, manifest) != dataframe_fingerprint(
+        frame, replace(manifest, **{field: value})
+    )
+
+
+def test_fingerprint_includes_dataframe_row_order() -> None:
+    frame = _frame()
+    manifest = _manifest(frame)
+
+    assert dataframe_fingerprint(frame, manifest) != dataframe_fingerprint(
+        frame.iloc[::-1], manifest
+    )

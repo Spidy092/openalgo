@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import pandas as pd
 
@@ -25,6 +26,56 @@ class MarketDataManifest:
     source_reference: str
 
 
+# Retrieval time is intentionally absent: it describes when the artifact was fetched, not
+# what data the artifact contains. Keep this allow-list explicit so adding a volatile manifest
+# field cannot silently change dataset identity.
+_FINGERPRINT_MANIFEST_FIELDS = (
+    "provider",
+    "exchange",
+    "instrument_token",
+    "symbol",
+    "timezone",
+    "interval",
+    "timestamp_semantics",
+    "start",
+    "end",
+    "adjustment_policy",
+    "universe_rule_version",
+    "source_reference",
+)
+
+
+def _canonical_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _canonical_value(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    return value
+
+
+def _canonical_fingerprint_payload(
+    frame: pd.DataFrame, manifest: MarketDataManifest
+) -> dict[str, Any]:
+    row_hashes = pd.util.hash_pandas_object(frame, index=True).tolist()
+    return {
+        "manifest": {
+            field: _canonical_value(getattr(manifest, field))
+            for field in _FINGERPRINT_MANIFEST_FIELDS
+        },
+        "frame": {
+            "columns": [_canonical_value(column) for column in frame.columns.tolist()],
+            "column_dtypes": [str(dtype) for dtype in frame.dtypes.tolist()],
+            "index_name": _canonical_value(frame.index.name),
+            "index_dtype": str(frame.index.dtype),
+            # Keep the ordered row hashes as a JSON list. A set or sorted hash list would make
+            # reordered candles look identical, which is unsafe for time-series research.
+            "ordered_row_hashes": [int(row_hash) for row_hash in row_hashes],
+        },
+    }
+
+
 def dataframe_fingerprint(frame: pd.DataFrame, manifest: MarketDataManifest) -> str:
     """Create a deterministic fingerprint from metadata plus dataframe values/index.
 
@@ -35,18 +86,14 @@ def dataframe_fingerprint(frame: pd.DataFrame, manifest: MarketDataManifest) -> 
     if frame.empty:
         raise ValueError("cannot fingerprint an empty dataframe")
 
-    metadata = json.dumps(
-        asdict(manifest),
+    payload = json.dumps(
+        _canonical_fingerprint_payload(frame, manifest),
+        ensure_ascii=False,
         sort_keys=True,
-        default=str,
         separators=(",", ":"),
     ).encode("utf-8")
-    hashed_rows = pd.util.hash_pandas_object(frame, index=True).values.tobytes()
 
-    digest = hashlib.sha256()
-    digest.update(metadata)
-    digest.update(hashed_rows)
-    return digest.hexdigest()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def validate_ohlcv_frame(frame: pd.DataFrame) -> list[str]:
