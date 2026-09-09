@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 from .costs import CostProvider, ReconciliationResult, reconcile_costs
 from .documented_costs import CurrentTermsNSEIntradayCostProvider
 from .models import Exchange, OrderSpec, Product, Side
+from .sizing import max_affordable_buy_quantity
 from .upstox_costs import UpstoxBrokerCostProvider
 
 
@@ -138,6 +139,7 @@ def build_orders(
     price: Decimal,
     capital: Decimal,
     target_notionals: Iterable[Decimal],
+    cost_provider: CostProvider,
 ) -> tuple[OrderSpec, ...]:
     if not instrument_token.strip():
         raise ValueError("--instrument-token is required")
@@ -151,11 +153,16 @@ def build_orders(
     for target in _unique_positive_decimals(target_notionals):
         if not target.is_finite() or target <= 0:
             raise ValueError("target notionals must be positive finite Decimals")
-        quantity = int(target // price)
+        affordability = max_affordable_buy_quantity(
+            instrument_token=instrument_token.strip(),
+            exchange=Exchange.NSE,
+            product=Product.INTRADAY,
+            price=price,
+            cash_limit=min(target, capital),
+            cost_provider=cost_provider,
+        )
+        quantity = affordability.quantity
         if quantity <= 0 or quantity in seen_quantities:
-            continue
-        order_notional = price * quantity
-        if order_notional > capital:
             continue
         seen_quantities.add(quantity)
         for side in (Side.BUY, Side.SELL):
@@ -194,13 +201,14 @@ def reconcile_orders(
     if not tolerance.is_finite() or tolerance < 0:
         raise ValueError("--tolerance must be a non-negative finite Decimal")
 
+    local = local_provider or CurrentTermsNSEIntradayCostProvider(pricing_date=pricing_date)
     orders = build_orders(
         instrument_token=instrument_token,
         price=price,
         capital=capital,
         target_notionals=target_notionals,
+        cost_provider=local,
     )
-    local = local_provider or CurrentTermsNSEIntradayCostProvider(pricing_date=pricing_date)
     broker = broker_provider or UpstoxBrokerCostProvider(access_token=access_token)
     generated_at = (now or (lambda: datetime.now(timezone.utc)))().astimezone(timezone.utc)
 

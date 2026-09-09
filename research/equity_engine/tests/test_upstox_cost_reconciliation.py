@@ -15,6 +15,7 @@ from equity_engine.upstox_cost_reconciliation import (
     EXIT_PASS,
     ReconciliationReport,
     exit_code_for,
+    build_orders,
     reconcile_orders,
     report_as_dict,
     report_as_json,
@@ -60,9 +61,61 @@ def _run(*, delta: Decimal = Decimal("0"), tolerance: Decimal = Decimal("0.01"))
         capital=Decimal("1000"),
         pricing_date=date(2026, 9, 7),
         tolerance=tolerance,
-        target_notionals=(Decimal("100"),),
+        target_notionals=(Decimal("250"),),
         broker_provider=_FixedBroker(delta),
     )
+
+
+def test_raw_notional_that_exceeds_cash_after_entry_charges_is_reduced() -> None:
+    provider = CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7))
+    orders = build_orders(
+        instrument_token="NSE_EQ|TEST",
+        price=Decimal("100"),
+        capital=Decimal("1000"),
+        target_notionals=(Decimal("1000"),),
+        cost_provider=provider,
+    )
+    buy = next(order for order in orders if order.side is Side.BUY)
+    quote = provider.quote(buy)
+    assert buy.quantity == 9
+    assert buy.notional == Decimal("900")
+    assert buy.notional + quote.total <= Decimal("1000")
+
+
+def test_generated_buy_cash_requirement_never_exceeds_capital() -> None:
+    provider = CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7))
+    capital = Decimal("1000")
+    orders = build_orders(
+        instrument_token="NSE_EQ|TEST",
+        price=Decimal("100"),
+        capital=capital,
+        target_notionals=(
+            Decimal("100"),
+            Decimal("250"),
+            Decimal("500"),
+            Decimal("750"),
+            Decimal("950"),
+        ),
+        cost_provider=provider,
+    )
+    buys = [order for order in orders if order.side is Side.BUY]
+    assert buys
+    assert all(order.notional + provider.quote(order).total <= capital for order in buys)
+
+
+def test_generated_sell_uses_corresponding_buy_quantity() -> None:
+    provider = CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7))
+    orders = build_orders(
+        instrument_token="NSE_EQ|TEST",
+        price=Decimal("100"),
+        capital=Decimal("1000"),
+        target_notionals=(Decimal("100"), Decimal("250"), Decimal("500")),
+        cost_provider=provider,
+    )
+    buy_quantities = [order.quantity for order in orders if order.side is Side.BUY]
+    sell_quantities = [order.quantity for order in orders if order.side is Side.SELL]
+    assert buy_quantities == sell_quantities
+    assert len(buy_quantities) == len(set(buy_quantities))
 
 
 def test_missing_token_is_rejected() -> None:
@@ -114,7 +167,7 @@ def test_broker_api_error_is_not_a_false_pass() -> None:
         capital=Decimal("1000"),
         pricing_date=date(2026, 9, 7),
         tolerance=Decimal("0.05"),
-        target_notionals=(Decimal("100"),),
+        target_notionals=(Decimal("250"),),
         broker_provider=_ErrorBroker(),
     )
     assert report.overall == "ERROR"
