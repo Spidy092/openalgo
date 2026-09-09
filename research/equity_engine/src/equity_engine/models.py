@@ -10,6 +10,7 @@ from typing import Tuple
 class CostSource(StrEnum):
     BROKER_QUOTE = "broker_quote"
     DOCUMENTED_SNAPSHOT = "documented_snapshot"
+    OBSERVED_SNAPSHOT = "observed_snapshot"
 
 
 class Side(StrEnum):

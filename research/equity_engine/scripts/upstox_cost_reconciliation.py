@@ -9,9 +9,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from equity_engine.upstox_cost_reconciliation import (
+    COST_MODELS,
     DEFAULT_NOTIONALS,
     EXIT_BROKER_API_ERROR,
     EXIT_CONFIGURATION_ERROR,
+    cost_provider_for_model,
     reconcile_orders,
     report_as_json,
     render_terminal,
@@ -58,6 +60,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--capital", type=_decimal_arg, default=Decimal("1000"))
     parser.add_argument("--pricing-date", type=date.fromisoformat, default=date.today())
     parser.add_argument(
+        "--cost-model",
+        choices=COST_MODELS,
+        default="documented",
+        help="Cost model to reconcile; documented is the safe default",
+    )
+    parser.add_argument(
         "--notionals", type=_notionals_arg, default=tuple(Decimal(x) for x in DEFAULT_NOTIONALS)
     )
     parser.add_argument("--tolerance", required=True, type=_decimal_arg, help="INR tolerance")
@@ -78,6 +86,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIGURATION_ERROR
 
     try:
+        local_provider = cost_provider_for_model(
+            cost_model=args.cost_model,
+            pricing_date=args.pricing_date,
+        )
         report = reconcile_orders(
             access_token=token,
             instrument_token=args.instrument_token,
@@ -87,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
             pricing_date=args.pricing_date,
             tolerance=args.tolerance,
             target_notionals=args.notionals,
+            local_provider=local_provider,
+            cost_model=args.cost_model,
         )
     except (ValueError, NotImplementedError) as exc:
         if args.json:

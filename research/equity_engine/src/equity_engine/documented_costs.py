@@ -36,6 +36,7 @@ class CurrentTermsNSEIntradayCostProvider:
     """
 
     EFFECTIVE_FROM = date(2026, 3, 1)
+    MODEL_NAME = "documented"
 
     BROKERAGE_RATE = Decimal("0.001")  # 0.1% per executed intraday order
     BROKERAGE_CAP = Decimal("20")
@@ -54,6 +55,27 @@ class CurrentTermsNSEIntradayCostProvider:
             )
         self._pricing_date = pricing_date
 
+    @property
+    def provenance(self) -> dict[str, str]:
+        return {
+            "source": "Upstox public/documented pricing terms",
+            "effective_date": self.EFFECTIVE_FROM.isoformat(),
+            "brokerage_rate": str(self.BROKERAGE_RATE),
+            "scope": "NSE equity intraday / documented terms snapshot",
+        }
+
+    def _round_component(self, value: Decimal) -> Decimal:
+        return value
+
+    def _cost_source(self) -> CostSource:
+        return CostSource.DOCUMENTED_SNAPSHOT
+
+    def _source_refs(self) -> tuple[str, ...]:
+        return (UPSTOX_PRICING_SOURCE, NSE_TRANSACTION_SOURCE, NSE_STT_SOURCE)
+
+    def _effective_date(self) -> date:
+        return self.EFFECTIVE_FROM
+
     def quote(self, order: OrderSpec) -> CostQuote:
         if order.exchange is not Exchange.NSE:
             raise NotImplementedError("current documented snapshot supports NSE only")
@@ -61,19 +83,21 @@ class CurrentTermsNSEIntradayCostProvider:
             raise NotImplementedError("current documented snapshot supports intraday only")
 
         turnover = order.notional
-        brokerage = min(turnover * self.BROKERAGE_RATE, self.BROKERAGE_CAP)
-        transaction = turnover * self.NSE_TRANSACTION_RATE
-        ipft = turnover * self.NSE_IPFT_RATE
-        sebi_turnover = turnover * self.SEBI_TURNOVER_RATE
-        stt = turnover * self.STT_SELL_RATE if order.side is Side.SELL else Decimal("0")
-        stamp_duty = (
+        brokerage = self._round_component(min(turnover * self.BROKERAGE_RATE, self.BROKERAGE_CAP))
+        transaction = self._round_component(turnover * self.NSE_TRANSACTION_RATE)
+        ipft = self._round_component(turnover * self.NSE_IPFT_RATE)
+        sebi_turnover = self._round_component(turnover * self.SEBI_TURNOVER_RATE)
+        stt = self._round_component(
+            turnover * self.STT_SELL_RATE if order.side is Side.SELL else Decimal("0")
+        )
+        stamp_duty = self._round_component(
             turnover * self.STAMP_BUY_RATE if order.side is Side.BUY else Decimal("0")
         )
 
         # Upstox's current detailed pricing table states GST for equity intraday is levied on
         # brokerage + transaction charges + IPFT. This exact formula must still be reconciled
         # against the broker quote before any live promotion.
-        gst = (brokerage + transaction + ipft) * self.GST_RATE
+        gst = self._round_component((brokerage + transaction + ipft) * self.GST_RATE)
 
         return CostQuote(
             order=order,
@@ -86,8 +110,8 @@ class CurrentTermsNSEIntradayCostProvider:
                 ipft=ipft,
                 sebi_turnover=sebi_turnover,
             ),
-            source=CostSource.DOCUMENTED_SNAPSHOT,
+            source=self._cost_source(),
             retrieved_at=datetime.now(timezone.utc),
-            source_refs=(UPSTOX_PRICING_SOURCE, NSE_TRANSACTION_SOURCE, NSE_STT_SOURCE),
-            effective_date=self.EFFECTIVE_FROM,
+            source_refs=self._source_refs(),
+            effective_date=self._effective_date(),
         )

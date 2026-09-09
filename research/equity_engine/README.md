@@ -98,11 +98,14 @@ python scripts/upstox_cost_reconciliation.py \
   --symbol RELIANCE \
   --price 250 \
   --pricing-date 2026-09-07 \
+  --cost-model documented \
   --tolerance 0.05 \
   --output data/reconciliation/reliance.json
 ```
 
 The runner generates distinct affordable quantities near ₹100, ₹250, ₹500, ₹750 and ₹950, and checks both BUY and SELL. It uses the broker's reported `charges.total` as authoritative, retains broker charge components in the optional evidence file, uses Decimal-only comparisons, and exits 1 when a difference exceeds the explicitly supplied tolerance. It only calls the read-only Brokerage Details endpoint; live orders are never called. The token is read from the environment and is not printed or persisted.
+
+The safe default `--cost-model documented` uses the public/documented 0.1% brokerage snapshot. The separately selected `--cost-model broker-observed` uses the authenticated 2026-09-09 account snapshot at 0.06% brokerage with component-level paise rounding. The observed snapshot is additional evidence and does not rewrite or retroactively mark earlier documented-model reconciliation results.
 
 ## Costs that must be represented
 

@@ -10,6 +10,7 @@ from typing import Callable, Iterable
 from .costs import CostProvider, ReconciliationResult, reconcile_costs
 from .documented_costs import CurrentTermsNSEIntradayCostProvider
 from .models import Exchange, OrderSpec, Product, Side
+from .observed_costs import ObservedUpstoxNSEIntradayCostProvider
 from .sizing import max_affordable_buy_quantity
 from .upstox_costs import UpstoxBrokerCostProvider
 
@@ -20,6 +21,9 @@ EXIT_CONFIGURATION_ERROR = 2
 EXIT_BROKER_API_ERROR = 3
 
 DEFAULT_NOTIONALS = ("100", "250", "500", "750", "950")
+COST_MODEL_DOCUMENTED = "documented"
+COST_MODEL_BROKER_OBSERVED = "broker-observed"
+COST_MODELS = (COST_MODEL_DOCUMENTED, COST_MODEL_BROKER_OBSERVED)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,8 @@ class ReconciliationReport:
     tolerance: Decimal
     items: tuple[ReconciliationItem, ...]
     overall: str
+    cost_model: str = COST_MODEL_DOCUMENTED
+    model_provenance: dict[str, str] | None = None
     live_orders_called: bool = False
 
     @property
@@ -133,6 +139,14 @@ def _unique_positive_decimals(values: Iterable[Decimal]) -> tuple[Decimal, ...]:
     return tuple(sorted(unique))
 
 
+def cost_provider_for_model(*, cost_model: str, pricing_date: date) -> CostProvider:
+    if cost_model == COST_MODEL_DOCUMENTED:
+        return CurrentTermsNSEIntradayCostProvider(pricing_date=pricing_date)
+    if cost_model == COST_MODEL_BROKER_OBSERVED:
+        return ObservedUpstoxNSEIntradayCostProvider(pricing_date=pricing_date)
+    raise ValueError(f"unsupported cost model: {cost_model!r}")
+
+
 def build_orders(
     *,
     instrument_token: str,
@@ -195,13 +209,19 @@ def reconcile_orders(
     local_provider: CostProvider | None = None,
     broker_provider: CostProvider | None = None,
     now: Callable[[], datetime] | None = None,
+    cost_model: str = COST_MODEL_DOCUMENTED,
 ) -> ReconciliationReport:
     if not access_token.strip():
         raise ValueError("UPSTOX_ACCESS_TOKEN is not set")
     if not tolerance.is_finite() or tolerance < 0:
         raise ValueError("--tolerance must be a non-negative finite Decimal")
+    if cost_model not in COST_MODELS:
+        raise ValueError(f"unsupported cost model: {cost_model!r}")
 
-    local = local_provider or CurrentTermsNSEIntradayCostProvider(pricing_date=pricing_date)
+    local = local_provider or cost_provider_for_model(
+        cost_model=cost_model,
+        pricing_date=pricing_date,
+    )
     orders = build_orders(
         instrument_token=instrument_token,
         price=price,
@@ -273,6 +293,8 @@ def reconcile_orders(
         tolerance=tolerance,
         items=tuple(items),
         overall=overall,
+        cost_model=cost_model,
+        model_provenance=getattr(local, "provenance", None),
         live_orders_called=False,
     )
 
@@ -290,6 +312,7 @@ def render_terminal(report: ReconciliationReport) -> str:
         "UPSTOX COST RECONCILIATION",
         "",
         f"Instrument: {report.symbol} / {report.instrument_token}",
+        f"Cost model: {report.cost_model}",
         f"Pricing date: {report.pricing_date.isoformat()}",
         f"Capital cap: ₹{_decimal_text(report.capital)}",
         f"Tolerance: ₹{_decimal_text(report.tolerance)} (configured)",

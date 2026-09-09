@@ -9,13 +9,17 @@ import pytest
 
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.models import CostQuote, CostSource, Exchange, OrderSpec, Product, Side
+from equity_engine.observed_costs import ObservedUpstoxNSEIntradayCostProvider
 from equity_engine.upstox_cost_reconciliation import (
+    COST_MODEL_BROKER_OBSERVED,
+    COST_MODEL_DOCUMENTED,
     EXIT_BROKER_API_ERROR,
     EXIT_CONFIGURATION_ERROR,
     EXIT_PASS,
     ReconciliationReport,
-    exit_code_for,
     build_orders,
+    cost_provider_for_model,
+    exit_code_for,
     reconcile_orders,
     report_as_dict,
     report_as_json,
@@ -50,6 +54,22 @@ class _FixedBroker:
 class _ErrorBroker:
     def quote(self, order: OrderSpec) -> CostQuote:
         raise httpx.ReadTimeout("simulated transient Upstox failure")
+
+
+class _MatchingBroker:
+    def __init__(self, provider) -> None:
+        self.provider = provider
+
+    def quote(self, order: OrderSpec) -> CostQuote:
+        estimate = self.provider.quote(order)
+        return CostQuote(
+            order=order,
+            charges=estimate.charges,
+            source=CostSource.BROKER_QUOTE,
+            retrieved_at=datetime.now(timezone.utc),
+            source_refs=("test-broker",),
+            broker_reported_total=estimate.total,
+        )
 
 
 def _run(*, delta: Decimal = Decimal("0"), tolerance: Decimal = Decimal("0.01")):
@@ -145,6 +165,38 @@ def test_sell_comparison_passes() -> None:
     assert sell.status == "PASS"
 
 
+def test_documented_model_is_the_explicit_safe_default() -> None:
+    report = _run()
+
+    assert report.cost_model == COST_MODEL_DOCUMENTED
+    assert report.model_provenance["brokerage_rate"] == "0.001"
+
+
+def test_runner_can_explicitly_select_broker_observed_model() -> None:
+    provider = cost_provider_for_model(
+        cost_model=COST_MODEL_BROKER_OBSERVED,
+        pricing_date=date(2026, 9, 9),
+    )
+    assert isinstance(provider, ObservedUpstoxNSEIntradayCostProvider)
+    report = reconcile_orders(
+        access_token=TOKEN,
+        instrument_token="NSE_EQ|INE001A01036",
+        symbol="TEST",
+        price=Decimal("100"),
+        capital=Decimal("1000"),
+        pricing_date=date(2026, 9, 9),
+        tolerance=Decimal("0.01"),
+        target_notionals=(Decimal("250"),),
+        local_provider=provider,
+        broker_provider=_MatchingBroker(provider),
+        cost_model=COST_MODEL_BROKER_OBSERVED,
+    )
+
+    assert report.overall == "PASS"
+    assert report.cost_model == COST_MODEL_BROKER_OBSERVED
+    assert report.model_provenance["brokerage_rate"] == "0.0006"
+
+
 def test_tolerance_boundary_is_inclusive() -> None:
     report = _run(delta=Decimal("0.05"), tolerance=Decimal("0.05"))
     assert report.overall == "PASS"
@@ -200,6 +252,7 @@ def test_malformed_broker_response_fails_closed() -> None:
 
 def test_broker_reported_total_is_authoritative() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/charges/brokerage"
         assert request.url.params["instrument_token"] == "NSE_EQ|TEST"
         assert request.url.params["quantity"] == "1"
         assert request.url.params["product"] == "I"
