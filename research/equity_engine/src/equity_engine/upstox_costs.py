@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Mapping
 
 import httpx
 
@@ -21,7 +22,19 @@ UPSTOX_BROKERAGE_DOC = "https://upstox.com/developer/api-documentation/get-broke
 def _money(value: object | None) -> Decimal:
     if value is None:
         return Decimal("0")
-    return Decimal(str(value))
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, ValueError) as exc:
+        raise ValueError("malformed numeric value in Upstox brokerage response") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise ValueError("malformed non-negative money value in Upstox brokerage response")
+    return parsed
+
+
+def _mapping(value: object, *, name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"malformed {name} in Upstox brokerage response")
+    return value
 
 
 class UpstoxBrokerCostProvider:
@@ -81,12 +94,23 @@ class UpstoxBrokerCostProvider:
         response.raise_for_status()
         payload = response.json()
 
+        payload = _mapping(payload, name="payload")
         if payload.get("status") != "success":
-            raise RuntimeError(f"unexpected Upstox brokerage response: {payload!r}")
+            raise RuntimeError("Upstox brokerage response was not successful")
 
-        raw = payload["data"]["charges"]
-        taxes = raw.get("taxes") or {}
-        other_charges = raw.get("other_charges") or raw.get("otherTaxes") or {}
+        data = _mapping(payload.get("data"), name="data")
+        raw = _mapping(data.get("charges"), name="charges")
+        if "total" not in raw or raw["total"] is None:
+            raise ValueError("missing total in Upstox brokerage response")
+        taxes_value = raw.get("taxes")
+        taxes = _mapping({} if taxes_value is None else taxes_value, name="taxes")
+        other_charges_value = raw.get("other_charges")
+        if other_charges_value is None:
+            other_charges_value = raw.get("otherTaxes")
+        other_charges = _mapping(
+            {} if other_charges_value is None else other_charges_value,
+            name="other charges",
+        )
 
         charges = ChargeBreakdown(
             brokerage=_money(raw.get("brokerage")),

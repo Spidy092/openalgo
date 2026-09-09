@@ -89,6 +89,21 @@ A documented snapshot is an estimate. It MUST carry source URLs, verification da
 
 Before a strategy can be marked live-eligible, representative orders must be reconciled against the broker's Brokerage Details API. The configured tolerance is expressed in INR and should normally be at paisa-level precision.
 
+Run the read-only cost reconciliation for a supplied NSE instrument token and price:
+
+```bash
+export UPSTOX_ACCESS_TOKEN='...'
+python scripts/upstox_cost_reconciliation.py \
+  --instrument-token 'NSE_EQ|INE002A01018' \
+  --symbol RELIANCE \
+  --price 250 \
+  --pricing-date 2026-09-07 \
+  --tolerance 0.05 \
+  --output data/reconciliation/reliance.json
+```
+
+The runner generates distinct affordable quantities near ₹100, ₹250, ₹500, ₹750 and ₹950, and checks both BUY and SELL. It uses the broker's reported `charges.total` as authoritative, retains broker charge components in the optional evidence file, uses Decimal-only comparisons, and exits 1 when a difference exceeds the explicitly supplied tolerance. It only calls the read-only Brokerage Details endpoint; live orders are never called. The token is read from the environment and is not printed or persisted.
+
 ## Costs that must be represented
 
 Where applicable:
