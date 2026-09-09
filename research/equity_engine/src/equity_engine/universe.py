@@ -53,6 +53,7 @@ class HistoricalLiquidityEvidence:
     observed_trading_days: int
     affordable_quantity_after_entry_costs: int
     source_complete: bool
+    approved_capital_rupees: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.last_price_rupees <= 0:
@@ -65,6 +66,12 @@ class HistoricalLiquidityEvidence:
             raise ValueError("observed_trading_days cannot be negative")
         if self.affordable_quantity_after_entry_costs < 0:
             raise ValueError("affordable quantity cannot be negative")
+        if self.approved_capital_rupees is not None and (
+            not isinstance(self.approved_capital_rupees, Decimal)
+            or not self.approved_capital_rupees.is_finite()
+            or self.approved_capital_rupees <= 0
+        ):
+            raise ValueError("approved_capital_rupees must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -116,11 +123,15 @@ def evaluate_research_universe_candidate(
             + ", ".join(day.isoformat() for day in historical_membership.missing_dates)
         )
     if not historical_membership.eligible_dates:
-        violations.append("instrument has no eligible historical trading dates in the research window")
+        violations.append(
+            "instrument has no eligible historical trading dates in the research window"
+        )
 
     eligible_dates = set(historical_membership.eligible_dates)
     if set(tick_coverage.requested_dates) != eligible_dates:
-        violations.append("tick-size coverage was not evaluated on exactly the eligible historical dates")
+        violations.append(
+            "tick-size coverage was not evaluated on exactly the eligible historical dates"
+        )
     if not tick_coverage.complete:
         violations.append(
             "verified historical tick size is missing for: "
@@ -134,14 +145,23 @@ def evaluate_research_universe_candidate(
             f"last price ₹{liquidity.last_price_rupees} exceeds research cap "
             f"₹{thresholds.max_last_price_rupees}"
         )
-    if liquidity.median_daily_notional_proxy_rupees < thresholds.min_median_daily_notional_proxy_rupees:
+    if (
+        liquidity.median_daily_notional_proxy_rupees
+        < thresholds.min_median_daily_notional_proxy_rupees
+    ):
         violations.append("median daily notional proxy is below required threshold")
     if liquidity.median_daily_volume_shares < thresholds.min_median_daily_volume_shares:
         violations.append("median daily volume is below required threshold")
     if liquidity.observed_trading_days < thresholds.min_observed_trading_days:
         violations.append("insufficient observed trading-history days")
     if liquidity.affordable_quantity_after_entry_costs < thresholds.min_affordable_quantity:
-        violations.append("₹1,000 account cannot afford required quantity after entry costs")
+        if liquidity.approved_capital_rupees is None:
+            violations.append("approved capital cannot afford required quantity after entry costs")
+        else:
+            violations.append(
+                f"approved capital ₹{liquidity.approved_capital_rupees} cannot afford "
+                "required quantity after entry costs"
+            )
 
     if not corporate_actions.complete:
         violations.append("corporate-action evidence is incomplete")
@@ -174,9 +194,13 @@ def evaluate_live_universe_candidate(
     if current_instrument.exchange != "NSE" or current_instrument.segment != "NSE_EQ":
         violations.append("current instrument is not NSE cash equity")
     if current_instrument.instrument_type != "EQ":
-        violations.append(f"current instrument_type {current_instrument.instrument_type!r} is not EQ")
+        violations.append(
+            f"current instrument_type {current_instrument.instrument_type!r} is not EQ"
+        )
     if current_instrument.security_type != "NORMAL":
-        violations.append(f"current security_type {current_instrument.security_type!r} is not NORMAL")
+        violations.append(
+            f"current security_type {current_instrument.security_type!r} is not NORMAL"
+        )
     if not current_instrument.mis_eligible:
         violations.append("instrument is not present in current Upstox NSE MIS list")
     if current_instrument.suspended:

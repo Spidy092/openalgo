@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import median
-from typing import Iterable
 
 import pandas as pd
 
 from .provenance import validate_ohlcv_frame
 from .universe import HistoricalLiquidityEvidence, LiveSpreadEvidence
-
 
 _BPS = Decimal("10000")
 
@@ -22,6 +21,7 @@ def summarize_historical_liquidity(
     *,
     frame: pd.DataFrame,
     affordable_quantity_after_entry_costs: int,
+    approved_capital_rupees: Decimal | None = None,
 ) -> HistoricalLiquidityEvidence:
     """Summarize OHLCV liquidity without mislabeling estimated notional as exchange turnover.
 
@@ -57,6 +57,7 @@ def summarize_historical_liquidity(
         observed_trading_days=len(volume_by_day),
         affordable_quantity_after_entry_costs=affordable_quantity_after_entry_costs,
         source_complete=True,
+        approved_capital_rupees=approved_capital_rupees,
     )
 
 

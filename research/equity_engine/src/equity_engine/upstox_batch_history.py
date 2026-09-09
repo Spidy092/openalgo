@@ -163,7 +163,7 @@ def plan_historical_batch(
         "candidate set was explicitly prefiltered before 5-minute acquisition"
         if affordability_prefilter_applied
         else (
-            "NSE reference masters contain no historical market price; ₹1,000 affordability "
+            "NSE reference masters contain no historical market price; approved-capital affordability "
             "cannot be inferred safely here. Full acquisition is planning-only until an explicit "
             "prefilter candidate file is supplied."
         )

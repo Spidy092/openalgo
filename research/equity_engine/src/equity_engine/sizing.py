@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR
+from decimal import ROUND_FLOOR, Decimal
 
 from .costs import CostProvider
 from .models import Exchange, OrderSpec, Product, Side
@@ -24,20 +24,30 @@ def max_affordable_buy_quantity(
     price: Decimal,
     cash_limit: Decimal,
     cost_provider: CostProvider,
+    minimum_tradable_quantity: int = 1,
 ) -> PositionSize:
-    """Return the largest integer quantity whose buy notional + quoted charges fits cash.
+    """Return the largest tradable quantity whose buy cash requirement fits cash.
 
     The search calls the configured cost provider instead of assuming linear fees, so the same
     function works with capped brokerage and with the authoritative broker quote provider.
+    ``cash_limit`` is explicit approved capital; it is never read from a broker balance or
+    inferred from account readiness.
     """
 
-    if price <= 0:
+    if not isinstance(price, Decimal) or not price.is_finite() or price <= 0:
         raise ValueError("price must be positive")
-    if cash_limit <= 0:
+    if not isinstance(cash_limit, Decimal) or not cash_limit.is_finite() or cash_limit <= 0:
         raise ValueError("cash_limit must be positive")
+    if (
+        isinstance(minimum_tradable_quantity, bool)
+        or not isinstance(minimum_tradable_quantity, int)
+        or minimum_tradable_quantity <= 0
+    ):
+        raise ValueError("minimum_tradable_quantity must be a positive integer")
 
     upper = int((cash_limit / price).to_integral_value(rounding=ROUND_FLOOR))
-    if upper <= 0:
+    upper_units = upper // minimum_tradable_quantity
+    if upper_units <= 0:
         return PositionSize(
             quantity=0,
             notional=Decimal("0"),
@@ -47,11 +57,12 @@ def max_affordable_buy_quantity(
         )
 
     low = 0
-    high = upper
+    high = upper_units
     best: PositionSize | None = None
 
     while low <= high:
-        quantity = (low + high) // 2
+        units = (low + high) // 2
+        quantity = units * minimum_tradable_quantity
         if quantity == 0:
             low = 1
             continue
@@ -75,9 +86,9 @@ def max_affordable_buy_quantity(
                 cash_required=required,
                 cash_remaining=cash_limit - required,
             )
-            low = quantity + 1
+            low = units + 1
         else:
-            high = quantity - 1
+            high = units - 1
 
     if best is None:
         return PositionSize(

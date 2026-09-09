@@ -46,7 +46,7 @@ python scripts/upstox_history_batch.py \
   --universe-manifest data/nse_universe_batch/nse_universe_manifest.json
 ```
 
-This reports the full-universe candidate count, estimated Upstox request count, estimated rows/storage, and explicitly reports that the ₹1,000 affordability prefilter has not yet been applied. NSE reference masters do not contain historical market prices, so the program refuses to infer affordability from them.
+This reports the full-universe candidate count, estimated Upstox request count, estimated rows/storage, and explicitly reports that the approved-capital affordability prefilter has not yet been applied. NSE reference masters do not contain historical market prices, so the program refuses to infer affordability from them.
 
 Actual 5-minute acquisition is deliberately blocked until a separate point-in-time affordability/liquidity step produces an explicit candidate JSON file. Execution requires both `--candidate-file` and `--prefilter-evidence`; it reads `UPSTOX_ACCESS_TOKEN` from the environment, rate-limits/retries transient market-data requests, fingerprints every dataset, saves Parquet + manifest, resumes verified artifacts, and never writes the token to artifacts.
 

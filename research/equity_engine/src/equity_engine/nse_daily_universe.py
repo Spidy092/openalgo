@@ -79,7 +79,7 @@ def materialize_nse_daily_equity_universe(
 ) -> NseDailyEquityUniverse:
     """Materialize one point-in-time EQ universe from one dated NSE master snapshot.
 
-    This function does not apply liquidity or ₹1,000 affordability filters. Those use only market
+    This function does not apply liquidity or approved-capital affordability filters. Those use only market
     data known by the later selection cutoff. Here we answer the narrower exchange-reference
     question: which configured normal-equity rows existed, what was their dated tick, and were
     they permitted/eligible/not-suspended according to the sourced semantics for this date?

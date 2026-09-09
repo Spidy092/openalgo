@@ -70,3 +70,17 @@ def test_probe_never_exposes_profile_identity_fields() -> None:
     serialized = repr(snapshot)
     assert "must-not-leak@example.com" not in serialized
     assert "test-token" not in serialized
+
+
+def test_readiness_minimum_test_capital_is_configurable_and_not_approved_capital() -> None:
+    with _client() as client:
+        snapshot = UpstoxReadinessProbe(
+            access_token="test-token",
+            client=client,
+            minimum_test_capital=Decimal("2000"),
+        ).run()
+
+    assert not snapshot.passed
+    check = next(item for item in snapshot.checks if item.name == "minimum_test_capital_present")
+    assert not check.passed
+    assert "2000" in check.detail

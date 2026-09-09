@@ -44,12 +44,20 @@ class UpstoxReadinessProbe:
         access_token: str,
         timeout_seconds: float = 20.0,
         client: httpx.Client | None = None,
+        minimum_test_capital: Decimal = Decimal("1000"),
     ) -> None:
         if not access_token:
             raise ValueError("access_token is required")
+        if (
+            not isinstance(minimum_test_capital, Decimal)
+            or not minimum_test_capital.is_finite()
+            or minimum_test_capital <= 0
+        ):
+            raise ValueError("minimum_test_capital must be positive and finite")
         self._access_token = access_token
         self._timeout_seconds = timeout_seconds
         self._client = client
+        self._minimum_test_capital = minimum_test_capital
 
     def run(self) -> UpstoxReadinessSnapshot:
         checks: list[ReadinessCheck] = []
@@ -64,21 +72,27 @@ class UpstoxReadinessProbe:
             ReadinessCheck(
                 name="profile_api",
                 passed=profile_ok,
-                detail="Upstox profile API authenticated successfully" if profile_ok else "profile API did not return success",
+                detail="Upstox profile API authenticated successfully"
+                if profile_ok
+                else "profile API did not return success",
             )
         )
         checks.append(
             ReadinessCheck(
                 name="nse_enabled",
                 passed="NSE" in exchanges,
-                detail="NSE is enabled on the account" if "NSE" in exchanges else "NSE is not listed in enabled exchanges",
+                detail="NSE is enabled on the account"
+                if "NSE" in exchanges
+                else "NSE is not listed in enabled exchanges",
             )
         )
         checks.append(
             ReadinessCheck(
                 name="intraday_product_enabled",
                 passed="I" in products,
-                detail="intraday product I is enabled" if "I" in products else "intraday product I is not enabled",
+                detail="intraday product I is enabled"
+                if "I" in products
+                else "intraday product I is not enabled",
             )
         )
 
@@ -101,11 +115,15 @@ class UpstoxReadinessProbe:
         checks.append(
             ReadinessCheck(
                 name="minimum_test_capital_present",
-                passed=available_to_trade is not None and available_to_trade >= Decimal("1000"),
+                passed=(
+                    available_to_trade is not None
+                    and available_to_trade >= self._minimum_test_capital
+                ),
                 detail=(
-                    "at least ₹1,000 is available to trade"
-                    if available_to_trade is not None and available_to_trade >= Decimal("1000")
-                    else "less than ₹1,000 is currently available to trade"
+                    f"at least ₹{self._minimum_test_capital} is available to trade"
+                    if available_to_trade is not None
+                    and available_to_trade >= self._minimum_test_capital
+                    else f"less than ₹{self._minimum_test_capital} is currently available to trade"
                 ),
             )
         )
