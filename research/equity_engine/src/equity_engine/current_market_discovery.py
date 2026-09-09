@@ -19,6 +19,7 @@ from .suspension_identity import (
     SUSPENDED_EXACT,
     SUSPENSION_CONFLICT,
     SUSPENSION_IDENTITY_POLICY,
+    build_suspension_index,
     field_text,
     resolve_suspension,
     row_evidence,
@@ -481,6 +482,7 @@ def measure_current_market(
         _text(row, "instrument_key") for row in mis.rows if _text(row, "instrument_key")
     }
     suspended_rows = tuple(suspended.rows)
+    suspension_index = build_suspension_index(suspended_rows)
     suspended_key_counts = Counter(
         _text(row, "instrument_key")
         for row in suspended_rows
@@ -517,7 +519,7 @@ def measure_current_market(
             reasons.append("duplicate_instrument_key")
 
         mis_eligible = key in mis_keys
-        suspension = resolve_suspension(row, suspended_rows)
+        suspension = resolve_suspension(row, suspension_index)
         suspended_value = suspension.status in {SUSPENDED_EXACT, AMBIGUOUS_EXACT}
         strict_row = not _row_gate_reasons(row)
         if strict_row and key:
@@ -632,9 +634,13 @@ def measure_current_market(
                 suspension_variant_row_count=len(suspension.same_segment_key_rows),
                 same_key_variant_count=len(suspension.same_segment_key_rows),
                 exact_token_match_count=len(suspension.exact_token_rows),
-                suspension_evidence=tuple(
-                    row_evidence(suspended_row)
-                    for suspended_row in suspension.same_segment_key_rows
+                suspension_evidence=(
+                    tuple(
+                        row_evidence(suspended_row)
+                        for suspended_row in suspension.same_segment_key_rows
+                    )
+                    if strict_row
+                    else ()
                 ),
                 cas_eligible=cas_value,
                 quote_status="success" if measurement_ready else "failure",

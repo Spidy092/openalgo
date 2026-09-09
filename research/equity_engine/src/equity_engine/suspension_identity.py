@@ -8,8 +8,9 @@ same-segment/key evidence separate from an exact current-token match.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 
 SUSPENDED_EXACT = "SUSPENDED_EXACT"
@@ -57,6 +58,74 @@ def row_sort_key(row: Mapping[str, object]) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class SuspensionIndex:
+    """Immutable, deterministically ordered indexes over suspended-file rows."""
+
+    rows_by_segment_key: Mapping[
+        tuple[str, str], tuple[Mapping[str, object], ...]
+    ]
+    rows_by_segment_key_token: Mapping[
+        tuple[str, str, str], tuple[Mapping[str, object], ...]
+    ]
+
+    def rows_for(
+        self, segment: str, instrument_key: str
+    ) -> tuple[Mapping[str, object], ...]:
+        return self.rows_by_segment_key.get((segment, instrument_key), ())
+
+    def exact_token_rows_for(
+        self, segment: str, instrument_key: str, exchange_token: str
+    ) -> tuple[Mapping[str, object], ...]:
+        return self.rows_by_segment_key_token.get(
+            (segment, instrument_key, exchange_token), ()
+        )
+
+
+def build_suspension_index(
+    suspended_rows: Iterable[Mapping[str, object]],
+) -> SuspensionIndex:
+    """Build the canonical suspension index with one deterministic sort pass.
+
+    Rows without both identity scope fields cannot match a current row under
+    the approved policy and are intentionally omitted from the lookup maps.
+    The original payload remains available to callers for source counts and
+    hashing; this index only owns references to relevant row mappings.
+    """
+
+    grouped: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for row in suspended_rows:
+        scope = (field_text(row, "segment"), field_text(row, "instrument_key"))
+        if not scope[0] or not scope[1]:
+            continue
+        grouped.setdefault(scope, []).append(row)
+
+    rows_by_segment_key: dict[
+        tuple[str, str], tuple[Mapping[str, object], ...]
+    ] = {}
+    token_groups: dict[
+        tuple[str, str, str], list[Mapping[str, object]]
+    ] = {}
+    for scope in sorted(grouped):
+        ordered_rows = tuple(sorted(grouped[scope], key=row_sort_key))
+        rows_by_segment_key[scope] = ordered_rows
+        segment, instrument_key = scope
+        for row in ordered_rows:
+            exchange_token = field_text(row, "exchange_token")
+            if exchange_token:
+                token_groups.setdefault(
+                    (segment, instrument_key, exchange_token), []
+                ).append(row)
+
+    rows_by_segment_key_token = {
+        scope: tuple(rows) for scope, rows in sorted(token_groups.items())
+    }
+    return SuspensionIndex(
+        rows_by_segment_key=MappingProxyType(rows_by_segment_key),
+        rows_by_segment_key_token=MappingProxyType(rows_by_segment_key_token),
+    )
+
+
+@dataclass(frozen=True)
 class SuspensionResolution:
     """Resolution of one current BOD row against suspended-file evidence."""
 
@@ -85,14 +154,14 @@ class SuspensionResolution:
 
 def resolve_suspension(
     current_row: Mapping[str, object],
-    suspended_rows: Sequence[Mapping[str, object]],
+    suspension_index: SuspensionIndex,
 ) -> SuspensionResolution:
     """Resolve suspension evidence without treating a key-only match as exact.
 
     The segment and instrument key scope the evidence.  The exchange token is
     the current row identity.  Exchange and instrument type are consistency
     guards: a mismatch at the current token is a conflict and never an active
-    exact suspension.
+    exact suspension. Lookups never scan the full suspended payload.
     """
 
     segment = field_text(current_row, "segment")
@@ -101,36 +170,21 @@ def resolve_suspension(
     instrument_type = field_text(current_row, "instrument_type")
     exchange = field_text(current_row, "exchange")
 
-    same_segment_key_rows = tuple(
-        sorted(
-            (
-                suspended_row
-                for suspended_row in suspended_rows
-                if segment
-                and instrument_key
-                and field_text(suspended_row, "segment") == segment
-                and field_text(suspended_row, "instrument_key") == instrument_key
-            ),
-            key=row_sort_key,
-        )
-    )
-    exact_token_rows = tuple(
-        suspended_row
-        for suspended_row in same_segment_key_rows
+    same_segment_key_rows = suspension_index.rows_for(segment, instrument_key)
+    exact_token_rows = (
+        suspension_index.exact_token_rows_for(segment, instrument_key, exchange_token)
         if exchange_token
-        and field_text(suspended_row, "exchange_token") == exchange_token
+        else ()
     )
-    exact_identity_rows = tuple(
-        suspended_row
-        for suspended_row in exact_token_rows
-        if field_text(suspended_row, "instrument_type") == instrument_type
-        and field_text(suspended_row, "exchange") == exchange
-    )
-    guard_conflict_rows = tuple(
-        suspended_row
-        for suspended_row in exact_token_rows
-        if suspended_row not in exact_identity_rows
-    )
+
+    def guard_matches(row: Mapping[str, object]) -> bool:
+        return (
+            field_text(row, "instrument_type") == instrument_type
+            and field_text(row, "exchange") == exchange
+        )
+
+    exact_identity_rows = tuple(row for row in exact_token_rows if guard_matches(row))
+    guard_conflict_rows = tuple(row for row in exact_token_rows if not guard_matches(row))
 
     if not same_segment_key_rows:
         status = NO_SUSPENSION_RECORD

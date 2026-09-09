@@ -2,12 +2,23 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
+import equity_engine.current_market_discovery as current_market_discovery
+import equity_engine.instrument_master as instrument_master
 from equity_engine.current_market_discovery import (
     APPROVED_CAPITALS,
     measure_current_market,
     quote_request_keys,
 )
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
+from equity_engine.instrument_master import build_nse_equity_master
+from equity_engine.suspension_identity import (
+    AMBIGUOUS_EXACT,
+    NO_SUSPENSION_RECORD,
+    SUSPENDED_EXACT,
+    SUSPENSION_CONFLICT,
+    build_suspension_index,
+    resolve_suspension,
+)
 from equity_engine.upstox_instruments import InstrumentFilePayload
 from equity_engine.upstox_market_context import QuoteBatchResult
 
@@ -368,6 +379,182 @@ def test_exchange_token_is_scoped_by_segment_and_instrument_key() -> None:
     artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=[token_only])
 
     assert artifact.instruments[0].suspension_status == "NO_SUSPENSION_RECORD"
+
+
+def test_suspension_index_is_sorted_once_and_input_order_independent(monkeypatch) -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    variants = [
+        _suspended_variant(bod, instrument_type=kind, exchange_token=token)
+        for kind, token in (("TL", 757288), ("AF", 11139), ("BE", 4615))
+    ]
+    sort_calls = 0
+
+    import equity_engine.suspension_identity as suspension_identity
+
+    original = suspension_identity.row_sort_key
+
+    def counting_sort_key(row):
+        nonlocal sort_calls
+        sort_calls += 1
+        return original(row)
+
+    monkeypatch.setattr(suspension_identity, "row_sort_key", counting_sort_key)
+    first = build_suspension_index(variants)
+    second = build_suspension_index(list(reversed(variants)))
+
+    assert sort_calls == len(variants) * 2
+    assert first.rows_by_segment_key == second.rows_by_segment_key
+    assert first.rows_by_segment_key_token == second.rows_by_segment_key_token
+    assert resolve_suspension(bod, first).status == SUSPENSION_CONFLICT
+
+
+def test_index_resolution_does_not_reiterate_source_for_each_instrument() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    variants = [_suspended_variant(bod, instrument_type="AF", exchange_token=11139)]
+
+    class OnePassRows:
+        def __init__(self, rows):
+            self.rows = rows
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations > 1:
+                raise AssertionError("suspended source was rescanned")
+            return iter(self.rows)
+
+    source = OnePassRows(variants)
+    index = build_suspension_index(source)
+
+    class CountingIndex:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.scope_lookups = 0
+            self.token_lookups = 0
+
+        def rows_for(self, segment, instrument_key):
+            self.scope_lookups += 1
+            return self.wrapped.rows_for(segment, instrument_key)
+
+        def exact_token_rows_for(self, segment, instrument_key, exchange_token):
+            self.token_lookups += 1
+            return self.wrapped.exact_token_rows_for(segment, instrument_key, exchange_token)
+
+    counting_index = CountingIndex(index)
+    for _ in range(100):
+        assert resolve_suspension(bod, counting_index).status == SUSPENSION_CONFLICT
+
+    assert source.iterations == 1
+    assert counting_index.scope_lookups == 100
+    assert counting_index.token_lookups == 100
+
+
+def test_realistic_scale_uses_constant_index_lookups() -> None:
+    suspended_rows = [
+        _suspended_variant(
+            _row(f"NSE_EQ|INE{i:09d}", symbol=f"S{i}"),
+            instrument_type="AF",
+            exchange_token=100000 + i,
+        )
+        for i in range(34429)
+    ]
+    index = build_suspension_index(suspended_rows)
+
+    class CountingIndex:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.scope_lookups = 0
+            self.token_lookups = 0
+
+        def rows_for(self, segment, instrument_key):
+            self.scope_lookups += 1
+            return self.wrapped.rows_for(segment, instrument_key)
+
+        def exact_token_rows_for(self, segment, instrument_key, exchange_token):
+            self.token_lookups += 1
+            return self.wrapped.exact_token_rows_for(segment, instrument_key, exchange_token)
+
+    counting_index = CountingIndex(index)
+    resolved = 0
+    for i in range(77068):
+        row = _row(f"NSE_EQ|INE{i:09d}", symbol=f"B{i}")
+        resolve_suspension(row, counting_index)
+        resolved += 1
+
+    assert resolved == 77068
+    assert counting_index.scope_lookups == 77068
+    assert counting_index.token_lookups == 77068
+    assert len(index.rows_by_segment_key) == 34429
+    assert index.rows_for("NSE_EQ", "NSE_EQ|INE000000000")[0] is suspended_rows[0]
+
+
+def test_current_market_and_instrument_master_each_build_one_shared_index(monkeypatch) -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    suspended_rows = [_suspended_variant(bod, instrument_type="AF", exchange_token=11139)]
+
+    current_calls = 0
+    current_builder = current_market_discovery.build_suspension_index
+
+    def count_current(rows):
+        nonlocal current_calls
+        current_calls += 1
+        return current_builder(rows)
+
+    monkeypatch.setattr(current_market_discovery, "build_suspension_index", count_current)
+    _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=suspended_rows)
+    assert current_calls == 1
+
+    master_calls = 0
+    master_builder = instrument_master.build_suspension_index
+
+    def count_master(rows):
+        nonlocal master_calls
+        master_calls += 1
+        return master_builder(rows)
+
+    monkeypatch.setattr(instrument_master, "build_suspension_index", count_master)
+    snapshot = build_nse_equity_master(
+        as_of_date=datetime(2026, 9, 9).date(),
+        bod_rows=[bod],
+        mis_rows=[{"instrument_key": key}],
+        suspended_rows=suspended_rows,
+        tick_size_scale_rupees_per_raw_unit=Decimal("0.01"),
+    )
+    assert master_calls == 1
+    assert snapshot.instruments[0].suspension_status == SUSPENSION_CONFLICT
+
+
+def test_index_preserves_all_approved_statuses_and_master_matches_resolver() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    exact = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    duplicate = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    conflict = _suspended_variant(bod, instrument_type="AF", exchange_token=11139)
+    unrelated = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    unrelated["segment"] = "BSE_EQ"
+
+    assert resolve_suspension(bod, build_suspension_index([exact])).status == SUSPENDED_EXACT
+    assert (
+        resolve_suspension(bod, build_suspension_index([exact, duplicate])).status
+        == AMBIGUOUS_EXACT
+    )
+    assert resolve_suspension(bod, build_suspension_index([conflict])).status == SUSPENSION_CONFLICT
+    assert (
+        resolve_suspension(bod, build_suspension_index([unrelated])).status
+        == NO_SUSPENSION_RECORD
+    )
+
+    snapshot = build_nse_equity_master(
+        as_of_date=datetime(2026, 9, 9).date(),
+        bod_rows=[bod],
+        mis_rows=[{"instrument_key": key}],
+        suspended_rows=[conflict],
+        tick_size_scale_rupees_per_raw_unit=Decimal("0.01"),
+    )
+    assert snapshot.instruments[0].suspension_status == SUSPENSION_CONFLICT
 
 
 def test_no_mis_membership_is_not_an_intraday_candidate() -> None:

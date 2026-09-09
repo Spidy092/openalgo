@@ -11,6 +11,7 @@ from .suspension_identity import (
     AMBIGUOUS_EXACT,
     NO_SUSPENSION_RECORD,
     SUSPENDED_EXACT,
+    build_suspension_index,
     resolve_suspension,
 )
 
@@ -102,6 +103,7 @@ def build_nse_equity_master(
     mis = list(mis_rows)
     suspended = list(suspended_rows)
     mis_keys = _instrument_keys(mis)
+    suspension_index = build_suspension_index(suspended)
 
     seen: set[str] = set()
     instruments: list[EquityInstrument] = []
@@ -137,7 +139,7 @@ def build_nse_equity_master(
         if not isinstance(cas_value, bool):
             raise ValueError(f"invalid cas_eligible for {key}")
 
-        suspension = resolve_suspension(row, suspended)
+        suspension = resolve_suspension(row, suspension_index)
 
         instruments.append(
             EquityInstrument(
