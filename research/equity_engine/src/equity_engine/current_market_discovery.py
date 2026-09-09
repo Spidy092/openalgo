@@ -28,6 +28,20 @@ DEFAULT_TICK_SIZE_SCALE_RUPEES_PER_RAW_UNIT = Decimal("0.01")
 DEFAULT_ESTIMATED_BYTES_PER_ROW = 256
 APPROVED_CAPITALS = (Decimal("1000.00"), Decimal("10000.00"))
 _ISIN = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]\Z")
+SUSPENSION_MATCH_POLICY = "instrument_key+segment+exchange+instrument_type+isin"
+_SUSPENSION_IDENTITY_FIELDS = ("instrument_key", "segment", "exchange", "instrument_type", "isin")
+_SUSPENSION_EVIDENCE_FIELDS = (
+    "segment",
+    "exchange",
+    "isin",
+    "instrument_key",
+    "instrument_type",
+    "security_type",
+    "trading_symbol",
+    "series",
+    "lot_size",
+    "exchange_token",
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +87,10 @@ class CurrentInstrumentMeasurement:
     minimum_tradable_quantity_source: str | None
     mis_eligible: bool
     suspended: bool
+    suspension_match_count: int
+    suspension_ambiguous: bool
+    suspension_variant_row_count: int
+    suspension_evidence: tuple[dict[str, object], ...]
     cas_eligible: bool | None
     quote_status: str
     quote_failure_reason: str | None
@@ -99,6 +117,10 @@ class CurrentInstrumentMeasurement:
             "minimum_tradable_quantity_source": self.minimum_tradable_quantity_source,
             "mis_eligible": self.mis_eligible,
             "suspended": self.suspended,
+            "suspension_match_count": self.suspension_match_count,
+            "suspension_ambiguous": self.suspension_ambiguous,
+            "suspension_variant_row_count": self.suspension_variant_row_count,
+            "suspension_evidence": list(self.suspension_evidence),
             "cas_eligible": self.cas_eligible,
             "quote_status": self.quote_status,
             "quote_failure_reason": self.quote_failure_reason,
@@ -116,6 +138,15 @@ class CurrentInstrumentMeasurement:
 class CurrentMarketCalibrationArtifact:
     snapshot_as_of: datetime
     source_files: tuple[dict[str, object], ...]
+    suspended_source_hash: str
+    suspended_row_count: int
+    suspended_unique_key_count: int
+    suspended_duplicate_key_count: int
+    suspended_duplicate_isin_count: int
+    suspension_match_policy: str
+    suspension_match_count: int
+    suspension_ambiguous_count: int
+    suspension_key_variant_count: int
     gate_counts: dict[str, int]
     quote_request_count: int
     quote_success_count: int
@@ -140,6 +171,15 @@ class CurrentMarketCalibrationArtifact:
             "schema_version": self.schema_version,
             "snapshot_as_of": self.snapshot_as_of.isoformat(),
             "source_files": list(self.source_files),
+            "suspended_source_hash": self.suspended_source_hash,
+            "suspended_row_count": self.suspended_row_count,
+            "suspended_unique_key_count": self.suspended_unique_key_count,
+            "suspended_duplicate_key_count": self.suspended_duplicate_key_count,
+            "suspended_duplicate_isin_count": self.suspended_duplicate_isin_count,
+            "suspension_match_policy": self.suspension_match_policy,
+            "suspension_match_count": self.suspension_match_count,
+            "suspension_ambiguous_count": self.suspension_ambiguous_count,
+            "suspension_key_variant_count": self.suspension_key_variant_count,
             "gate_counts": dict(sorted(self.gate_counts.items())),
             "quote_requests": {
                 "instrument_count": self.quote_request_count,
@@ -200,6 +240,51 @@ def _positive_integral(value: object) -> int | None:
     if parsed is None or parsed != parsed.to_integral_value():
         return None
     return int(parsed)
+
+
+@dataclass(frozen=True)
+class SuspensionResolution:
+    same_key_rows: tuple[Mapping[str, object], ...]
+    matching_rows: tuple[Mapping[str, object], ...]
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.matching_rows) > 1
+
+
+def _suspension_identity(row: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(_text(row, field) for field in _SUSPENSION_IDENTITY_FIELDS)
+
+
+def _suspension_row_evidence(row: Mapping[str, object]) -> dict[str, object]:
+    return {field: row.get(field) for field in _SUSPENSION_EVIDENCE_FIELDS}
+
+
+def _suspension_sort_key(row: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(str(row.get(field, "")) for field in _SUSPENSION_EVIDENCE_FIELDS)
+
+
+def _resolve_suspension(
+    row: Mapping[str, object], suspended_rows: Sequence[Mapping[str, object]]
+) -> SuspensionResolution:
+    key = _text(row, "instrument_key")
+    same_key_rows = tuple(
+        sorted(
+            (
+                suspended_row
+                for suspended_row in suspended_rows
+                if key and _text(suspended_row, "instrument_key") == key
+            ),
+            key=_suspension_sort_key,
+        )
+    )
+    identity = _suspension_identity(row)
+    matching_rows = tuple(
+        suspended_row
+        for suspended_row in same_key_rows
+        if _suspension_identity(suspended_row) == identity
+    )
+    return SuspensionResolution(same_key_rows=same_key_rows, matching_rows=matching_rows)
 
 
 def _row_gate_reasons(row: Mapping[str, object]) -> list[str]:
@@ -416,9 +501,15 @@ def measure_current_market(
     mis_keys = {
         _text(row, "instrument_key") for row in mis.rows if _text(row, "instrument_key")
     }
-    suspended_keys = {
-        _text(row, "instrument_key") for row in suspended.rows if _text(row, "instrument_key")
-    }
+    suspended_rows = tuple(suspended.rows)
+    suspended_key_counts = Counter(
+        _text(row, "instrument_key")
+        for row in suspended_rows
+        if _text(row, "instrument_key")
+    )
+    suspended_isin_counts = Counter(
+        _text(row, "isin") for row in suspended_rows if _text(row, "isin")
+    )
     valid_key_counts = Counter(
         _text(row, "instrument_key") for row in bod_rows if _text(row, "instrument_key")
     )
@@ -430,6 +521,9 @@ def measure_current_market(
     minimum_quantities: list[int] = []
     cas_counts = Counter({"cas_eligible": 0, "non_cas": 0, "unknown": 0})
     exclusion_counts: Counter[str] = Counter()
+    suspension_match_keys: set[str] = set()
+    suspension_ambiguous_keys: set[str] = set()
+    suspension_variant_keys: set[str] = set()
 
     for row in bod_rows:
         reasons = _row_gate_reasons(row)
@@ -441,7 +535,16 @@ def measure_current_market(
             reasons.append("duplicate_instrument_key")
 
         mis_eligible = key in mis_keys
-        suspended_value = key in suspended_keys
+        suspension = _resolve_suspension(row, suspended_rows)
+        suspended_value = bool(suspension.matching_rows) or suspension.ambiguous
+        strict_row = not _row_gate_reasons(row)
+        if strict_row and key:
+            if suspension.matching_rows:
+                suspension_match_keys.add(key)
+            elif suspension.same_key_rows:
+                suspension_variant_keys.add(key)
+            if suspension.ambiguous:
+                suspension_ambiguous_keys.add(key)
         tick_raw = _positive_decimal(row.get("tick_size"))
         tick_rupees = (
             tick_raw * tick_size_scale_rupees_per_raw_unit if tick_raw is not None else None
@@ -510,6 +613,10 @@ def measure_current_market(
                 quote_failures += 1
             cas_counts["unknown"] += 1
 
+        if suspension.ambiguous:
+            reasons.append("ambiguous_suspended_identity")
+        elif suspension.matching_rows:
+            reasons.append("suspended_exact_identity")
         reasons = tuple(sorted(set(reasons)))
         for reason in reasons:
             exclusion_counts[reason] += 1
@@ -534,6 +641,13 @@ def measure_current_market(
                 ),
                 mis_eligible=mis_eligible,
                 suspended=suspended_value,
+                suspension_match_count=len(suspension.matching_rows),
+                suspension_ambiguous=suspension.ambiguous,
+                suspension_variant_row_count=len(suspension.same_key_rows),
+                suspension_evidence=tuple(
+                    _suspension_row_evidence(suspended_row)
+                    for suspended_row in suspension.same_key_rows
+                ),
                 cas_eligible=cas_value,
                 quote_status="success" if measurement_ready else "failure",
                 quote_failure_reason=(None if measurement_ready else (reasons[0] if reasons else "unknown")),
@@ -576,11 +690,8 @@ def measure_current_market(
         "current_mis_eligible": sum(
             not _row_gate_reasons(row) and _text(row, "instrument_key") in mis_keys for row in bod_rows
         ),
-        "current_suspended": sum(
-            not _row_gate_reasons(row)
-            and _text(row, "instrument_key") in suspended_keys
-            for row in bod_rows
-        ),
+        "current_suspended": len(suspension_match_keys | suspension_ambiguous_keys),
+        "current_suspended_ambiguous": len(suspension_ambiguous_keys),
         "quote_request_candidates": len(quotes.requested_instrument_keys),
         "quote_usable": quote_successes,
         "quote_unusable": quote_failures,
@@ -642,6 +753,15 @@ def measure_current_market(
                 key=lambda item: str(item["url"]),
             )
         ),
+        suspended_source_hash=suspended.sha256,
+        suspended_row_count=len(suspended_rows),
+        suspended_unique_key_count=len(suspended_key_counts),
+        suspended_duplicate_key_count=sum(count > 1 for count in suspended_key_counts.values()),
+        suspended_duplicate_isin_count=sum(count > 1 for count in suspended_isin_counts.values()),
+        suspension_match_policy=SUSPENSION_MATCH_POLICY,
+        suspension_match_count=len(suspension_match_keys),
+        suspension_ambiguous_count=len(suspension_ambiguous_keys),
+        suspension_key_variant_count=len(suspension_variant_keys),
         gate_counts=gate_counts,
         quote_request_count=len(quotes.requested_instrument_keys),
         quote_success_count=quote_successes,

@@ -55,17 +55,26 @@ def _artifact(
     quotes: dict[str, dict[str, object]],
     quote_failures: dict[str, str] | None = None,
     max_last_price_rupees: Decimal | None = None,
+    mis_keys: set[str] | None = None,
+    suspended_rows: list[dict[str, object]] | None = None,
 ):
     keys = quote_request_keys(rows)
+    eligible_mis_keys = (
+        {str(row["instrument_key"]) for row in rows} if mis_keys is None else mis_keys
+    )
     return measure_current_market(
         snapshot_as_of=datetime.fromisoformat("2026-09-09T10:00:00+05:30"),
         bod=_payload("https://example.test/NSE.json.gz", rows, "bod-sha"),
         mis=_payload(
             "https://example.test/NSE_MIS.json.gz",
-            [{"instrument_key": row["instrument_key"]} for row in rows],
+            [{"instrument_key": key} for key in sorted(eligible_mis_keys)],
             "mis-sha",
         ),
-        suspended=_payload("https://example.test/suspended.json.gz", [], "suspended-sha"),
+        suspended=_payload(
+            "https://example.test/suspended.json.gz",
+            suspended_rows or [],
+            "suspended-sha",
+        ),
         quotes=QuoteBatchResult(
             requested_instrument_keys=keys,
             quotes=quotes,
@@ -87,6 +96,22 @@ def _quote(key: str, *, price: str = "100", cas_eligible: bool = False) -> dict[
         "timestamp": "2026-09-09T10:00:00+05:30",
         "cas_eligible": cas_eligible,
     }
+
+
+def _suspended_variant(
+    row: dict[str, object],
+    *,
+    instrument_type: str,
+    symbol: str | None = None,
+    exchange_token: int = 1,
+) -> dict[str, object]:
+    suspended = dict(row)
+    suspended["instrument_type"] = instrument_type
+    suspended["exchange_token"] = exchange_token
+    if symbol is not None:
+        suspended["trading_symbol"] = symbol
+    suspended.pop("security_type", None)
+    return suspended
 
 
 def test_quote_request_set_is_structural_and_deterministic() -> None:
@@ -189,3 +214,103 @@ def test_exact_bod_duplicate_is_excluded_fail_closed() -> None:
     assert artifact.quote_request_count == 0
     assert artifact.gate_counts["raw_upstox_instruments"] == 2
     assert artifact.exclusion_reason_counts["duplicate_instrument_key"] == 2
+
+
+def test_suspended_key_only_variant_does_not_false_positive() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    variants = [
+        _suspended_variant(bod, instrument_type=kind, exchange_token=index)
+        for index, kind in enumerate(("AF", "BE", "BL", "IQ", "RL", "TL"), start=1)
+    ]
+
+    artifact = _artifact(
+        rows=[bod],
+        quotes={key: _quote(key)},
+        suspended_rows=variants,
+    )
+    item = artifact.instruments[0]
+
+    assert item.suspended is False
+    assert item.candidate is True
+    assert item.suspension_match_count == 0
+    assert item.suspension_variant_row_count == 6
+    assert artifact.suspension_match_count == 0
+    assert artifact.suspension_key_variant_count == 1
+
+
+def test_exact_suspended_eq_identity_is_rejected() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    exact = _suspended_variant(bod, instrument_type="EQ", symbol="RELIANCE", exchange_token=2885)
+
+    artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=[exact])
+    item = artifact.instruments[0]
+
+    assert item.suspended is True
+    assert item.candidate is False
+    assert item.suspension_match_count == 1
+    assert item.suspension_ambiguous is False
+    assert "suspended_exact_identity" in item.exclusion_reasons
+    assert artifact.suspension_match_count == 1
+
+
+def test_duplicate_exact_suspended_identity_fails_closed() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    duplicate_a = _suspended_variant(bod, instrument_type="EQ", exchange_token=2885)
+    duplicate_b = _suspended_variant(bod, instrument_type="EQ", exchange_token=9999)
+
+    artifact = _artifact(
+        rows=[bod],
+        quotes={key: _quote(key)},
+        suspended_rows=[duplicate_a, duplicate_b],
+    )
+    item = artifact.instruments[0]
+
+    assert item.suspended is True
+    assert item.suspension_ambiguous is True
+    assert item.suspension_match_count == 2
+    assert item.candidate is False
+    assert "ambiguous_suspended_identity" in item.exclusion_reasons
+    assert artifact.suspension_ambiguous_count == 1
+
+
+def test_reliance_shape_and_mis_intersection_are_resolved_by_identity() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    variants = [
+        _suspended_variant(bod, instrument_type=kind, exchange_token=index)
+        for index, kind in enumerate(("AF", "BE", "BL", "IQ", "RL", "TL"), start=1)
+    ]
+    artifact = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=variants)
+
+    assert artifact.gate_counts["current_mis_eligible"] == 1
+    assert artifact.gate_counts["current_suspended"] == 0
+    assert artifact.instruments[0].candidate is True
+
+
+def test_suspension_evidence_is_deterministic() -> None:
+    key = "NSE_EQ|INE002A01018"
+    bod = _row(key, symbol="RELIANCE")
+    variants = [
+        _suspended_variant(bod, instrument_type=kind, exchange_token=index)
+        for index, kind in enumerate(("AF", "BE", "BL"), start=1)
+    ]
+    first = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=variants)
+    second = _artifact(rows=[bod], quotes={key: _quote(key)}, suspended_rows=variants)
+
+    assert first.fingerprint == second.fingerprint
+    assert first.to_dict() == second.to_dict()
+
+
+def test_no_mis_membership_is_not_an_intraday_candidate() -> None:
+    key = "NSE_EQ|INE002A01018"
+    artifact = _artifact(
+        rows=[_row(key, symbol="RELIANCE")],
+        quotes={key: _quote(key)},
+        mis_keys=set(),
+    )
+
+    assert artifact.instruments[0].mis_eligible is False
+    assert artifact.instruments[0].candidate is False
