@@ -14,6 +14,9 @@ dependencies = [
   "pandas==3.0.3",
   "pyarrow==23.0.1",
   "pydantic==2.13.4",
+  # VectorBT 1.1.0 registers templates containing the removed Mapbox trace names;
+  # Plotly 7 rejects those templates during import. Keep the tested pre-v7 API.
+  "plotly==6.9.0",
   "vectorbt==1.1.0",
 ]
 
