@@ -11,6 +11,7 @@ from equity_engine.current_market_discovery import (
     APPROVED_CAPITALS,
     DEFAULT_ESTIMATED_BYTES_PER_ROW,
     DEFAULT_TICK_SIZE_SCALE_RUPEES_PER_RAW_UNIT,
+    fingerprint_payload,
     measure_current_market,
     quote_request_keys,
 )
@@ -110,18 +111,17 @@ def main() -> int:
         estimated_bytes_per_row=args.estimated_bytes_per_row,
     )
     output = artifact.to_dict()
-    output["artifact_fingerprint"] = artifact.fingerprint
+    artifact_fingerprint = fingerprint_payload(output)
+    output["artifact_fingerprint"] = artifact_fingerprint
+    serialized_output = json.dumps(output, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(output, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
-        encoding="utf-8",
-    )
+    args.output.write_text(serialized_output, encoding="utf-8")
     print(
         json.dumps(
             {
                 "status": "success",
                 "output": str(args.output),
-                "artifact_fingerprint": artifact.fingerprint,
+                "artifact_fingerprint": artifact_fingerprint,
                 "raw_upstox_instruments": artifact.gate_counts["raw_upstox_instruments"],
                 "quote_requests": artifact.quote_request_count,
                 "quote_successes": artifact.quote_success_count,

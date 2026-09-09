@@ -11,6 +11,7 @@ from .suspension_identity import (
     AMBIGUOUS_EXACT,
     NO_SUSPENSION_RECORD,
     SUSPENDED_EXACT,
+    SuspensionIndex,
     build_suspension_index,
     resolve_suspension,
 )
@@ -87,6 +88,7 @@ def build_nse_equity_master(
     mis_rows: Iterable[Mapping[str, object]],
     suspended_rows: Iterable[Mapping[str, object]],
     tick_size_scale_rupees_per_raw_unit: Decimal,
+    suspension_index: SuspensionIndex | None = None,
 ) -> InstrumentMasterSnapshot:
     """Build an auditable NSE-equity master from Upstox's official daily files.
 
@@ -103,7 +105,8 @@ def build_nse_equity_master(
     mis = list(mis_rows)
     suspended = list(suspended_rows)
     mis_keys = _instrument_keys(mis)
-    suspension_index = build_suspension_index(suspended)
+    if suspension_index is None:
+        suspension_index = build_suspension_index(suspended)
 
     seen: set[str] = set()
     instruments: list[EquityInstrument] = []
@@ -175,12 +178,18 @@ def build_nse_equity_master(
     if not instruments:
         raise ValueError("BOD master contained no NSE_EQ instruments")
 
+    def canonical_rows(rows: Iterable[Mapping[str, object]]) -> list[Mapping[str, object]]:
+        return sorted(
+            rows,
+            key=lambda row: json.dumps(row, sort_keys=True, default=str, separators=(",", ":")),
+        )
+
     canonical = {
         "as_of_date": as_of_date.isoformat(),
         "tick_size_scale": str(tick_size_scale_rupees_per_raw_unit),
-        "bod": bod,
-        "mis": mis,
-        "suspended": suspended,
+        "bod": canonical_rows(bod),
+        "mis": canonical_rows(mis),
+        "suspended": canonical_rows(suspended),
     }
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")

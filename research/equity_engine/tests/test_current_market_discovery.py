@@ -1,11 +1,17 @@
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
 import equity_engine.current_market_discovery as current_market_discovery
 import equity_engine.instrument_master as instrument_master
 from equity_engine.current_market_discovery import (
     APPROVED_CAPITALS,
+    fingerprint_payload,
     measure_current_market,
     quote_request_keys,
 )
@@ -215,6 +221,63 @@ def test_calibration_artifact_is_deterministic_and_does_not_serialize_credential
     assert "Authorization" not in serialized
     assert first.to_dict() == second.to_dict()
     assert first.live_orders_called is False
+
+
+def test_artifact_retains_detailed_measurements_only_for_structural_quote_population() -> None:
+    key = "NSE_EQ|INE000000001"
+    irrelevant = _row("NFO|INE000000002", symbol="FUTURE")
+    irrelevant["segment"] = "NFO"
+    irrelevant["instrument_type"] = "FUT"
+    artifact = _artifact(
+        rows=[_row(key, symbol="GOOD"), irrelevant],
+        quotes={key: _quote(key)},
+    )
+
+    assert artifact.gate_counts["raw_upstox_instruments"] == 2
+    assert artifact.quote_request_count == 1
+    assert len(artifact.instruments) == 1
+    assert artifact.instruments[0].instrument_key == key
+    assert artifact.exclusion_reason_counts["not_nse_eq"] == 1
+
+
+def test_artifact_fingerprint_is_verifiable_from_on_disk_payload() -> None:
+    key = "NSE_EQ|INE000000001"
+    artifact = _artifact(rows=[_row(key, symbol="GOOD")], quotes={key: _quote(key)})
+    payload = artifact.to_dict()
+    expected = fingerprint_payload(payload)
+    on_disk = dict(payload)
+    on_disk["artifact_fingerprint"] = expected
+
+    restored = json.loads(json.dumps(on_disk, sort_keys=True))
+    reference = restored.pop("artifact_fingerprint")
+    assert reference == expected
+    assert fingerprint_payload(restored) == reference
+    with pytest.raises(ValueError, match="must be excluded"):
+        fingerprint_payload(on_disk)
+
+
+def test_artifact_fingerprint_is_independent_of_input_order() -> None:
+    first_key = "NSE_EQ|INE000000001"
+    second_key = "NSE_EQ|INE000000002"
+    first_row = _row(first_key, symbol="FIRST")
+    second_row = _row(second_key, symbol="SECOND")
+    first_variant = _suspended_variant(first_row, instrument_type="AF", exchange_token=11139)
+    second_variant = _suspended_variant(second_row, instrument_type="AF", exchange_token=11140)
+    quotes = {first_key: _quote(first_key), second_key: _quote(second_key)}
+
+    first = _artifact(
+        rows=[first_row, second_row],
+        quotes=quotes,
+        suspended_rows=[first_variant, second_variant],
+    )
+    second = _artifact(
+        rows=[second_row, first_row],
+        quotes=quotes,
+        suspended_rows=[second_variant, first_variant],
+    )
+
+    assert first.to_dict() == second.to_dict()
+    assert first.fingerprint == second.fingerprint
 
 
 def test_exact_bod_duplicate_is_excluded_fail_closed() -> None:
@@ -490,6 +553,114 @@ def test_realistic_scale_uses_constant_index_lookups() -> None:
     assert index.rows_for("NSE_EQ", "NSE_EQ|INE000000000")[0] is suspended_rows[0]
 
 
+def test_realistic_scale_artifact_peak_memory_is_bounded() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+        import resource
+        from datetime import datetime
+        from decimal import Decimal
+
+        from equity_engine.current_market_discovery import fingerprint_payload, measure_current_market, quote_request_keys
+        from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
+        from equity_engine.upstox_instruments import InstrumentFilePayload
+        from equity_engine.upstox_market_context import QuoteBatchResult
+
+        def row(index, strict):
+            key = f"NSE_EQ|INE{index:09d}"
+            return {
+                "segment": "NSE_EQ" if strict else "NFO",
+                "name": f"SECURITY {index}",
+                "exchange": "NSE",
+                "isin": f"INE{index:09d}",
+                "instrument_type": "EQ" if strict else "FUT",
+                "instrument_key": key,
+                "exchange_token": str(100000 + index),
+                "lot_size": 1,
+                "freeze_quantity": 100000,
+                "tick_size": 5,
+                "trading_symbol": f"S{index}",
+                "series": "EQ",
+                "security_type": "NORMAL",
+                "cas_eligible": False,
+            }
+
+        bod_rows = [row(index, index < 2648) for index in range(77068)]
+        strict_rows = bod_rows[:2648]
+        request_keys = quote_request_keys(bod_rows)
+        quotes = {
+            key: {
+                "instrument_token": key,
+                "last_price": "100",
+                "timestamp": "2026-09-09T10:00:00+05:30",
+                "cas_eligible": False,
+            }
+            for key in request_keys
+        }
+        suspended_rows = [
+            {
+                "segment": "NSE_EQ",
+                "instrument_key": f"NSE_EQ|INE{100000 + index:09d}",
+                "exchange": "NSE",
+                "instrument_type": "AF",
+                "exchange_token": str(900000 + index),
+                "isin": f"INE{100000 + index:09d}",
+                "trading_symbol": f"X{index}",
+            }
+            for index in range(34429)
+        ]
+        artifact = measure_current_market(
+            snapshot_as_of=datetime.fromisoformat("2026-09-09T10:00:00+05:30"),
+            bod=InstrumentFilePayload("bod", tuple(bod_rows), "bod-sha", None, None),
+            mis=InstrumentFilePayload(
+                "mis",
+                tuple({"instrument_key": row["instrument_key"]} for row in strict_rows[:1340]),
+                "mis-sha",
+                None,
+                None,
+            ),
+            suspended=InstrumentFilePayload(
+                "suspended", tuple(suspended_rows), "suspended-sha", None, None
+            ),
+            quotes=QuoteBatchResult(request_keys, quotes, {}, 1),
+            cost_provider=CurrentTermsNSEIntradayCostProvider(
+                pricing_date=datetime(2026, 9, 9).date()
+            ),
+            approved_capitals=(Decimal("1000.00"),),
+        )
+        payload = artifact.to_dict()
+        fingerprint = fingerprint_payload(payload)
+        payload["artifact_fingerprint"] = fingerprint
+        json.dumps(payload, indent=2, sort_keys=True)
+        print(json.dumps({
+            "raw": artifact.gate_counts["raw_upstox_instruments"],
+            "detailed": len(artifact.instruments),
+            "quotes": artifact.quote_request_count,
+            "rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        }))
+        """
+    )
+    source_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (source_root, env.get("PYTHONPATH", "")) if path
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert result["raw"] == 77068
+    assert result["detailed"] == 2648
+    assert result["quotes"] == 2648
+    assert result["rss_kb"] < 600 * 1024
+
+
 def test_current_market_and_instrument_master_each_build_one_shared_index(monkeypatch) -> None:
     key = "NSE_EQ|INE002A01018"
     bod = _row(key, symbol="RELIANCE")
@@ -543,8 +714,7 @@ def test_index_preserves_all_approved_statuses_and_master_matches_resolver() -> 
     )
     assert resolve_suspension(bod, build_suspension_index([conflict])).status == SUSPENSION_CONFLICT
     assert (
-        resolve_suspension(bod, build_suspension_index([unrelated])).status
-        == NO_SUSPENSION_RECORD
+        resolve_suspension(bod, build_suspension_index([unrelated])).status == NO_SUSPENSION_RECORD
     )
 
     snapshot = build_nse_equity_master(

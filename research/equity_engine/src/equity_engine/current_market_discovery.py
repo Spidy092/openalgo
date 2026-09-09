@@ -35,6 +35,7 @@ from .upstox_market_context import (
 
 
 CURRENT_MARKET_SCHEMA_VERSION = "current-market-calibration-v1"
+ARTIFACT_FINGERPRINT_FIELD = "artifact_fingerprint"
 DEFAULT_TICK_SIZE_SCALE_RUPEES_PER_RAW_UNIT = Decimal("0.01")
 DEFAULT_ESTIMATED_BYTES_PER_ROW = 256
 APPROVED_CAPITALS = (Decimal("1000.00"), Decimal("10000.00"))
@@ -228,10 +229,23 @@ class CurrentMarketCalibrationArtifact:
 
     @property
     def fingerprint(self) -> str:
-        canonical = json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("utf-8")
-        return hashlib.sha256(canonical).hexdigest()
+        return fingerprint_payload(self.to_dict())
+
+
+def fingerprint_payload(payload: Mapping[str, object]) -> str:
+    """Return the canonical artifact fingerprint for a payload without its fingerprint field.
+
+    The on-disk JSON contains ``artifact_fingerprint`` as a reference.  The
+    field is intentionally outside the hashed payload so verification can
+    remove it and hash the same canonical object that was written.
+    """
+
+    if ARTIFACT_FINGERPRINT_FIELD in payload:
+        raise ValueError(f"{ARTIFACT_FINGERPRINT_FIELD} must be excluded before fingerprinting")
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _decimal_or_none(value: Decimal | None) -> str | None:
@@ -522,6 +536,7 @@ def measure_current_market(
         suspension = resolve_suspension(row, suspension_index)
         suspended_value = suspension.status in {SUSPENDED_EXACT, AMBIGUOUS_EXACT}
         strict_row = not _row_gate_reasons(row)
+        detail_row = strict_row and not duplicate
         if strict_row and key:
             suspension_status_keys[suspension.status].add(key)
         tick_raw = _positive_decimal(row.get("tick_size"))
@@ -610,56 +625,59 @@ def measure_current_market(
         candidate_after_max = research_candidate and (
             max_last_price_rupees is None or reference_price <= max_last_price_rupees
         )
-        instruments.append(
-            CurrentInstrumentMeasurement(
-                instrument_key=key,
-                symbol=symbol,
-                isin=isin,
-                series=_text(row, "series", "instrument_type"),
-                exchange=_text(row, "exchange"),
-                instrument_type=_text(row, "instrument_type"),
-                security_type=_text(row, "security_type"),
-                tick_size_raw=tick_raw,
-                tick_size_rupees=tick_rupees,
-                minimum_tradable_quantity=minimum_quantity,
-                minimum_tradable_quantity_source=(
-                    "upstox_nse_bod.lot_size" if minimum_quantity is not None else None
-                ),
-                mis_eligible=mis_eligible,
-                suspended=suspended_value,
-                current_exchange_token=(field_text(row, "exchange_token") or None),
-                suspension_status=suspension.status,
-                suspension_match_count=len(suspension.exact_identity_rows),
-                suspension_ambiguous=suspension.status == AMBIGUOUS_EXACT,
-                suspension_variant_row_count=len(suspension.same_segment_key_rows),
-                same_key_variant_count=len(suspension.same_segment_key_rows),
-                exact_token_match_count=len(suspension.exact_token_rows),
-                suspension_evidence=(
-                    tuple(
-                        row_evidence(suspended_row)
-                        for suspended_row in suspension.same_segment_key_rows
-                    )
-                    if strict_row
-                    else ()
-                ),
-                cas_eligible=cas_value,
-                quote_status="success" if measurement_ready else "failure",
-                quote_failure_reason=(None if measurement_ready else (reasons[0] if reasons else "unknown")),
-                reference_price=reference_price,
-                quote_timestamp=quote_timestamp,
-                price_source=price_source,
-                candidate=candidate,
-                candidate_after_max_last_price=candidate_after_max,
-                research_candidate=research_candidate,
-                live_tradability_proven=(
-                    measurement_ready
-                    and mis_eligible
-                    and suspension.status == NO_SUSPENSION_RECORD
-                ),
-                exclusion_reasons=reasons,
-                capital_measurements=tuple(capital_measurements),
+        if detail_row:
+            instruments.append(
+                CurrentInstrumentMeasurement(
+                    instrument_key=key,
+                    symbol=symbol,
+                    isin=isin,
+                    series=_text(row, "series", "instrument_type"),
+                    exchange=_text(row, "exchange"),
+                    instrument_type=_text(row, "instrument_type"),
+                    security_type=_text(row, "security_type"),
+                    tick_size_raw=tick_raw,
+                    tick_size_rupees=tick_rupees,
+                    minimum_tradable_quantity=minimum_quantity,
+                    minimum_tradable_quantity_source=(
+                        "upstox_nse_bod.lot_size" if minimum_quantity is not None else None
+                    ),
+                    mis_eligible=mis_eligible,
+                    suspended=suspended_value,
+                    current_exchange_token=(field_text(row, "exchange_token") or None),
+                    suspension_status=suspension.status,
+                    suspension_match_count=len(suspension.exact_identity_rows),
+                    suspension_ambiguous=suspension.status == AMBIGUOUS_EXACT,
+                    suspension_variant_row_count=len(suspension.same_segment_key_rows),
+                    same_key_variant_count=len(suspension.same_segment_key_rows),
+                    exact_token_match_count=len(suspension.exact_token_rows),
+                    suspension_evidence=(
+                        tuple(
+                            row_evidence(suspended_row)
+                            for suspended_row in suspension.same_segment_key_rows
+                        )
+                        if strict_row
+                        else ()
+                    ),
+                    cas_eligible=cas_value,
+                    quote_status="success" if measurement_ready else "failure",
+                    quote_failure_reason=(
+                        None if measurement_ready else (reasons[0] if reasons else "unknown")
+                    ),
+                    reference_price=reference_price,
+                    quote_timestamp=quote_timestamp,
+                    price_source=price_source,
+                    candidate=candidate,
+                    candidate_after_max_last_price=candidate_after_max,
+                    research_candidate=research_candidate,
+                    live_tradability_proven=(
+                        measurement_ready
+                        and mis_eligible
+                        and suspension.status == NO_SUSPENSION_RECORD
+                    ),
+                    exclusion_reasons=reasons,
+                    capital_measurements=tuple(capital_measurements),
+                )
             )
-        )
 
     master_digest: str | None = None
     if strict_master_rows:
@@ -668,6 +686,7 @@ def measure_current_market(
             bod_rows=strict_master_rows,
             mis_rows=mis.rows,
             suspended_rows=suspended.rows,
+            suspension_index=suspension_index,
             tick_size_scale_rupees_per_raw_unit=tick_size_scale_rupees_per_raw_unit,
         )
         master_digest = master.source_digest
