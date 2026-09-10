@@ -25,6 +25,7 @@ from .cost_ledger import (
     SUPPORTED_RESEARCH_START,
     EffectiveDatedCostLedger,
     EvidenceClass,
+    LedgerAssessment,
     LedgerComponent,
     LedgerProduct,
     LedgerSide,
@@ -33,7 +34,8 @@ from .cost_ledger import (
 from .gates import DrawdownBasis, PromotionThresholds
 from .provenance import MarketDataManifest, dataframe_fingerprint
 
-EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v2"
+EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v3"
+CURRENT_CALIBRATION_SCHEMA_VERSION = "openalgo-current-calibration/v1"
 VECTORBT_RESEARCH_VERSION = "1.1.0"
 SIMULATOR_RESEARCH_VERSION = "openalgo-event-simulator-v1"
 DEFAULT_COST_EVIDENCE_POLICY = "effective-dated-cost-ledger/default-resolution/v1"
@@ -301,10 +303,11 @@ def _record_identity(record: Any) -> str:
 class CostEvidenceIdentity:
     """Cryptographic identity of the exact ledger and policy used by research.
 
-    This is deliberately separate from ``CostModelIdentity``. A free-form
-    rates mapping can describe a scenario, but it cannot claim verified
-    historical-account costs. Use ``from_ledger`` so the ledger digest and
-    selected effective-dated records are created from the canonical ledger.
+    A historical-actual identity is an internal product of the concrete
+    :class:`EffectiveDatedCostLedger`.  The dataclass constructor deliberately
+    cannot receive verification fields, so a caller cannot turn an arbitrary
+    digest into ``HISTORICAL_ACTUAL_COSTS``.  Scenario identities are separate
+    and are also derived from the real ledger, but always remain non-historical.
     """
 
     ledger_schema_version: str
@@ -318,10 +321,12 @@ class CostEvidenceIdentity:
     selected_record_ids: tuple[str, ...]
     unknown_components: tuple[str, ...]
     scenario_identity: str | None = None
-    _verified_ledger_fingerprint: str | None = field(default=None, repr=False, compare=False)
-    _verified_historical_actual: bool | None = field(default=None, repr=False, compare=False)
+    _verified_by_ledger: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
         for name, value in (
             ("ledger_schema_version", self.ledger_schema_version),
             ("ledger_fingerprint", self.ledger_fingerprint),
@@ -330,21 +335,26 @@ class CostEvidenceIdentity:
             ("evidence_mode", self.evidence_mode),
             ("policy_identity", self.policy_identity),
         ):
-            if not value.strip():
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} is required")
         if len(self.ledger_fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in self.ledger_fingerprint
         ):
-            raise ValueError("ledger_fingerprint must be a hexadecimal digest")
+            raise ValueError("ledger_fingerprint must be a lowercase hexadecimal digest")
+        if self.product_scope not in {product.value for product in LedgerProduct}:
+            raise ValueError("product_scope must be a LedgerProduct value")
+        if not isinstance(self.resolved_on_date, date):
+            raise TypeError("resolved_on_date must be a date")
         if self.evidence_classification == HISTORICAL_ACTUAL_LABEL:
             if not self.historical_actual:
                 raise ValueError("historical actual classification requires historical_actual=True")
-            if (
-                self._verified_ledger_fingerprint != self.ledger_fingerprint
-                or self._verified_historical_actual is not True
-            ):
+            if not self._verified_by_ledger:
                 raise ValueError(
-                    "historical actual cost evidence must be created from verified ledger evidence"
+                    "historical actual cost evidence must be created from verified ledger evidence on the concrete ledger"
+                )
+            if self.unknown_components:
+                raise ValueError(
+                    "historical actual cost evidence cannot contain unknown components"
                 )
         elif self.historical_actual:
             raise ValueError(
@@ -368,27 +378,46 @@ class CostEvidenceIdentity:
         policy_identity: str = DEFAULT_COST_EVIDENCE_POLICY,
         scenario_identity: str | None = None,
     ) -> CostEvidenceIdentity:
-        """Derive identity from the ledger's date-scoped assessment."""
+        """Derive identity from the concrete ledger's date/product assessment."""
 
+        if not isinstance(ledger, EffectiveDatedCostLedger):
+            raise TypeError("ledger must be an EffectiveDatedCostLedger")
+        if not isinstance(on_date, date):
+            raise TypeError("on_date must be a date")
+        if not isinstance(product, LedgerProduct):
+            raise TypeError("product must be a LedgerProduct")
         assessment = ledger.describe(on_date, product)
+        if not isinstance(assessment, LedgerAssessment):
+            raise TypeError("ledger.describe must return a LedgerAssessment")
+        if assessment.on_date != on_date or assessment.product is not product:
+            raise ValueError("ledger assessment does not match the requested date/product")
         fingerprint = ledger.fingerprint()
-        return cls(
-            ledger_schema_version=str(ledger.to_dict()["schema_version"]),
-            ledger_fingerprint=fingerprint,
-            evidence_classification=assessment.classification,
-            historical_actual=assessment.historical_actual,
-            product_scope=product.value,
-            evidence_mode=evidence_mode,
-            policy_identity=policy_identity,
-            resolved_on_date=on_date,
-            selected_record_ids=tuple(
-                sorted({_record_identity(record) for record in assessment.records})
-            ),
-            unknown_components=tuple(sorted(set(assessment.unknowns))),
-            scenario_identity=scenario_identity,
-            _verified_ledger_fingerprint=fingerprint,
-            _verified_historical_actual=assessment.historical_actual,
+        schema = ledger.to_dict().get("schema_version")
+        if not isinstance(schema, str) or not schema.strip():
+            raise ValueError("ledger schema_version is required")
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("ledger fingerprint must be a lowercase hexadecimal digest")
+        identity = object.__new__(cls)
+        object.__setattr__(identity, "ledger_schema_version", schema)
+        object.__setattr__(identity, "ledger_fingerprint", fingerprint)
+        object.__setattr__(identity, "evidence_classification", assessment.classification)
+        object.__setattr__(identity, "historical_actual", assessment.historical_actual)
+        object.__setattr__(identity, "product_scope", product.value)
+        object.__setattr__(identity, "evidence_mode", evidence_mode)
+        object.__setattr__(identity, "policy_identity", policy_identity)
+        object.__setattr__(identity, "resolved_on_date", on_date)
+        object.__setattr__(
+            identity,
+            "selected_record_ids",
+            tuple(sorted({_record_identity(record) for record in assessment.records})),
         )
+        object.__setattr__(identity, "unknown_components", tuple(sorted(set(assessment.unknowns))))
+        object.__setattr__(identity, "scenario_identity", scenario_identity)
+        object.__setattr__(identity, "_verified_by_ledger", True)
+        identity._validate()
+        return identity
 
     @classmethod
     def from_public_scenario(
@@ -400,9 +429,15 @@ class CostEvidenceIdentity:
         scenario_identity: str,
         policy_identity: str = "effective-dated-cost-ledger/public-scenario/v1",
     ) -> CostEvidenceIdentity:
-        """Derive an explicitly labelled public broker scenario identity."""
+        """Derive an explicitly labelled public broker scenario from the ledger."""
 
-        if not scenario_identity.strip():
+        if not isinstance(ledger, EffectiveDatedCostLedger):
+            raise TypeError("ledger must be an EffectiveDatedCostLedger")
+        if not isinstance(on_date, date):
+            raise TypeError("on_date must be a date")
+        if not isinstance(product, LedgerProduct):
+            raise TypeError("product must be a LedgerProduct")
+        if not isinstance(scenario_identity, str) or not scenario_identity.strip():
             raise ValueError("scenario_identity is required")
         record = ledger.resolve(
             LedgerComponent.BROKERAGE,
@@ -426,8 +461,6 @@ class CostEvidenceIdentity:
                 "public broker scenario is not account-specific historical evidence",
             ),
             scenario_identity=scenario_identity,
-            _verified_ledger_fingerprint=fingerprint,
-            _verified_historical_actual=False,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -443,6 +476,43 @@ class CostEvidenceIdentity:
             "scenario_identity": self.scenario_identity,
             "selected_record_ids": list(self.selected_record_ids),
             "unknown_components": list(self.unknown_components),
+        }
+
+
+@dataclass(frozen=True)
+class CurrentCalibrationReference:
+    """Current operational calibration, never historical PIT eligibility."""
+
+    snapshot_fingerprint: str
+    snapshot_as_of: str
+    current_snapshot_not_historical_eligibility: bool = True
+    schema_version: str = CURRENT_CALIBRATION_SCHEMA_VERSION
+    source_uri: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot_fingerprint, str) or not self.snapshot_fingerprint.strip():
+            raise ValueError("snapshot_fingerprint is required")
+        if len(self.snapshot_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.snapshot_fingerprint
+        ):
+            raise ValueError("snapshot_fingerprint must be a 64-character hexadecimal digest")
+        if not isinstance(self.snapshot_as_of, str) or not self.snapshot_as_of.strip():
+            raise ValueError("snapshot_as_of timestamp is required")
+        if self.current_snapshot_not_historical_eligibility is not True:
+            raise ValueError(
+                "current calibration reference must have "
+                "current_snapshot_not_historical_eligibility=True"
+            )
+        if not isinstance(self.schema_version, str) or not self.schema_version.strip():
+            raise ValueError("calibration schema_version is required")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "snapshot_fingerprint": self.snapshot_fingerprint,
+            "snapshot_as_of": self.snapshot_as_of,
+            "current_snapshot_not_historical_eligibility": True,
+            "source_uri": self.source_uri,
         }
 
 
@@ -712,10 +782,7 @@ class ConcretePromotionEvidence:
         if self.held_out_test is None:
             violations.append("held-out test evidence artifact is missing")
         else:
-            if (
-                self.held_out_test.drawdown_basis
-                is not DrawdownBasis.OHLC_LOW_LIQUIDATION_STRESS
-            ):
+            if self.held_out_test.drawdown_basis is not DrawdownBasis.OHLC_LOW_LIQUIDATION_STRESS:
                 violations.append(
                     "promotion drawdown must use OHLC-low liquidation stress; "
                     f"received {self.held_out_test.drawdown_basis.value}"
@@ -781,9 +848,7 @@ class ConcretePromotionEvidence:
             "baseline_comparison": (
                 self.baseline_comparison.as_dict() if self.baseline_comparison else None
             ),
-            "slippage_stress": (
-                self.slippage_stress.as_dict() if self.slippage_stress else None
-            ),
+            "slippage_stress": (self.slippage_stress.as_dict() if self.slippage_stress else None),
             "event_simulation": (
                 self.event_simulation.as_dict() if self.event_simulation else None
             ),
@@ -834,6 +899,7 @@ class ExperimentArtifact:
     walk_forward_result: dict[str, Any]
     promotion_evidence: ConcretePromotionEvidence
     code_commit_sha: str
+    current_calibration_reference: CurrentCalibrationReference | None = None
     live_orders_called: bool = False
 
     def __post_init__(self) -> None:
@@ -863,6 +929,22 @@ class ExperimentArtifact:
                 f"{self.cost_evidence_identity.resolved_on_date} is after research window end "
                 f"{self.research_window.end}"
             )
+        if self.current_calibration_reference is not None:
+            calibration = self.current_calibration_reference
+            if calibration.current_snapshot_not_historical_eligibility is not True:
+                raise ValueError(
+                    "current calibration reference must have "
+                    "current_snapshot_not_historical_eligibility=True"
+                )
+            if calibration.snapshot_fingerprint in {
+                self.universe_fingerprint,
+                self.candidate_prefilter_artifact_fingerprint,
+                self.nse_membership_evidence.coverage_fingerprint,
+                self.cost_evidence_identity.ledger_fingerprint,
+            }:
+                raise DataLeakageError(
+                    "current calibration snapshot cannot substitute for historical PIT or cost evidence"
+                )
 
     def deterministic_payload(self) -> dict[str, Any]:
         """Return canonical dictionary of all deterministic research identity fields.
@@ -891,16 +973,17 @@ class ExperimentArtifact:
             "cost_model_identity": self.cost_model_identity.as_dict(),
             "cost_evidence_identity": self.cost_evidence_identity.as_dict(),
             "cost_evidence_class": self.cost_evidence_class,
+            "current_calibration_reference": (
+                self.current_calibration_reference.as_dict()
+                if self.current_calibration_reference is not None
+                else None
+            ),
             "strategy_definitions": [s.as_dict() for s in self.strategy_definitions],
-            "parameter_grid": {
-                k: list(v) for k, v in sorted(self.parameter_grid.items())
-            },
+            "parameter_grid": {k: list(v) for k, v in sorted(self.parameter_grid.items())},
             "vectorbt_version": self.vectorbt_version,
             "simulator_version": self.simulator_version,
             "random_seeds": (
-                dict(sorted(self.random_seeds.items()))
-                if self.random_seeds is not None
-                else None
+                dict(sorted(self.random_seeds.items())) if self.random_seeds is not None else None
             ),
             "friction_scenarios": [s.as_dict() for s in self.friction_scenarios],
             "rejected_candidates": [r.as_dict() for r in self.rejected_candidates],
@@ -939,6 +1022,8 @@ class ExperimentArtifact:
 
         passed, violations = self.promotion_evidence.evaluate_gate(thresholds)
         cost_violations = list(violations)
+        if self.live_orders_called:
+            cost_violations.append("live orders were called; cannot promote")
         if (
             self.cost_evidence_identity.evidence_classification != HISTORICAL_ACTUAL_LABEL
             or not self.cost_evidence_identity.historical_actual
@@ -946,6 +1031,25 @@ class ExperimentArtifact:
             cost_violations.append(
                 "cost evidence is not verified HISTORICAL_ACTUAL_COSTS; "
                 "scenario/incomplete evidence cannot promote"
+            )
+        if self.cost_evidence_identity.unknown_components:
+            cost_violations.append(
+                "cost evidence contains unknown components: "
+                + ", ".join(self.cost_evidence_identity.unknown_components)
+            )
+        if self.current_calibration_reference is not None and (
+            self.current_calibration_reference.current_snapshot_not_historical_eligibility
+            is not True
+            or self.current_calibration_reference.snapshot_fingerprint
+            in {
+                self.universe_fingerprint,
+                self.candidate_prefilter_artifact_fingerprint,
+                self.nse_membership_evidence.coverage_fingerprint,
+                self.cost_evidence_identity.ledger_fingerprint,
+            }
+        ):
+            cost_violations.append(
+                "current calibration snapshot leaked into historical PIT or cost evidence"
             )
         return (passed and not cost_violations, tuple(cost_violations))
 
@@ -1015,27 +1119,37 @@ class ExperimentArtifact:
                 "held-out test evidence artifact is missing; arbitrary booleans are forbidden"
             )
         if self.promotion_evidence.cost_reconciliation is None:
-            raise MissingEvidenceError(
-                "broker cost reconciliation evidence artifact is missing"
-            )
+            raise MissingEvidenceError("broker cost reconciliation evidence artifact is missing")
         if self.promotion_evidence.paper_trading is None:
-            raise MissingEvidenceError(
-                "paper-trading evidence artifact is missing"
-            )
+            raise MissingEvidenceError("paper-trading evidence artifact is missing")
         if self.promotion_evidence.baseline_comparison is None:
-            raise MissingEvidenceError(
-                "baseline comparison evidence artifact is missing"
-            )
+            raise MissingEvidenceError("baseline comparison evidence artifact is missing")
         if self.promotion_evidence.slippage_stress is None:
-            raise MissingEvidenceError(
-                "slippage/spread stress evidence artifact is missing"
-            )
+            raise MissingEvidenceError("slippage/spread stress evidence artifact is missing")
         if self.promotion_evidence.event_simulation is None:
-            raise MissingEvidenceError(
-                "event-driven simulation evidence artifact is missing"
-            )
+            raise MissingEvidenceError("event-driven simulation evidence artifact is missing")
 
-        # 5. Threshold evaluation if requested
+        # 5. Current calibration remains operational-only and cannot stand in for PIT evidence.
+        if self.current_calibration_reference is not None:
+            if (
+                self.current_calibration_reference.current_snapshot_not_historical_eligibility
+                is not True
+            ):
+                raise MissingEvidenceError(
+                    "current calibration reference must be marked "
+                    "current_snapshot_not_historical_eligibility=True"
+                )
+            if self.current_calibration_reference.snapshot_fingerprint in {
+                self.universe_fingerprint,
+                self.candidate_prefilter_artifact_fingerprint,
+                self.nse_membership_evidence.coverage_fingerprint,
+                self.cost_evidence_identity.ledger_fingerprint,
+            }:
+                raise DataLeakageError(
+                    "current calibration snapshot leaked into historical PIT or cost evidence"
+                )
+
+        # 6. Threshold evaluation if requested
         if promotion_thresholds is not None:
             passed, violations = self.evaluate_promotion_gate(promotion_thresholds)
             if not passed:
@@ -1099,15 +1213,12 @@ class ExperimentOrchestrator:
         tournament_result: dict[str, Any],
         walk_forward_result: dict[str, Any],
         promotion_evidence: ConcretePromotionEvidence,
+        current_calibration_reference: CurrentCalibrationReference | None = None,
         random_seeds: dict[str, int] | None = None,
         created_at: str | None = None,
     ) -> ExperimentArtifact:
         """Create and return an immutable ExperimentArtifact with strict fail-closed validation."""
-        timestamp = (
-            created_at
-            if created_at is not None
-            else datetime.now(UTC).isoformat()
-        )
+        timestamp = created_at if created_at is not None else datetime.now(UTC).isoformat()
 
         artifact = ExperimentArtifact(
             schema_version=EXPERIMENT_SCHEMA_VERSION,
@@ -1138,6 +1249,7 @@ class ExperimentOrchestrator:
             walk_forward_result=walk_forward_result,
             promotion_evidence=promotion_evidence,
             code_commit_sha=self._code_commit_sha,
+            current_calibration_reference=current_calibration_reference,
             live_orders_called=False,
         )
 
