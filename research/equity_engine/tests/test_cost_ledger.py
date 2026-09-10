@@ -232,7 +232,7 @@ def test_stamp_duty_side_and_product_differences() -> None:
     assert delivery_sell.rate == Decimal("0")
 
 
-def test_statutory_sebi_and_gst_are_known() -> None:
+def test_statutory_sebi_remains_known() -> None:
     ledger = _ledger()
     sebi = ledger.resolve(
         LedgerComponent.SEBI_TURNOVER,
@@ -240,14 +240,10 @@ def test_statutory_sebi_and_gst_are_known() -> None:
         LedgerProduct.INTRADAY,
         LedgerSide.BOTH,
     )
-    gst = ledger.resolve(
-        LedgerComponent.GST, date(2025, 6, 1), LedgerProduct.DELIVERY, LedgerSide.BOTH
-    )
 
     assert sebi.rate == Decimal("10") / _CRORE
     assert sebi.evidence_class is EvidenceClass.STATUTORY_SCHEDULE
-    assert gst.rate == Decimal("0.18")
-    assert gst.evidence_class is EvidenceClass.STATUTORY_SCHEDULE
+    assert sebi.historical_actual is True
 
 
 def test_evidence_classes_cover_required_taxonomy() -> None:
@@ -359,3 +355,269 @@ def test_public_scenario_does_not_leak_into_default_resolution() -> None:
         LedgerSide.BOTH,
     )
     assert default.evidence_class is EvidenceClass.ACCOUNT_SNAPSHOT
+
+
+def test_boundary_2024_06_30_is_unsupported() -> None:
+    ledger = _ledger()
+    with pytest.raises(UnsupportedResearchDate):
+        ledger.resolve(
+            LedgerComponent.STT,
+            date(2024, 6, 30),
+            LedgerProduct.INTRADAY,
+            LedgerSide.SELL,
+        )
+    with pytest.raises(UnsupportedResearchDate):
+        ledger.describe(date(2024, 6, 30), LedgerProduct.INTRADAY)
+    with pytest.raises(UnsupportedResearchDate):
+        ledger.quote_historical_actual(on_date=date(2024, 6, 30), product=LedgerProduct.INTRADAY)
+
+
+def test_boundary_2024_07_01_is_supported() -> None:
+    ledger = _ledger()
+    # Supported boundary: statutory STT resolves instead of raising unsupported.
+    sell = ledger.resolve(
+        LedgerComponent.STT,
+        date(2024, 7, 1),
+        LedgerProduct.INTRADAY,
+        LedgerSide.SELL,
+    )
+    assert sell.rate == Decimal("0.00025")
+    # Full assessment still fails closed (INCOMPLETE), but the date is supported.
+    assessment = ledger.describe(date(2024, 7, 1), LedgerProduct.INTRADAY)
+    assert assessment.classification == INCOMPLETE_LABEL
+    assert assessment.historical_actual is False
+    with pytest.raises(InsufficientHistoricalCostEvidence):
+        ledger.quote_historical_actual(on_date=date(2024, 7, 1), product=LedgerProduct.INTRADAY)
+
+
+def test_boundary_2024_09_30_mii_unknown() -> None:
+    ledger = _ledger()
+    with pytest.raises(UnknownCostEvidence) as txn:
+        ledger.mii_transaction_record(date(2024, 9, 30))
+    with pytest.raises(UnknownCostEvidence) as ipft:
+        ledger.mii_ipft_record(date(2024, 9, 30))
+    assert txn.value.unknowns
+    assert ipft.value.unknowns
+    with pytest.raises(UnknownCostEvidence):
+        ledger.total_mii_rate(date(2024, 9, 30))
+
+
+def test_boundary_2024_10_01_mii_period_a() -> None:
+    ledger = _ledger()
+    transaction = ledger.mii_transaction_record(date(2024, 10, 1))
+    ipft = ledger.mii_ipft_record(date(2024, 10, 1))
+    assert transaction.rate == Decimal("297") / _CRORE
+    assert ipft.rate == Decimal("10") / _CRORE
+    assert transaction.evidence_class is EvidenceClass.MII_SCHEDULE
+    assert ledger.total_mii_rate(date(2024, 10, 1)) == Decimal("307") / _CRORE
+
+
+def test_boundary_2026_02_28_mii_period_a() -> None:
+    ledger = _ledger()
+    transaction = ledger.mii_transaction_record(date(2026, 2, 28))
+    ipft = ledger.mii_ipft_record(date(2026, 2, 28))
+    assert transaction.rate == Decimal("297") / _CRORE
+    assert ipft.rate == Decimal("10") / _CRORE
+    assert ledger.total_mii_rate(date(2026, 2, 28)) == Decimal("307") / _CRORE
+
+
+def test_boundary_2026_03_01_mii_period_b() -> None:
+    ledger = _ledger()
+    transaction = ledger.mii_transaction_record(date(2026, 3, 1))
+    ipft = ledger.mii_ipft_record(date(2026, 3, 1))
+    assert transaction.rate == Decimal("306.99") / _CRORE
+    assert ipft.rate == Decimal("0.01") / _CRORE
+    assert ledger.total_mii_rate(date(2026, 3, 1)) == Decimal("307") / _CRORE
+
+
+def test_boundary_2026_09_08_account_brokerage_unknown() -> None:
+    ledger = _ledger()
+    with pytest.raises(UnknownCostEvidence) as exc:
+        ledger.brokerage_record(date(2026, 9, 8), LedgerProduct.INTRADAY)
+    assert exc.value.unknowns
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.BROKERAGE,
+            date(2026, 9, 8),
+            LedgerProduct.INTRADAY,
+            LedgerSide.BOTH,
+        )
+
+
+def test_boundary_2026_09_09_snapshot_available_not_historical_actual() -> None:
+    ledger = _ledger()
+    snapshot = ledger.brokerage_record(ACCOUNT_SNAPSHOT_DATE, LedgerProduct.INTRADAY)
+    assert snapshot.rate == Decimal("0.0006")
+    assert snapshot.evidence_class is EvidenceClass.ACCOUNT_SNAPSHOT
+    assert snapshot.historical_actual is False
+    assert snapshot.effective_from == ACCOUNT_SNAPSHOT_DATE
+    assert snapshot.effective_to == ACCOUNT_SNAPSHOT_DATE
+    # Full historical actual still fails closed on the snapshot date.
+    with pytest.raises(InsufficientHistoricalCostEvidence):
+        ledger.quote_historical_actual(
+            on_date=ACCOUNT_SNAPSHOT_DATE, product=LedgerProduct.INTRADAY
+        )
+    assert ledger.cost_label_for(ACCOUNT_SNAPSHOT_DATE, LedgerProduct.INTRADAY) == INCOMPLETE_LABEL
+
+
+def test_boundary_2026_09_10_account_brokerage_unknown() -> None:
+    ledger = _ledger()
+    with pytest.raises(UnknownCostEvidence) as exc:
+        ledger.brokerage_record(date(2026, 9, 10), LedgerProduct.INTRADAY)
+    assert exc.value.unknowns
+    assert any("forward" in item or "2026-09-09" in item for item in exc.value.unknowns)
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.BROKERAGE,
+            date(2026, 9, 10),
+            LedgerProduct.INTRADAY,
+            LedgerSide.BOTH,
+        )
+
+
+def test_snapshot_window_is_single_day() -> None:
+    ledger = _ledger()
+    snapshots = [
+        record
+        for record in ledger.records
+        if record.evidence_class is EvidenceClass.ACCOUNT_SNAPSHOT
+    ]
+    assert snapshots
+    for record in snapshots:
+        assert record.effective_from == ACCOUNT_SNAPSHOT_DATE
+        assert record.effective_to == ACCOUNT_SNAPSHOT_DATE
+        assert record.historical_actual is False
+
+
+def test_snapshot_rounding_is_account_observed_not_statutory() -> None:
+    ledger = _ledger()
+    snapshot = ledger.brokerage_record(ACCOUNT_SNAPSHOT_DATE, LedgerProduct.INTRADAY)
+    assert snapshot.rounding is not None
+    assert "account_observed" in snapshot.rounding
+    assert "not_statutory" in snapshot.rounding
+    assert snapshot.historical_actual is False
+    assert any("reconciliation" in item and "statutory" in item for item in snapshot.unknowns)
+
+
+def test_default_historical_gst_never_returns_historical_actual() -> None:
+    ledger = _ledger()
+    for query_date in (
+        date(2024, 7, 1),
+        date(2024, 9, 30),
+        date(2024, 10, 1),
+        date(2026, 2, 28),
+        date(2026, 3, 1),
+        date(2026, 9, 9),
+    ):
+        for product in (LedgerProduct.INTRADAY, LedgerProduct.DELIVERY):
+            with pytest.raises(UnknownCostEvidence) as exc:
+                ledger.resolve(LedgerComponent.GST, query_date, product, LedgerSide.BOTH)
+            assert exc.value.unknowns
+    # No default GST record may claim historical actual.
+    for record in ledger.records:
+        if record.component is LedgerComponent.GST and record.evidence_class in (
+            EvidenceClass.STATUTORY_SCHEDULE,
+            EvidenceClass.MII_SCHEDULE,
+            EvidenceClass.ACCOUNT_SNAPSHOT,
+            EvidenceClass.UNKNOWN,
+        ):
+            assert record.historical_actual is False
+            assert record.rate is None
+
+
+def test_gst_missing_evidence_is_explicit_unknown() -> None:
+    ledger = _ledger()
+    with pytest.raises(UnknownCostEvidence) as exc:
+        ledger.resolve(
+            LedgerComponent.GST,
+            date(2025, 6, 1),
+            LedgerProduct.INTRADAY,
+            LedgerSide.BOTH,
+        )
+    assert exc.value.unknowns
+    assert any("GST" in item or "gst" in item.lower() for item in exc.value.unknowns)
+    assert any("public pricing" in item for item in exc.value.unknowns)
+
+
+def test_full_historical_assessment_remains_incomplete_for_gst() -> None:
+    ledger = _ledger()
+    for query_date in (
+        date(2024, 7, 1),
+        date(2024, 10, 1),
+        date(2026, 3, 1),
+        date(2026, 9, 9),
+    ):
+        for product in (LedgerProduct.INTRADAY, LedgerProduct.DELIVERY):
+            assessment = ledger.describe(query_date, product)
+            assert assessment.classification == INCOMPLETE_LABEL
+            assert assessment.historical_actual is False
+            assert assessment.unknowns
+            assert ledger.cost_label_for(query_date, product) == INCOMPLETE_LABEL
+            assert ledger.cost_label_for(query_date, product) != HISTORICAL_ACTUAL_LABEL
+            with pytest.raises(InsufficientHistoricalCostEvidence):
+                ledger.quote_historical_actual(on_date=query_date, product=product)
+
+
+def test_missing_gst_never_becomes_zero() -> None:
+    ledger = _ledger()
+    for record in ledger.records:
+        if record.component is LedgerComponent.GST:
+            assert record.rate is None or record.rate != Decimal("0")
+    # Explicit default-path check: UNKNOWN, never Decimal("0").
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.GST,
+            date(2025, 6, 1),
+            LedgerProduct.INTRADAY,
+            LedgerSide.BOTH,
+        )
+
+
+def test_gst_public_scenario_does_not_enter_default_path() -> None:
+    ledger = _ledger()
+    scenario = ledger.resolve(
+        LedgerComponent.GST,
+        date(2026, 9, 9),
+        LedgerProduct.INTRADAY,
+        LedgerSide.BOTH,
+        evidence_classes=(EvidenceClass.BROKER_PUBLIC_SCENARIO,),
+    )
+    assert scenario.rate == Decimal("0.18")
+    assert scenario.evidence_class is EvidenceClass.BROKER_PUBLIC_SCENARIO
+    assert scenario.historical_actual is False
+    # Default path still raises UNKNOWN on the same date/product.
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.GST,
+            date(2026, 9, 9),
+            LedgerProduct.INTRADAY,
+            LedgerSide.BOTH,
+        )
+
+
+def test_delivery_gst_not_silently_intraday_formula() -> None:
+    ledger = _ledger()
+    # Intraday has an explicit public scenario; delivery must not reuse it.
+    intraday_scenario = ledger.resolve(
+        LedgerComponent.GST,
+        date(2026, 9, 9),
+        LedgerProduct.INTRADAY,
+        LedgerSide.BOTH,
+        evidence_classes=(EvidenceClass.BROKER_PUBLIC_SCENARIO,),
+    )
+    assert intraday_scenario.product is LedgerProduct.INTRADAY
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.GST,
+            date(2026, 9, 9),
+            LedgerProduct.DELIVERY,
+            LedgerSide.BOTH,
+            evidence_classes=(EvidenceClass.BROKER_PUBLIC_SCENARIO,),
+        )
+    with pytest.raises(UnknownCostEvidence):
+        ledger.resolve(
+            LedgerComponent.GST,
+            date(2026, 9, 9),
+            LedgerProduct.DELIVERY,
+            LedgerSide.BOTH,
+        )
