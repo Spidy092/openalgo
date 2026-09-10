@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -1035,8 +1035,27 @@ class EventDrivenSimulationEvidence:
 
 
 @dataclass(frozen=True)
+class PerformanceEvidenceResult:
+    """Non-authorizing result from evaluating concrete performance evidence.
+
+    This result contains metric/performance evidence only.  It deliberately does
+    not represent an experiment-level promotion decision: trusted cost evidence,
+    full-window cost coverage, and the remaining artifact integrity requirements
+    are evaluated only by :meth:`ExperimentArtifact.evaluate_promotion_gate`.
+
+    ``non_authorizing`` is immutable and cannot be supplied by callers.  The
+    explicit marker makes it difficult to mistake this result for a promotion
+    authorization when inspecting or serializing it.
+    """
+
+    passed: bool
+    violations: tuple[str, ...]
+    non_authorizing: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True)
 class ConcretePromotionEvidence:
-    """Rigorous gate decision grounded strictly in concrete evidence artifacts.
+    """Concrete performance evidence used by the experiment-level promotion gate.
 
     Arbitrary booleans like ``paper_trading_present=True`` are strictly forbidden:
     every claim must link to a verified artifact fingerprint.
@@ -1050,7 +1069,18 @@ class ConcretePromotionEvidence:
     event_simulation: EventDrivenSimulationEvidence | None
     unpriced_cost_components: tuple[str, ...] = ()
 
-    def evaluate_gate(self, thresholds: PromotionThresholds) -> tuple[bool, tuple[str, ...]]:
+    def evaluate_performance_evidence(
+        self, thresholds: PromotionThresholds
+    ) -> PerformanceEvidenceResult:
+        """Evaluate metric/performance evidence without authorizing promotion.
+
+        THIS RESULT IS NOT PROMOTION AUTHORIZATION.  It only evaluates the
+        concrete performance evidence against metric thresholds.  In particular,
+        it does not validate trusted cost evidence, full-window cost coverage,
+        experiment data provenance, or any other experiment-level promotion
+        boundary.  Only ``ExperimentArtifact.evaluate_promotion_gate`` may return
+        an experiment-level promotion decision.
+        """
         violations: list[str] = []
 
         if self.held_out_test is None:
@@ -1113,7 +1143,10 @@ class ConcretePromotionEvidence:
                 "unpriced cost components remain: " + ", ".join(self.unpriced_cost_components)
             )
 
-        return (len(violations) == 0, tuple(violations))
+        return PerformanceEvidenceResult(
+            passed=len(violations) == 0,
+            violations=tuple(violations),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1342,8 +1375,8 @@ class ExperimentArtifact:
         it cannot establish historical actual costs by itself.
         """
 
-        passed, violations = self.promotion_evidence.evaluate_gate(thresholds)
-        cost_violations = list(violations)
+        performance = self.promotion_evidence.evaluate_performance_evidence(thresholds)
+        cost_violations = list(performance.violations)
         if trusted_cost_ledger is None:
             cost_violations.append(
                 "trusted cost evidence ledger is required for promotion; "
@@ -1381,7 +1414,7 @@ class ExperimentArtifact:
                 "cost evidence coverage is not verified HISTORICAL_ACTUAL_COSTS for the full "
                 "research window; every regime must be complete historical evidence"
             )
-        return (passed and not cost_violations, tuple(cost_violations))
+        return (performance.passed and not cost_violations, tuple(cost_violations))
 
     def validate_integrity(
         self,

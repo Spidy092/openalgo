@@ -47,6 +47,7 @@ from equity_engine.experiment import (
     MissingEvidenceError,
     NSEMembershipEvidenceIdentity,
     PaperTradingEvidence,
+    PerformanceEvidenceResult,
     RejectedCandidateSpec,
     ResearchWindowConfig,
     SessionPolicyIdentity,
@@ -601,3 +602,47 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
             promotion_thresholds=thresholds,
             trusted_cost_ledger=EffectiveDatedCostLedger(),
         )
+
+
+def test_performance_evidence_result_is_explicitly_non_authorizing(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.20"),
+        max_drawdown_pct=Decimal("10.0"),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    result = baseline_experiment.promotion_evidence.evaluate_performance_evidence(thresholds)
+
+    assert isinstance(result, PerformanceEvidenceResult)
+    assert result.passed is True
+    assert result.violations == ()
+    assert result.non_authorizing is True
+    assert not hasattr(baseline_experiment.promotion_evidence, "evaluate_gate")
+
+
+def test_metric_evidence_alone_cannot_authorize_promotion(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.20"),
+        max_drawdown_pct=Decimal("10.0"),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    performance = baseline_experiment.promotion_evidence.evaluate_performance_evidence(
+        thresholds
+    )
+    promotion_passed, promotion_violations = baseline_experiment.evaluate_promotion_gate(
+        thresholds
+    )
+
+    assert performance.passed is True
+    assert promotion_passed is False
+    assert any("trusted cost evidence ledger is required" in item for item in promotion_violations)
+    assert any("full research window" in item for item in promotion_violations)
