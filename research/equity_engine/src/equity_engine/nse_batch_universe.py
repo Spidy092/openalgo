@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -62,6 +64,42 @@ def _json_default(value: object) -> object:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     raise TypeError(f"cannot serialize {type(value)!r}")
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    _atomic_write_bytes(path, content.encode("utf-8"))
+
+
+def _atomic_write_parquet(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        frame.to_parquet(temporary_path, index=False)
+        with temporary_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _universe_frame(universe: NseDailyEquityUniverse) -> pd.DataFrame:
@@ -178,7 +216,7 @@ class NseBatchUniverseBuilder:
                         f"recorded={recorded} actual={cached_hash}"
                     )
             else:
-                hash_path.write_text(cached_hash + "\n", encoding="utf-8")
+                _atomic_write_text(hash_path, cached_hash + "\n")
 
             if not refresh_existing:
                 return cached, "cached"
@@ -194,8 +232,8 @@ class NseBatchUniverseBuilder:
 
         payload = self._get(source_url)
         digest = sha256(payload).hexdigest()
-        raw_path.write_bytes(payload)
-        hash_path.write_text(digest + "\n", encoding="utf-8")
+        _atomic_write_bytes(raw_path, payload)
+        _atomic_write_text(hash_path, digest + "\n")
         return payload, "downloaded"
 
     def _process_day(
@@ -220,7 +258,7 @@ class NseBatchUniverseBuilder:
         day_dir = self.output_dir / "daily" / str(report_date.year)
         day_dir.mkdir(parents=True, exist_ok=True)
         parquet_path = day_dir / f"NSE_CM_universe_{report_date.isoformat()}.parquet"
-        _universe_frame(universe).to_parquet(parquet_path, index=False)
+        _atomic_write_parquet(parquet_path, _universe_frame(universe))
 
         raw_path = self.output_dir / "raw" / str(report_date.year) / filename
         summary = NseBatchDaySummary(
@@ -310,9 +348,9 @@ class NseBatchUniverseBuilder:
             "days": [asdict(item) for item in day_summaries],
             "failures": [asdict(item) for item in failures],
         }
-        manifest_path.write_text(
+        _atomic_write_text(
+            manifest_path,
             json.dumps(payload, indent=2, default=_json_default),
-            encoding="utf-8",
         )
 
         return NseBatchUniverseResult(

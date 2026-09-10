@@ -26,7 +26,9 @@ Research pipeline:
 
 ## Historical batch-data workflow
 
-The first exact point-in-time research boundary is `2024-07-01` through `2026-07-31`. NSE CM semantics before 2024-07-01 are not projected backward, and the August-2026 Closing Auction Session regime is kept outside this first normal-session batch.
+Historical acquisition boundaries are caller-supplied. NSE CM semantics before the verified
+`2024-07-01` evidence boundary are not projected backward. Any CAS or other session change must
+be resolved by its effective-dated session policy; it is never treated as an ordinary missing bar.
 
 Build the dated NSE universe:
 
@@ -39,11 +41,59 @@ python scripts/nse_universe_batch.py \
 
 The batch uses sourced NSE Capital Market holiday calendars, excludes explicitly identified Muhurat/special sessions from the normal-session research pass, caches every raw `NSE_CM_security_DDMMYYYY.csv.gz`, writes a SHA-256 sidecar, materializes one dated Parquet universe per session, and writes `nse_universe_manifest.json`. A missing snapshot on a declared trading date, cache hash mismatch, unknown schema/code, or unresolved eligible duplicate fails closed. Re-running resumes from verified cache. `--refresh-existing` re-downloads cached dates only to verify that the archive payload has not changed; a differing payload is never silently overwritten.
 
+For the two-stage research workflow, first create a dry-run plan from a completed universe
+manifest. The command requires capital, affordability/liquidity thresholds, formation/signal/
+execution timing, rate-limit evidence, adjustment policy, and storage assumptions explicitly. It
+only reads the manifest and writes a deterministic plan; it does not download NSE, Upstox, or
+historical candles:
+
+```bash
+python scripts/pit_historical_plan.py \
+  --universe-manifest data/nse_universe_batch/nse_universe_manifest.json \
+  --start "$PIT_START" --end "$PIT_END" \
+  --approved-capital 1000 \
+  --max-last-price "$MAX_LAST_PRICE" \
+  --min-median-daily-notional "$MIN_MEDIAN_DAILY_NOTIONAL" \
+  --min-median-daily-volume "$MIN_MEDIAN_DAILY_VOLUME" \
+  --min-observed-trading-days "$MIN_OBSERVED_TRADING_DAYS" \
+  --min-affordable-quantity 1 \
+  --timezone Asia/Kolkata --formation-policy-id pit-prior-close-v1 \
+  --decision-time 09:20 \
+  --price-reference-policy prior_completed_session_close \
+  --signal-time-policy signal-after-formation \
+  --execution-time-policy execution-after-signal \
+  --rate-limit-policy-id upstox-evidence-rate-limit-v1 \
+  --rate-limit-source "$RATE_LIMIT_EVIDENCE" \
+  --min-request-interval "$MIN_REQUEST_INTERVAL" \
+  --max-attempts 4 --backoff-seconds 1 \
+  --universe-rule-version nse-cm-v15-point-in-time \
+  --adjustment-policy raw-unadjusted-block-structural-actions \
+  --lookback-calendar-days 1 \
+  --estimated-rows-per-trading-day 1 \
+  --estimated-bytes-per-daily-row 80 \
+  --cost-model-identity documented-current-terms-explicit-scenario \
+  --output data/pit_historical_acquisition_plan.json
+```
+
+Stage A uses the existing resumable Upstox batch downloader at daily resolution after the plan is
+approved. Its completed daily datasets are then evaluated by the reusable point-in-time prefilter;
+missing observations, malformed OHLCV, missing tick/corporate-action evidence, and unresolved
+membership evidence leave the prefilter incomplete. Stage B cannot be built until that artifact is
+complete and cryptographically bound to the exact Stage-A plan/source manifest. Only then may the
+existing downloader be run at 5-minute resolution for the explicit prefiltered candidates.
+
+The dry-run report deliberately leaves `candidate_count_after_affordability_filter` pending until
+Stage-A daily data exists; it never guesses that count from today's universe or prices. Both batch
+downloaders use atomic artifact writes, verify cached bytes/hashes on resume, retry only transient
+HTTP failures, and set `live_orders_called` to `false`.
+
 Plan the full 5-minute Upstox acquisition without downloading it:
 
 ```bash
 python scripts/upstox_history_batch.py \
-  --universe-manifest data/nse_universe_batch/nse_universe_manifest.json
+  --universe-manifest data/nse_universe_batch/nse_universe_manifest.json \
+  --min-request-interval "$MIN_REQUEST_INTERVAL" \
+  --max-attempts 4 --backoff-seconds 1
 ```
 
 This reports the full-universe candidate count, estimated Upstox request count, estimated rows/storage, and explicitly reports that the approved-capital affordability prefilter has not yet been applied. NSE reference masters do not contain historical market prices, so the program refuses to infer affordability from them.
@@ -56,6 +106,8 @@ Example candidate-file execution after that prefilter exists:
 python scripts/upstox_history_batch.py \
   --candidate-file data/candidates.json \
   --prefilter-evidence data/candidates.audit.json \
+  --min-request-interval "$MIN_REQUEST_INTERVAL" \
+  --max-attempts 4 --backoff-seconds 1 \
   --execute
 ```
 

@@ -24,13 +24,17 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--prefilter-evidence")
     parser.add_argument("--output-dir", default="data/upstox_history_batch")
-    parser.add_argument("--interval", type=int, default=5)
+    parser.add_argument("--resolution", choices=("minutes", "daily"), default="minutes")
+    parser.add_argument("--interval", type=int)
     parser.add_argument("--expected-rows-per-trading-day", type=int, default=75)
     parser.add_argument("--estimated-bytes-per-row", type=int, default=80)
-    parser.add_argument("--min-request-interval", type=float, default=0.15)
+    parser.add_argument("--min-request-interval", type=float, required=True)
+    parser.add_argument("--max-attempts", type=int, required=True)
+    parser.add_argument("--backoff-seconds", type=float, required=True)
     parser.add_argument("--universe-rule-version", default="nse-cm-v15-point-in-time")
     parser.add_argument("--adjustment-policy", default="raw-unadjusted-block-structural-actions")
     args = parser.parse_args()
+    interval = args.interval if args.interval is not None else (1 if args.resolution == "daily" else 5)
 
     trading_day_counts = None
     if args.universe_manifest:
@@ -44,7 +48,8 @@ def main() -> int:
 
     plan = plan_historical_batch(
         candidates=candidates,
-        interval_minutes=args.interval,
+        resolution=args.resolution,
+        interval_minutes=interval,
         expected_rows_per_trading_day=(
             args.expected_rows_per_trading_day if trading_day_counts is not None else None
         ),
@@ -86,8 +91,11 @@ def main() -> int:
     downloader = UpstoxHistoricalBatchDownloader(
         access_token=token,
         output_dir=Path(args.output_dir),
-        interval_minutes=args.interval,
+        interval_minutes=interval,
+        resolution=args.resolution,
         min_request_interval_seconds=args.min_request_interval,
+        max_attempts=args.max_attempts,
+        backoff_seconds=args.backoff_seconds,
     )
     result = downloader.run(
         candidates=plan.candidates,

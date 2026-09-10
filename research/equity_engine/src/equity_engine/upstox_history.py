@@ -13,6 +13,8 @@ from .provenance import MarketDataManifest, dataframe_fingerprint, validate_ohlc
 
 UPSTOX_HISTORY_DOC = "https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/"
 UPSTOX_HISTORY_BASE = "https://api.upstox.com/v3/historical-candle"
+UPSTOX_MINUTE_HISTORY_START = date(2022, 1, 1)
+UPSTOX_DAILY_HISTORY_START = date(2000, 1, 1)
 
 
 @dataclass(frozen=True)
@@ -69,23 +71,81 @@ class UpstoxHistoricalDataProvider:
     ) -> HistoricalDataset:
         if interval_minutes < 1 or interval_minutes > 15:
             raise ValueError("this loader currently supports 1-15 minute V3 intervals")
+        return self._fetch_ohlcv(
+            instrument_token=instrument_token,
+            symbol=symbol,
+            exchange=exchange,
+            start=start,
+            end=end,
+            path=f"minutes/{interval_minutes}",
+            interval=f"{interval_minutes}m",
+            chunk_days=27,
+            adjustment_policy=adjustment_policy,
+            universe_rule_version=universe_rule_version,
+        )
+
+    def fetch_daily(
+        self,
+        *,
+        instrument_token: str,
+        symbol: str,
+        exchange: str,
+        start: date,
+        end: date,
+        universe_rule_version: str,
+        adjustment_policy: str,
+    ) -> HistoricalDataset:
+        """Fetch daily OHLCV for coarse PIT affordability/liquidity discovery."""
+
+        return self._fetch_ohlcv(
+            instrument_token=instrument_token,
+            symbol=symbol,
+            exchange=exchange,
+            start=start,
+            end=end,
+            path="days/1",
+            interval="1d",
+            chunk_days=3649,
+            adjustment_policy=adjustment_policy,
+            universe_rule_version=universe_rule_version,
+        )
+
+    def _fetch_ohlcv(
+        self,
+        *,
+        instrument_token: str,
+        symbol: str,
+        exchange: str,
+        start: date,
+        end: date,
+        path: str,
+        interval: str,
+        chunk_days: int,
+        adjustment_policy: str,
+        universe_rule_version: str,
+    ) -> HistoricalDataset:
         if start > end:
             raise ValueError("start must be on or before end")
-        if start < date(2022, 1, 1):
-            raise ValueError("Upstox documents minute history availability from January 2022")
+        supported_start = (
+            UPSTOX_DAILY_HISTORY_START if path.startswith("days/") else UPSTOX_MINUTE_HISTORY_START
+        )
+        if start < supported_start:
+            raise ValueError(
+                f"Upstox {interval} historical data is documented from {supported_start.isoformat()}"
+            )
+        if chunk_days < 1:
+            raise ValueError("chunk_days must be positive")
 
         all_rows: list[list[object]] = []
         chunk_start = start
-        # Upstox caps 1-15 minute retrieval at one month. 28-day inclusive windows remain
-        # safely inside that documented maximum without making calendar-month assumptions.
         while chunk_start <= end:
-            chunk_end = min(chunk_start + timedelta(days=27), end)
+            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
             all_rows.extend(
                 self._fetch_chunk(
                     instrument_token=instrument_token,
                     start=chunk_start,
                     end=chunk_end,
-                    interval_minutes=interval_minutes,
+                    path=path,
                 )
             )
             chunk_start = chunk_end + timedelta(days=1)
@@ -99,6 +159,8 @@ class UpstoxHistoricalDataProvider:
         )
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False)
         frame = frame.set_index("timestamp").sort_index()
+        if frame.index.tz is None:
+            raise ValueError("Upstox historical timestamps must be timezone-aware")
 
         violations = validate_ohlcv_frame(frame)
         if violations:
@@ -110,7 +172,7 @@ class UpstoxHistoricalDataProvider:
             instrument_token=instrument_token,
             symbol=symbol,
             timezone=str(frame.index.tz),
-            interval=f"{interval_minutes}m",
+            interval=interval,
             timestamp_semantics="candle_start",
             start=frame.index[0].to_pydatetime(),
             end=frame.index[-1].to_pydatetime(),
@@ -128,12 +190,11 @@ class UpstoxHistoricalDataProvider:
         instrument_token: str,
         start: date,
         end: date,
-        interval_minutes: int,
+        path: str,
     ) -> list[list[object]]:
         encoded_instrument = quote(instrument_token, safe="")
         url = (
-            f"{UPSTOX_HISTORY_BASE}/{encoded_instrument}/minutes/{interval_minutes}/"
-            f"{end.isoformat()}/{start.isoformat()}"
+            f"{UPSTOX_HISTORY_BASE}/{encoded_instrument}/{path}/{end.isoformat()}/{start.isoformat()}"
         )
         headers = {
             "Accept": "application/json",

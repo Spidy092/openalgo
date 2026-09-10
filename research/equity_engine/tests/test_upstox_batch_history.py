@@ -26,9 +26,11 @@ class _SequenceClient:
 class _HistoryClient:
     def __init__(self) -> None:
         self.calls = 0
+        self.urls: list[str] = []
 
     def get(self, url: str, **_: object) -> httpx.Response:
         self.calls += 1
+        self.urls.append(url)
         payload = {
             "status": "success",
             "data": {
@@ -107,6 +109,8 @@ def test_downloader_saves_manifest_without_token_and_resumes(tmp_path: Path) -> 
         output_dir=tmp_path,
         client=network,
         min_request_interval_seconds=0,
+        max_attempts=1,
+        backoff_seconds=0,
         sleep=lambda _: None,
     ).run(
         candidates=[_candidate()],
@@ -121,12 +125,19 @@ def test_downloader_saves_manifest_without_token_and_resumes(tmp_path: Path) -> 
     manifest = json.loads(manifest_text)
     assert manifest["live_orders_called"] is False
     assert manifest["fingerprint_schema"] == "equity-market-data-v2"
+    assert manifest["rate_limit"] == {
+        "backoff_seconds": 0,
+        "max_attempts": 1,
+        "minimum_interval_seconds": 0,
+    }
 
     second = UpstoxHistoricalBatchDownloader(
         access_token=token,
         output_dir=tmp_path,
         client=_NeverClient(),
         min_request_interval_seconds=0,
+        max_attempts=1,
+        backoff_seconds=0,
         sleep=lambda _: None,
     ).run(
         candidates=[_candidate()],
@@ -135,3 +146,69 @@ def test_downloader_saves_manifest_without_token_and_resumes(tmp_path: Path) -> 
     )
     assert second.passed is True
     assert second.items[0].retrieval == "cached"
+
+
+def test_daily_resolution_uses_one_day_endpoint_and_atomic_cache(tmp_path: Path) -> None:
+    network = _HistoryClient()
+    downloader = UpstoxHistoricalBatchDownloader(
+        access_token="super-secret-token",
+        output_dir=tmp_path,
+        client=network,
+        interval_minutes=1,
+        resolution="daily",
+        min_request_interval_seconds=0,
+        max_attempts=1,
+        backoff_seconds=0,
+        sleep=lambda _: None,
+    )
+    result = downloader.run(
+        candidates=[_candidate()],
+        universe_rule_version="test-rule",
+        adjustment_policy="raw",
+    )
+
+    assert result.passed is True
+    assert network.calls == 1
+    assert "/days/1/" in network.urls[0]
+    manifest = json.loads(Path(result.items[0].manifest).read_text(encoding="utf-8"))
+    assert manifest["request"]["resolution"] == "daily"
+    assert manifest["parquet_sha256"]
+
+
+def test_partial_cached_artifact_fails_closed_without_overwrite(tmp_path: Path) -> None:
+    candidate = _candidate()
+    network = _HistoryClient()
+    first = UpstoxHistoricalBatchDownloader(
+        access_token="super-secret-token",
+        output_dir=tmp_path,
+        client=network,
+        min_request_interval_seconds=0,
+        max_attempts=1,
+        backoff_seconds=0,
+        sleep=lambda _: None,
+    ).run(
+        candidates=[candidate],
+        universe_rule_version="test-rule",
+        adjustment_policy="raw",
+    )
+    parquet = Path(first.items[0].parquet)
+    manifest = Path(first.items[0].manifest)
+    manifest.unlink()
+
+    second = UpstoxHistoricalBatchDownloader(
+        access_token="super-secret-token",
+        output_dir=tmp_path,
+        client=_NeverClient(),
+        min_request_interval_seconds=0,
+        max_attempts=1,
+        backoff_seconds=0,
+        sleep=lambda _: None,
+    ).run(
+        candidates=[candidate],
+        universe_rule_version="test-rule",
+        adjustment_policy="raw",
+    )
+
+    assert second.passed is False
+    assert "partial historical artifact" in second.failures[0]
+    assert parquet.exists()
