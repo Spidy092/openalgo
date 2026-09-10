@@ -379,11 +379,43 @@ class CorporateActionPolicy:
                     "cannot evaluate threshold without a reference price"
                 )
 
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "policy_name": self.policy_name,
+            "blocked_event_types": sorted(
+                e.value if isinstance(e, CorporateActionEventType) else str(e)
+                for e in self.blocked_event_types
+            ),
+            "allow_ex_post_adjusted_splits": self.allow_ex_post_adjusted_splits,
+            "allow_ex_post_adjusted_bonuses": self.allow_ex_post_adjusted_bonuses,
+            "dividend_policy": (
+                self.dividend_policy.value
+                if isinstance(self.dividend_policy, DividendPolicy)
+                else str(self.dividend_policy)
+            ),
+            "dividend_threshold_percent": (
+                str(self.dividend_threshold_percent)
+                if self.dividend_threshold_percent is not None
+                else None
+            ),
+            "reference_price_for_dividend": (
+                str(self.reference_price_for_dividend)
+                if self.reference_price_for_dividend is not None
+                else None
+            ),
+        }
+
+    def policy_fingerprint(self) -> str:
+        """Deterministic SHA-256 fingerprint over complete canonical policy payload."""
+        payload = self.canonical_payload()
+        canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
     @property
     def policy_identity(self) -> str:
-        if self.dividend_policy == DividendPolicy.IGNORE_BELOW_THRESHOLD:
-            return f"{self.policy_name}:IGNORE_BELOW_THRESHOLD:{self.dividend_threshold_percent}%"
-        return f"{self.policy_name}:{self.dividend_policy.value}"
+        """Full cryptographic policy identity binding all behavior-changing fields."""
+        return f"{self.policy_name}:{self.policy_fingerprint()}"
+
 
 
 @dataclass(frozen=True)
@@ -590,10 +622,12 @@ class PointInTimeCorporateActionLedger:
     4. Deterministic cryptographic evidence fingerprinting.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER") -> None:
+        self.source = source
         self._records: dict[str, list[CorporateActionRecord]] = {}
         self._coverage: dict[str, list[CoverageScope]] = {}
         self._symbol_history: list[tuple[date, str, str]] = []  # effective_date, isin, symbol
+
 
     def add_coverage(self, coverage: CoverageScope) -> None:
         """Register a verified coverage scope for an instrument."""
@@ -824,9 +858,7 @@ class PointInTimeCorporateActionLedger:
                 if (
                     r.event_type == CorporateActionEventType.SPLIT
                     and effective_policy.allow_ex_post_adjusted_splits
-                ):
-                    is_blocked = False
-                elif (
+                ) or (
                     r.event_type == CorporateActionEventType.BONUS
                     and effective_policy.allow_ex_post_adjusted_bonuses
                 ):
@@ -945,17 +977,42 @@ class PointInTimeCorporateActionLedger:
         research_end: date,
         instruments: Iterable[str],
         policy: CorporateActionPolicy | None = None,
-        source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        evaluation_mode: CorporateActionEvaluationMode | str = CorporateActionEvaluationMode.TRADABLE_INFORMATION,
+        source: str | None = None,
     ) -> Any:
         """Derive canonical CorporateActionEvidenceIdentity for an experiment."""
         from .experiment import CorporateActionEvidenceIdentity
 
         effective_policy = policy if policy is not None else CorporateActionPolicy()
-        instrument_list = tuple(sorted(instruments))
-        if not instrument_list:
+        raw_instruments = tuple(instruments)
+        if not raw_instruments:
             raise CorporateActionCoverageError(
                 "cannot derive corporate-action evidence identity: requested instrument population is empty"
             )
+        if any(not str(k).strip() for k in raw_instruments):
+            raise CorporateActionCoverageError(
+                "cannot derive corporate-action evidence identity: instrument keys must be non-empty"
+            )
+        if len(set(raw_instruments)) != len(raw_instruments):
+            raise CorporateActionCoverageError(
+                "cannot derive corporate-action evidence identity: instrument population contains duplicates"
+            )
+        instrument_list = tuple(sorted(raw_instruments))
+        if instrument_list != raw_instruments:
+            raise CorporateActionCoverageError(
+                "cannot derive corporate-action evidence identity: instrument population must be sorted unique"
+            )
+
+        mode = (
+            evaluation_mode
+            if isinstance(evaluation_mode, CorporateActionEvaluationMode)
+            else CorporateActionEvaluationMode(str(evaluation_mode))
+        )
+        effective_source = (
+            source
+            if source is not None
+            else getattr(self, "source", "CANONICAL_PIT_CORPORATE_ACTION_LEDGER")
+        )
 
         # Check coverage across all instruments
         all_complete = True
@@ -964,7 +1021,11 @@ class PointInTimeCorporateActionLedger:
 
         for key in instrument_list:
             assessment = self.assess_window(
-                key, research_start, research_end, policy=effective_policy
+                key,
+                research_start,
+                research_end,
+                policy=effective_policy,
+                evaluation_mode=mode,
             )
             if not assessment.complete:
                 all_complete = False
@@ -978,7 +1039,7 @@ class PointInTimeCorporateActionLedger:
             )
 
         return CorporateActionEvidenceIdentity(
-            source=source,
+            source=effective_source,
             complete=all_complete,
             blocking_events=tuple(all_blocking),
             evidence_fingerprint=self.fingerprint(),
@@ -988,4 +1049,5 @@ class PointInTimeCorporateActionLedger:
             events_count=events_count,
             policy_identity=effective_policy.policy_identity,
             authoritative=True,
+            evaluation_mode=mode,
         )

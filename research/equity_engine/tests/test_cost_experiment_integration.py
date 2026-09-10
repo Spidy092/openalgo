@@ -5,10 +5,14 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+from equity_engine.corporate_actions import (
+    CoverageScope,
+    PointInTimeCorporateActionLedger,
+)
 from equity_engine.cost_ledger import (
     ACCOUNT_SNAPSHOT_DATE,
     GST_RATE,
@@ -64,13 +68,40 @@ def _cost_identity(
     )
 
 
+def _sample_ca_ledger() -> PointInTimeCorporateActionLedger:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 9, 8),
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    return ledger
+
+
 def _experiment(
     *,
     cost_evidence_identity: CostEvidenceIdentity | None = None,
     created_at: str = "2026-09-10T10:00:00+05:30",
+    ca_ledger: PointInTimeCorporateActionLedger | None = None,
 ) -> ExperimentArtifact:
     identity = cost_evidence_identity or _cost_identity()
     orchestrator = ExperimentOrchestrator(code_commit_sha="baa4e10aa")
+    effective_ca_ledger = ca_ledger if ca_ledger is not None else _sample_ca_ledger()
+    ca_evidence = CorporateActionEvidenceIdentity.from_ledger(
+        effective_ca_ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1),
+            end=date(2026, 9, 8),
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
     return orchestrator.build_experiment(
         research_window=ResearchWindowConfig(
             start=date(2026, 1, 1),
@@ -116,16 +147,7 @@ def _experiment(
             cas_effective_date="2026-03-01",
             continuous_end="15:30:00",
         ),
-        corporate_action_evidence=CorporateActionEvidenceIdentity(
-            source="corporate-action-source",
-            complete=True,
-            blocking_events=(),
-            evidence_fingerprint="corporate-action-fingerprint",
-            coverage_start=date(2026, 1, 1),
-            coverage_end=date(2026, 9, 8),
-            covered_instruments=("NSE_EQ|INE002A01018",),
-            authoritative=False,
-        ),
+        corporate_action_evidence=ca_evidence,
         cost_model_identity=CostModelIdentity(
             model_name="documented",
             effective_date="2026-03-01",
@@ -377,7 +399,8 @@ def test_public_gst_scenario_is_explicit_and_not_default_historical_evidence() -
 
 
 def test_incomplete_historical_evidence_cannot_pass_promotion_gate() -> None:
-    experiment = _experiment()
+    ca_ledger = _sample_ca_ledger()
+    experiment = _experiment(ca_ledger=ca_ledger)
     thresholds = PromotionThresholds(
         min_trades=100,
         min_profit_factor=Decimal("1.2"),
@@ -386,12 +409,17 @@ def test_incomplete_historical_evidence_cannot_pass_promotion_gate() -> None:
         max_cost_reconciliation_error_inr=Decimal("0.01"),
     )
 
-    passed, violations = experiment.evaluate_promotion_gate(thresholds)
+    passed, violations = experiment.evaluate_promotion_gate(
+        thresholds, trusted_corporate_action_ledger=ca_ledger
+    )
 
     assert passed is False
     assert any("not verified HISTORICAL_ACTUAL_COSTS" in violation for violation in violations)
     with pytest.raises(MissingEvidenceError, match="not verified HISTORICAL_ACTUAL_COSTS"):
-        experiment.validate_integrity(promotion_thresholds=thresholds)
+        experiment.validate_integrity(
+            promotion_thresholds=thresholds,
+            trusted_corporate_action_ledger=ca_ledger,
+        )
 
 
 def test_pre_boundary_and_mii_transition_semantics_remain_exact() -> None:

@@ -23,6 +23,10 @@ from typing import Any
 
 import pandas as pd
 import pytest
+from equity_engine.corporate_actions import (
+    CoverageScope,
+    PointInTimeCorporateActionLedger,
+)
 from equity_engine.cost_ledger import INCOMPLETE_LABEL, EffectiveDatedCostLedger, LedgerProduct
 from equity_engine.experiment import (
     EXPERIMENT_SCHEMA_VERSION,
@@ -207,7 +211,27 @@ def _sample_promotion_evidence(
 
 
 @pytest.fixture
-def baseline_experiment() -> ExperimentArtifact:
+def baseline_ca_ledger() -> PointInTimeCorporateActionLedger:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    return ledger
+
+
+@pytest.fixture
+def baseline_experiment(
+    baseline_ca_ledger: PointInTimeCorporateActionLedger,
+) -> ExperimentArtifact:
     prefilter = _sample_prefilter_artifact()
     prefilter_fp = compute_prefilter_artifact_fingerprint(prefilter)
 
@@ -220,6 +244,13 @@ def baseline_experiment() -> ExperimentArtifact:
         EffectiveDatedCostLedger(),
         on_date=date(2026, 6, 30),
         product=LedgerProduct.INTRADAY,
+    )
+    ca_identity = CorporateActionEvidenceIdentity.from_ledger(
+        baseline_ca_ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
     )
 
     return orchestrator.build_experiment(
@@ -254,16 +285,7 @@ def baseline_experiment() -> ExperimentArtifact:
             cas_effective_date="2026-03-01",
             continuous_end="15:30:00",
         ),
-        corporate_action_evidence=CorporateActionEvidenceIdentity(
-            source="https://upstox.com/developer/api-documentation/get-corporate-actions/",
-            complete=True,
-            blocking_events=(),
-            evidence_fingerprint="sha256_ca_evidence_001",
-            coverage_start=date(2026, 1, 1),
-            coverage_end=date(2026, 6, 30),
-            covered_instruments=("NSE_EQ|INE002A01018",),
-            authoritative=False,
-        ),
+        corporate_action_evidence=ca_identity,
         cost_model_identity=CostModelIdentity(
             model_name="documented",
             effective_date="2026-03-01",
@@ -315,19 +337,27 @@ def test_experiment_schema_version(baseline_experiment: ExperimentArtifact) -> N
 # 1. Dataset fingerprint mismatch fails closed
 
 
-def test_dataset_fingerprint_mismatch_fails_closed(baseline_experiment: ExperimentArtifact) -> None:
+def test_dataset_fingerprint_mismatch_fails_closed(
+    baseline_experiment: ExperimentArtifact,
+    baseline_ca_ledger: PointInTimeCorporateActionLedger,
+) -> None:
     frame = _make_frame(["2026-01-02", "2026-01-05"])
     manifest = _make_manifest("NSE_EQ|INE002A01018", "RELIANCE")
     actual_fp = dataframe_fingerprint(frame, manifest)
 
-    # Valid check passes
+    # Valid check passes both structural and integrity validation
     valid_exp = replace(
         baseline_experiment,
         instrument_dataset_fingerprints={"NSE_EQ|INE002A01018": actual_fp},
     )
+    valid_exp.validate_structure(
+        dataset_frames={"NSE_EQ|INE002A01018": frame},
+        dataset_manifests={"NSE_EQ|INE002A01018": manifest},
+    )
     valid_exp.validate_integrity(
         dataset_frames={"NSE_EQ|INE002A01018": frame},
         dataset_manifests={"NSE_EQ|INE002A01018": manifest},
+        trusted_corporate_action_ledger=baseline_ca_ledger,
     )
 
     # Mismatched fingerprint raises DatasetFingerprintMismatchError
@@ -336,16 +366,25 @@ def test_dataset_fingerprint_mismatch_fails_closed(baseline_experiment: Experime
         instrument_dataset_fingerprints={"NSE_EQ|INE002A01018": "tampered_or_stale_fingerprint"},
     )
     with pytest.raises(DatasetFingerprintMismatchError, match="dataset fingerprint mismatch"):
+        mismatched_exp.validate_structure(
+            dataset_frames={"NSE_EQ|INE002A01018": frame},
+            dataset_manifests={"NSE_EQ|INE002A01018": manifest},
+        )
+    with pytest.raises(DatasetFingerprintMismatchError, match="dataset fingerprint mismatch"):
         mismatched_exp.validate_integrity(
             dataset_frames={"NSE_EQ|INE002A01018": frame},
             dataset_manifests={"NSE_EQ|INE002A01018": manifest},
+            trusted_corporate_action_ledger=baseline_ca_ledger,
         )
 
 
 # 2. Universe mismatch fails closed
 
 
-def test_universe_mismatch_fails_closed(baseline_experiment: ExperimentArtifact) -> None:
+def test_universe_mismatch_fails_closed(
+    baseline_experiment: ExperimentArtifact,
+    baseline_ca_ledger: PointInTimeCorporateActionLedger,
+) -> None:
     prefilter = _sample_prefilter_artifact()
     actual_fp = compute_prefilter_artifact_fingerprint(prefilter)
 
@@ -355,7 +394,11 @@ def test_universe_mismatch_fails_closed(baseline_experiment: ExperimentArtifact)
         universe_fingerprint=actual_fp,
         candidate_prefilter_artifact_fingerprint=actual_fp,
     )
-    valid_exp.validate_integrity(prefilter_artifact=prefilter)
+    valid_exp.validate_structure(prefilter_artifact=prefilter)
+    valid_exp.validate_integrity(
+        prefilter_artifact=prefilter,
+        trusted_corporate_action_ledger=baseline_ca_ledger,
+    )
 
     # Mismatched universe prefilter fingerprint fails
     mismatched_prefilter_exp = replace(
@@ -364,7 +407,7 @@ def test_universe_mismatch_fails_closed(baseline_experiment: ExperimentArtifact)
         candidate_prefilter_artifact_fingerprint="tampered_prefilter_hash_999",
     )
     with pytest.raises(UniverseFingerprintMismatchError, match="prefilter fingerprint mismatch"):
-        mismatched_prefilter_exp.validate_integrity(prefilter_artifact=prefilter)
+        mismatched_prefilter_exp.validate_structure(prefilter_artifact=prefilter)
 
     # Internal inconsistency between universe_fingerprint and candidate_prefilter fails
     inconsistent_universe_exp = replace(
@@ -373,7 +416,7 @@ def test_universe_mismatch_fails_closed(baseline_experiment: ExperimentArtifact)
         candidate_prefilter_artifact_fingerprint=actual_fp,
     )
     with pytest.raises(UniverseFingerprintMismatchError, match="universe fingerprint"):
-        inconsistent_universe_exp.validate_integrity(prefilter_artifact=prefilter)
+        inconsistent_universe_exp.validate_structure(prefilter_artifact=prefilter)
 
 
 # 3. Missing test evidence fails closed (arbitrary booleans rejected)
@@ -385,7 +428,7 @@ def test_missing_test_evidence_fails_closed(baseline_experiment: ExperimentArtif
     exp = replace(baseline_experiment, promotion_evidence=missing_test_evidence)
 
     with pytest.raises(MissingEvidenceError, match="held-out test evidence artifact is missing"):
-        exp.validate_integrity()
+        exp.validate_structure()
 
 
 # 4. Missing cost evidence fails closed
@@ -396,7 +439,7 @@ def test_missing_cost_evidence_fails_closed(baseline_experiment: ExperimentArtif
     exp = replace(baseline_experiment, promotion_evidence=missing_cost_evidence)
 
     with pytest.raises(MissingEvidenceError, match="broker cost reconciliation evidence"):
-        exp.validate_integrity()
+        exp.validate_structure()
 
 
 # 5. Changed strategy params changes identity
@@ -554,7 +597,10 @@ def test_no_live_order_capability(baseline_experiment: ExperimentArtifact) -> No
 # 12. Evaluation of concrete promotion thresholds
 
 
-def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArtifact) -> None:
+def test_promotion_gate_threshold_evaluation(
+    baseline_experiment: ExperimentArtifact,
+    baseline_ca_ledger: PointInTimeCorporateActionLedger,
+) -> None:
     thresholds = PromotionThresholds(
         min_trades=100,
         min_profit_factor=Decimal("1.20"),
@@ -565,7 +611,10 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
 
     # Strong numerical evidence cannot promote an experiment whose ledger is incomplete.
     with pytest.raises(MissingEvidenceError, match="not verified HISTORICAL_ACTUAL_COSTS"):
-        baseline_experiment.validate_integrity(promotion_thresholds=thresholds)
+        baseline_experiment.validate_integrity(
+            promotion_thresholds=thresholds,
+            trusted_corporate_action_ledger=baseline_ca_ledger,
+        )
 
     # High drawdown fails gate
     bad_drawdown = replace(
@@ -578,4 +627,7 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
     failing_exp = replace(baseline_experiment, promotion_evidence=failing_drawdown_evidence)
 
     with pytest.raises(MissingEvidenceError, match="max drawdown 15.50% exceeds allowed 10.0%"):
-        failing_exp.validate_integrity(promotion_thresholds=thresholds)
+        failing_exp.validate_integrity(
+            promotion_thresholds=thresholds,
+            trusted_corporate_action_ledger=baseline_ca_ledger,
+        )

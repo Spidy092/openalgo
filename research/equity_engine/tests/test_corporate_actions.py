@@ -6,12 +6,10 @@ from decimal import Decimal
 
 import pytest
 from equity_engine.corporate_actions import (
-    AdjustmentFactorRecord,
     CorporateActionConfidence,
     CorporateActionCoverageError,
     CorporateActionDataLeakageError,
     CorporateActionEvaluationMode,
-    CorporateActionEvent,
     CorporateActionEventType,
     CorporateActionPolicy,
     CorporateActionRecord,
@@ -20,7 +18,6 @@ from equity_engine.corporate_actions import (
     PointInTimeCorporateActionLedger,
     assess_corporate_actions,
     parse_corporate_action_rows,
-    parse_ratio,
 )
 from equity_engine.experiment import (
     ApprovedCapital,
@@ -37,6 +34,7 @@ from equity_engine.experiment import (
     ExperimentArtifact,
     ExperimentOrchestrator,
     HeldOutTestEvidence,
+    LiveOrderAttemptError,
     MissingEvidenceError,
     NSEMembershipEvidenceIdentity,
     PaperTradingEvidence,
@@ -1361,8 +1359,14 @@ def test_non_authoritative_claim_allowed_in_research_artifact_but_blocks_promoti
     )
     exp = _sample_experiment(corporate_action_evidence=non_auth_claim)
 
-    # Research artifact carries non-authoritative claim and passes integrity validation
-    exp.validate_integrity()
+    # Research artifact carries non-authoritative claim and passes structural validation
+    exp.validate_structure()
+
+    # But fails integrity validation without trusted ledger (fail closed)
+    with pytest.raises(
+        MissingEvidenceError, match="trusted corporate-action evidence ledger is required"
+    ):
+        exp.validate_integrity()
 
     # But cannot pass promotion
     thresholds = PromotionThresholds(
@@ -1374,18 +1378,28 @@ def test_non_authoritative_claim_allowed_in_research_artifact_but_blocks_promoti
     )
     passed, violations = exp.evaluate_promotion_gate(thresholds)
     assert passed is False
-    assert any("trusted corporate-action evidence ledger is required for promotion" in v for v in violations)
-    assert any("corporate-action evidence is non-authoritative claim" in v for v in violations)
+    assert any(
+        "trusted corporate-action evidence ledger is required for promotion" in v
+        for v in violations
+    )
+    assert any(
+        "corporate-action evidence is non-authoritative claim" in v for v in violations
+    )
 
     # And cannot pass promotion integrity check
-    with pytest.raises(MissingEvidenceError, match="experiment failed promotion gate criteria"):
+    with pytest.raises(
+        MissingEvidenceError, match="trusted corporate-action evidence ledger is required"
+    ):
         exp.validate_integrity(promotion_thresholds=thresholds)
 
 
 def test_fix4_exact_instrument_coverage_enforcement() -> None:
     ledger = PointInTimeCorporateActionLedger()
     ts = datetime(2026, 1, 1, tzinfo=UTC)
-    for inst, isin in [("NSE_EQ|INE001A01010", "INE001A01010"), ("NSE_EQ|INE002A01018", "INE002A01018")]:
+    for inst, isin in [
+        ("NSE_EQ|INE001A01010", "INE001A01010"),
+        ("NSE_EQ|INE002A01018", "INE002A01018"),
+    ]:
         ledger.add_coverage(
             CoverageScope(
                 instrument_key=inst,
@@ -1401,7 +1415,9 @@ def test_fix4_exact_instrument_coverage_enforcement() -> None:
     # Partial coverage: only covers INE002
     partial_identity = CorporateActionEvidenceIdentity.from_ledger(
         ledger,
-        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
         instruments=("NSE_EQ|INE002A01018",),
     )
 
@@ -1413,9 +1429,19 @@ def test_fix4_exact_instrument_coverage_enforcement() -> None:
         },
     )
 
-    # Validate integrity fails closed on partial instrument coverage
-    with pytest.raises(MissingEvidenceError, match="does not exactly match canonical experiment instrument population"):
-        exp_partial.validate_integrity()
+    # Validate structure fails closed on partial instrument coverage
+    with pytest.raises(
+        MissingEvidenceError,
+        match="does not exactly match canonical experiment instrument population",
+    ):
+        exp_partial.validate_structure()
+
+    # Validate integrity also fails closed
+    with pytest.raises(
+        MissingEvidenceError,
+        match="does not exactly match canonical experiment instrument population",
+    ):
+        exp_partial.validate_integrity(trusted_corporate_action_ledger=ledger)
 
     # Promotion gate also fails closed
     thresholds = PromotionThresholds(
@@ -1427,7 +1453,10 @@ def test_fix4_exact_instrument_coverage_enforcement() -> None:
     )
     passed, violations = exp_partial.evaluate_promotion_gate(thresholds)
     assert passed is False
-    assert any("does not cover exact experiment instrument population" in v for v in violations)
+    assert any(
+        "does not cover exact experiment instrument population" in v
+        for v in violations
+    )
 
 
 def test_fix5_remove_hidden_2_percent_dividend_threshold() -> None:
@@ -1436,31 +1465,42 @@ def test_fix5_remove_hidden_2_percent_dividend_threshold() -> None:
     assert default_policy.dividend_policy == DividendPolicy.BLOCK_ALL
     assert default_policy.dividend_threshold_percent is None
     assert default_policy.reference_price_for_dividend is None
-    assert default_policy.policy_identity == "DEFAULT_RESEARCH_POLICY:BLOCK_ALL"
+    assert (
+        default_policy.policy_identity
+        == f"DEFAULT_RESEARCH_POLICY:{default_policy.policy_fingerprint()}"
+    )
 
     # IGNORE_BELOW_THRESHOLD requires explicit positive threshold and positive reference price
-    with pytest.raises(ValueError, match="requires an explicit positive dividend_threshold_percent"):
+    with pytest.raises(
+        ValueError, match="requires an explicit positive dividend_threshold_percent"
+    ):
         CorporateActionPolicy(
             dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
             dividend_threshold_percent=None,
             reference_price_for_dividend=Decimal(100),
         )
 
-    with pytest.raises(ValueError, match="requires an explicit positive dividend_threshold_percent"):
+    with pytest.raises(
+        ValueError, match="requires an explicit positive dividend_threshold_percent"
+    ):
         CorporateActionPolicy(
             dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
             dividend_threshold_percent=Decimal(0),
             reference_price_for_dividend=Decimal(100),
         )
 
-    with pytest.raises(ValueError, match="requires an explicit positive reference_price_for_dividend"):
+    with pytest.raises(
+        ValueError, match="requires an explicit positive reference_price_for_dividend"
+    ):
         CorporateActionPolicy(
             dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
             dividend_threshold_percent=Decimal("2.0"),
             reference_price_for_dividend=None,
         )
 
-    with pytest.raises(ValueError, match="requires an explicit positive reference_price_for_dividend"):
+    with pytest.raises(
+        ValueError, match="requires an explicit positive reference_price_for_dividend"
+    ):
         CorporateActionPolicy(
             dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
             dividend_threshold_percent=Decimal("2.0"),
@@ -1474,7 +1514,14 @@ def test_fix5_remove_hidden_2_percent_dividend_threshold() -> None:
         reference_price_for_dividend=Decimal(1000),
         policy_name="default",
     )
-    assert valid_threshold_policy.policy_identity == "default:IGNORE_BELOW_THRESHOLD:2.5%"
+    assert (
+        valid_threshold_policy.policy_identity
+        == f"default:{valid_threshold_policy.policy_fingerprint()}"
+    )
+    assert (
+        valid_threshold_policy.policy_fingerprint()
+        != default_policy.policy_fingerprint()
+    )
 
     # Under default BLOCK_ALL, even a small dividend (e.g. 0.5%) produces a blocking event in window assessment
     ledger = PointInTimeCorporateActionLedger()
@@ -1582,6 +1629,332 @@ def test_fix6_unknown_announcement_date_fails_closed_in_tradable_information() -
     # The split itself is an unhandled corporate action blocking event under default policy,
     # but NOT UNKNOWN_ANNOUNCEMENT_DATE
     assert not any("UNKNOWN_ANNOUNCEMENT_DATE" in b for b in ex_post_assessment.blocking_events)
+
+
+def test_split_structure_from_verified_integrity_semantics() -> None:
+    # 1. Non-authoritative claim passes validate_structure
+    non_auth_claim = CorporateActionEvidenceIdentity(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint="fp_claim_split_001",
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        authoritative=False,
+    )
+    exp = _sample_experiment(corporate_action_evidence=non_auth_claim)
+
+    exp.validate_structure()  # Passes structural validation
+
+    # 2. Same claim fails validate_integrity without trusted ledger (fails closed)
+    with pytest.raises(
+        MissingEvidenceError, match="trusted corporate-action evidence ledger is required"
+    ):
+        exp.validate_integrity()
+
+    # 3. Manually authoritative=True does not create proof
+    spoofed_auth_claim = replace(non_auth_claim, authoritative=True)
+    exp_spoofed = _sample_experiment(corporate_action_evidence=spoofed_auth_claim)
+
+    exp_spoofed.validate_structure()  # Shape is valid
+    with pytest.raises(
+        MissingEvidenceError, match="trusted corporate-action evidence ledger is required"
+    ):
+        exp_spoofed.validate_integrity()  # Fails closed without ledger
+
+    # 4. Genuine trusted ledger passes validate_integrity
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    genuine_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    exp_genuine = _sample_experiment(corporate_action_evidence=genuine_identity)
+
+    exp_genuine.validate_structure()
+    exp_genuine.validate_integrity(trusted_corporate_action_ledger=ledger)
+
+    # 5. Spoofed authoritative claim tested against genuine ledger fails with mismatch
+    with pytest.raises(
+        MissingEvidenceError, match="corporate-action evidence integrity mismatch"
+    ):
+        exp_spoofed.validate_integrity(trusted_corporate_action_ledger=ledger)
+
+
+def test_evaluation_mode_binding_and_fingerprint_separation() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+
+    id_tradable = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
+        evaluation_mode=CorporateActionEvaluationMode.TRADABLE_INFORMATION,
+    )
+    id_ex_post = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
+        evaluation_mode=CorporateActionEvaluationMode.EX_POST_NORMALIZATION,
+    )
+
+    # Explicit modes bound
+    assert (
+        id_tradable.evaluation_mode
+        == CorporateActionEvaluationMode.TRADABLE_INFORMATION
+    )
+    assert (
+        id_ex_post.evaluation_mode
+        == CorporateActionEvaluationMode.EX_POST_NORMALIZATION
+    )
+
+    # Changing evaluation mode changes identity fingerprint
+    assert id_tradable.identity_fingerprint() != id_ex_post.identity_fingerprint()
+    assert id_tradable.as_dict() != id_ex_post.as_dict()
+
+    # Revalidation requires the same explicit mode
+    id_tradable.validate_against_trusted_ledger(ledger)
+    id_ex_post.validate_against_trusted_ledger(ledger)
+
+    # Tampered mode in claim fails revalidation
+    tampered_mode = replace(
+        id_tradable,
+        evaluation_mode=CorporateActionEvaluationMode.EX_POST_NORMALIZATION,
+    )
+    # The claim claims EX_POST_NORMALIZATION, so ledger rederives EX_POST_NORMALIZATION,
+    # but the canonical payload changed so fingerprints mismatch if compared against expected
+    assert tampered_mode.identity_fingerprint() != id_tradable.identity_fingerprint()
+
+
+def test_full_policy_identity_fingerprint_changes() -> None:
+    base_policy = CorporateActionPolicy()
+
+    # 1. Changing blocked_event_types changes policy fingerprint
+    policy_fewer_blocks = CorporateActionPolicy(
+        blocked_event_types=frozenset({CorporateActionEventType.SPLIT})
+    )
+    assert (
+        base_policy.policy_fingerprint() != policy_fewer_blocks.policy_fingerprint()
+    )
+    assert base_policy.policy_identity != policy_fewer_blocks.policy_identity
+
+    # 2. Changing adjustment policy changes fingerprint
+    policy_allow_splits = CorporateActionPolicy(
+        allow_ex_post_adjusted_splits=True
+    )
+    assert (
+        base_policy.policy_fingerprint() != policy_allow_splits.policy_fingerprint()
+    )
+
+    policy_allow_bonuses = CorporateActionPolicy(
+        allow_ex_post_adjusted_bonuses=True
+    )
+    assert (
+        base_policy.policy_fingerprint() != policy_allow_bonuses.policy_fingerprint()
+    )
+
+    # 3. Changing dividend reference price changes fingerprint when relevant
+    p_div_ref100 = CorporateActionPolicy(
+        dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+        dividend_threshold_percent=Decimal("2.0"),
+        reference_price_for_dividend=Decimal("100.00"),
+    )
+    p_div_ref200 = CorporateActionPolicy(
+        dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+        dividend_threshold_percent=Decimal("2.0"),
+        reference_price_for_dividend=Decimal("200.00"),
+    )
+    assert (
+        p_div_ref100.policy_fingerprint() != p_div_ref200.policy_fingerprint()
+    )
+    assert p_div_ref100.policy_identity != p_div_ref200.policy_identity
+
+    # 4. Changing dividend threshold percent changes fingerprint
+    p_div_thresh3 = CorporateActionPolicy(
+        dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+        dividend_threshold_percent=Decimal("3.0"),
+        reference_price_for_dividend=Decimal("100.00"),
+    )
+    assert (
+        p_div_ref100.policy_fingerprint() != p_div_thresh3.policy_fingerprint()
+    )
+
+
+def test_claim_supplied_source_cannot_authenticate_itself() -> None:
+    ledger = PointInTimeCorporateActionLedger(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER"
+    )
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    genuine = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(
+            start=date(2026, 1, 1), end=date(2026, 6, 30)
+        ),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    assert genuine.source == "CANONICAL_PIT_CORPORATE_ACTION_LEDGER"
+
+    # Claim asserts a different source
+    spoofed_source_claim = replace(genuine, source="EXTERNAL_UNVERIFIED_SOURCE")
+    with pytest.raises(
+        CorporateActionMismatchError,
+        match=r"source \(expected 'CANONICAL_PIT_CORPORATE_ACTION_LEDGER', got 'EXTERNAL_UNVERIFIED_SOURCE'\)",
+    ):
+        spoofed_source_claim.validate_against_trusted_ledger(ledger)
+
+
+def test_duplicate_and_unsorted_population_rejected() -> None:
+    # 1. Duplicates rejected in CorporateActionEvidenceIdentity constructor
+    with pytest.raises(
+        ValueError, match="covered_instruments must be unique; duplicates are strictly forbidden"
+    ):
+        CorporateActionEvidenceIdentity(
+            source="NSE",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="fp_001",
+            covered_instruments=("NSE_EQ|INE002A01018", "NSE_EQ|INE002A01018"),
+        )
+
+    # 2. Unsorted population rejected in constructor
+    with pytest.raises(
+        ValueError, match="covered_instruments must be in sorted canonical order"
+    ):
+        CorporateActionEvidenceIdentity(
+            source="NSE",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="fp_001",
+            covered_instruments=("NSE_EQ|INE002A01018", "NSE_EQ|INE001A01010"),
+        )
+
+    # 3. Empty population rejected in constructor
+    with pytest.raises(
+        ValueError, match="covered_instruments cannot be empty"
+    ):
+        CorporateActionEvidenceIdentity(
+            source="NSE",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="fp_001",
+            covered_instruments=(),
+        )
+
+    # 4. Duplicates rejected in ledger.to_evidence_identity
+    ledger = PointInTimeCorporateActionLedger()
+    with pytest.raises(
+        CorporateActionCoverageError, match="instrument population contains duplicates"
+    ):
+        ledger.to_evidence_identity(
+            research_start=date(2026, 1, 1),
+            research_end=date(2026, 6, 30),
+            instruments=["NSE_EQ|INE002A01018", "NSE_EQ|INE002A01018"],
+        )
+
+    # 5. Empty population rejected in ledger.to_evidence_identity
+    with pytest.raises(
+        CorporateActionCoverageError, match="requested instrument population is empty"
+    ):
+        ledger.to_evidence_identity(
+            research_start=date(2026, 1, 1),
+            research_end=date(2026, 6, 30),
+            instruments=[],
+        )
+
+
+def test_promotion_always_requires_trusted_ca_evidence() -> None:
+    non_auth_claim = CorporateActionEvidenceIdentity(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint="fp_claim_001",
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        authoritative=False,
+    )
+    exp = _sample_experiment(corporate_action_evidence=non_auth_claim)
+
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    # Promotion fails without trusted ledger
+    passed, violations = exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any(
+        "trusted corporate-action evidence ledger is required for promotion" in v
+        for v in violations
+    )
+
+    # Promotion integrity validation fails closed without trusted ledger
+    with pytest.raises(
+        MissingEvidenceError, match="trusted corporate-action evidence ledger is required"
+    ):
+        exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+def test_no_broker_order_network_calls_guaranteed() -> None:
+    claim = CorporateActionEvidenceIdentity(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint="fp_claim_split_001",
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        authoritative=False,
+    )
+    exp = _sample_experiment(corporate_action_evidence=claim)
+    assert exp.live_orders_called is False
+    with pytest.raises(LiveOrderAttemptError, match="live orders are strictly forbidden"):
+        replace(exp, live_orders_called=True)
+
 
 
 

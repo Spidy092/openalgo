@@ -19,6 +19,7 @@ from typing import Any
 
 import pandas as pd
 
+from .corporate_actions import CorporateActionEvaluationMode
 from .cost_ledger import (
     HISTORICAL_ACTUAL_LABEL,
     SCENARIO_LABEL,
@@ -252,14 +253,29 @@ class CorporateActionEvidenceIdentity:
     events_count: int = 0
     policy_identity: str = "DEFAULT"
     authoritative: bool = False
+    evaluation_mode: CorporateActionEvaluationMode = (
+        CorporateActionEvaluationMode.TRADABLE_INFORMATION
+    )
 
     def __post_init__(self) -> None:
+        if isinstance(self.evaluation_mode, str):
+            object.__setattr__(
+                self,
+                "evaluation_mode",
+                CorporateActionEvaluationMode(self.evaluation_mode),
+            )
         if not self.complete:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
         if not self.covered_instruments:
             raise ValueError("covered_instruments cannot be empty for corporate-action evidence")
+        if any(not str(k).strip() for k in self.covered_instruments):
+            raise ValueError("covered_instruments cannot contain empty instrument keys")
+        if len(set(self.covered_instruments)) != len(self.covered_instruments):
+            raise ValueError("covered_instruments must be unique; duplicates are strictly forbidden")
+        if tuple(sorted(self.covered_instruments)) != tuple(self.covered_instruments):
+            raise ValueError("covered_instruments must be in sorted canonical order")
         if self.coverage_start is not None and self.coverage_end is not None:
             if self.coverage_start > self.coverage_end:
                 raise ValueError("coverage_start must be on or before coverage_end")
@@ -278,6 +294,34 @@ class CorporateActionEvidenceIdentity:
         if self.coverage_start is None or self.coverage_end is None:
             return False
         return self.coverage_start <= start and self.coverage_end >= end
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "complete": self.complete,
+            "blocking_events": sorted(self.blocking_events),
+            "evidence_fingerprint": self.evidence_fingerprint,
+            "coverage_start": (
+                self.coverage_start.isoformat() if self.coverage_start else None
+            ),
+            "coverage_end": (
+                self.coverage_end.isoformat() if self.coverage_end else None
+            ),
+            "covered_instruments": list(self.covered_instruments),
+            "events_count": self.events_count,
+            "policy_identity": self.policy_identity,
+            "authoritative": self.authoritative,
+            "evaluation_mode": self.evaluation_mode.value,
+        }
+
+    def identity_fingerprint(self) -> str:
+        """SHA-256 fingerprint over complete canonical corporate-action evidence payload."""
+        payload = self.canonical_payload()
+        canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def fingerprint(self) -> str:
+        return self.identity_fingerprint()
 
     def _derive_from_trusted_ledger(
         self,
@@ -305,12 +349,14 @@ class CorporateActionEvidenceIdentity:
             )
 
         try:
+            # Note: Do NOT pass source=self.source!
+            # Provenance/source must be derived from trusted ledger, not caller claim.
             expected = ledger.to_evidence_identity(
                 research_start=start,
                 research_end=end,
                 instruments=instruments,
                 policy=policy,
-                source=self.source,
+                evaluation_mode=self.evaluation_mode,
             )
         except Exception as exc:
             raise CorporateActionMismatchError(
@@ -340,7 +386,8 @@ class CorporateActionEvidenceIdentity:
         - event count
         - completeness
         - coverage
-        - source/evidence mode where applicable
+        - evaluation mode
+        - source/provenance
         """
         expected = self._derive_from_trusted_ledger(
             ledger,
@@ -426,7 +473,14 @@ class CorporateActionEvidenceIdentity:
         ):
             mismatches.append("coverage window does not cover required window")
 
-        # 10. Source / evidence mode
+        # 10. Evaluation mode
+        if self.evaluation_mode != expected.evaluation_mode:
+            mismatches.append(
+                f"evaluation_mode (expected {expected.evaluation_mode.value!r}, "
+                f"got {self.evaluation_mode.value!r})"
+            )
+
+        # 11. Source / provenance
         if self.source != expected.source:
             mismatches.append(
                 f"source (expected {expected.source!r}, got {self.source!r})"
@@ -449,7 +503,10 @@ class CorporateActionEvidenceIdentity:
         research_window: ResearchWindowConfig | Any,
         instruments: Iterable[str],
         policy: Any = None,
-        source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        evaluation_mode: CorporateActionEvaluationMode | str = (
+            CorporateActionEvaluationMode.TRADABLE_INFORMATION
+        ),
+        source: str | None = None,
     ) -> CorporateActionEvidenceIdentity:
         start = (
             research_window.start
@@ -466,6 +523,7 @@ class CorporateActionEvidenceIdentity:
             research_end=end,
             instruments=instruments,
             policy=policy,
+            evaluation_mode=evaluation_mode,
             source=source,
         )
 
@@ -476,6 +534,7 @@ class CorporateActionEvidenceIdentity:
             "blocking_events": list(self.blocking_events),
             "evidence_fingerprint": self.evidence_fingerprint,
             "authoritative": self.authoritative,
+            "evaluation_mode": self.evaluation_mode.value,
         }
         if self.coverage_start is not None:
             payload["coverage_start"] = self.coverage_start.isoformat()
@@ -1207,6 +1266,7 @@ class ExperimentArtifact:
         if ca_ledger is None:
             gate_violations.append(
                 "trusted corporate-action evidence ledger is required for promotion; "
+                "missing trusted ledger => fail closed; "
                 "serialized corporate-action evidence is a claim, not proof"
             )
         else:
@@ -1232,36 +1292,29 @@ class ExperimentArtifact:
                 "corporate-action evidence has unresolved blocking events: "
                 + ", ".join(self.corporate_action_evidence.blocking_events)
             )
-        if set(self.corporate_action_evidence.covered_instruments) != set(
-            self.instrument_dataset_fingerprints.keys()
-        ):
+        ca_insts = self.corporate_action_evidence.covered_instruments
+        canonical_insts = tuple(sorted(self.instrument_dataset_fingerprints.keys()))
+        if len(set(ca_insts)) != len(ca_insts) or tuple(sorted(ca_insts)) != tuple(ca_insts):
+            gate_violations.append("corporate-action covered_instruments must be sorted unique non-empty")
+        elif tuple(ca_insts) != canonical_insts:
             gate_violations.append(
                 "corporate-action evidence does not cover exact experiment instrument population"
             )
 
         return (passed and not gate_violations, tuple(gate_violations))
 
-    def validate_integrity(
+    def validate_structure(
         self,
         *,
         dataset_frames: Mapping[str, pd.DataFrame] | None = None,
         dataset_manifests: Mapping[str, MarketDataManifest] | None = None,
         prefilter_artifact: Mapping[str, Any] | None = None,
-        promotion_thresholds: PromotionThresholds | None = None,
-        corporate_action_ledger: Any = None,
-        corporate_action_policy: Any = None,
-        trusted_corporate_action_ledger: Any = None,
-        trusted_corporate_action_policy: Any = None,
-        **kwargs: Any,
     ) -> None:
-        """Enforce strict fail-closed validation of all fingerprints and evidence.
+        """Validate internal shape, date, and population structural consistency.
 
-        Raises:
-            DatasetFingerprintMismatchError: If an instrument dataset fingerprint does not match.
-            UniverseFingerprintMismatchError: If the universe prefilter fingerprint does not match.
-            MissingEvidenceError: If concrete evidence is missing or invalid.
-            DataLeakageError: If test/validation windows overlap or contaminate train.
-            LiveOrderAttemptError: If live order execution was marked true or invoked.
+        - Internal shape/date/population consistency only
+        - Explicitly accepts non-authoritative claims
+        - Does NOT authenticate evidence against a trusted ledger
         """
         if self.live_orders_called:
             raise LiveOrderAttemptError("live-order execution is strictly forbidden in research")
@@ -1332,7 +1385,7 @@ class ExperimentArtifact:
                 "event-driven simulation evidence artifact is missing"
             )
 
-        # 5. Fail-closed corporate-action evidence verification
+        # 5. Fail-closed corporate-action structural checks (accepts non-authoritative claims)
         if not self.corporate_action_evidence.complete:
             raise MissingEvidenceError("corporate-action evidence is incomplete")
         if (
@@ -1363,17 +1416,59 @@ class ExperimentArtifact:
                 + ", ".join(self.corporate_action_evidence.blocking_events)
             )
 
-        # Exact instrument coverage
-        canonical_experiment_instruments = set(self.instrument_dataset_fingerprints.keys())
-        ca_covered_instruments = set(self.corporate_action_evidence.covered_instruments)
-        if ca_covered_instruments != canonical_experiment_instruments:
-            missing_ca = canonical_experiment_instruments - ca_covered_instruments
-            extra_ca = ca_covered_instruments - canonical_experiment_instruments
+        # Exact canonical population: sorted, unique, non-empty, matching experiment instruments
+        ca_insts = self.corporate_action_evidence.covered_instruments
+        if not ca_insts:
+            raise MissingEvidenceError("corporate-action evidence covered_instruments cannot be empty")
+        if any(not str(k).strip() for k in ca_insts):
+            raise MissingEvidenceError("corporate-action covered_instruments cannot contain empty instrument keys")
+        if len(set(ca_insts)) != len(ca_insts):
+            raise MissingEvidenceError("corporate-action covered_instruments contains duplicate instruments")
+        if tuple(sorted(ca_insts)) != tuple(ca_insts):
+            raise MissingEvidenceError("corporate-action covered_instruments must be in sorted canonical order")
+
+        canonical_experiment_instruments = tuple(sorted(self.instrument_dataset_fingerprints.keys()))
+        if tuple(ca_insts) != canonical_experiment_instruments:
+            missing_ca = set(canonical_experiment_instruments) - set(ca_insts)
+            extra_ca = set(ca_insts) - set(canonical_experiment_instruments)
             raise MissingEvidenceError(
                 f"corporate-action evidence population does not exactly match canonical experiment "
                 f"instrument population: missing={sorted(missing_ca)}, extra={sorted(extra_ca)}"
             )
 
+    def validate_integrity(
+        self,
+        *,
+        dataset_frames: Mapping[str, pd.DataFrame] | None = None,
+        dataset_manifests: Mapping[str, MarketDataManifest] | None = None,
+        prefilter_artifact: Mapping[str, Any] | None = None,
+        promotion_thresholds: PromotionThresholds | None = None,
+        corporate_action_ledger: Any = None,
+        corporate_action_policy: Any = None,
+        trusted_corporate_action_ledger: Any = None,
+        trusted_corporate_action_policy: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        """Enforce strict fail-closed validation of all fingerprints and evidence.
+
+        ALWAYS requires trusted PointInTimeCorporateActionLedger. Missing trusted
+        ledger => fail closed.
+
+        Raises:
+            DatasetFingerprintMismatchError: If an instrument dataset fingerprint does not match.
+            UniverseFingerprintMismatchError: If the universe prefilter fingerprint does not match.
+            MissingEvidenceError: If concrete evidence is missing, invalid, or ledger missing.
+            DataLeakageError: If test/validation windows overlap or contaminate train.
+            LiveOrderAttemptError: If live order execution was marked true or invoked.
+        """
+        # 1. Structural validation (shape, dates, population, evidence presence)
+        self.validate_structure(
+            dataset_frames=dataset_frames,
+            dataset_manifests=dataset_manifests,
+            prefilter_artifact=prefilter_artifact,
+        )
+
+        # 2. Authenticate corporate action evidence against trusted ledger (FAIL CLOSED)
         ca_ledger = (
             trusted_corporate_action_ledger
             if trusted_corporate_action_ledger is not None
@@ -1385,27 +1480,28 @@ class ExperimentArtifact:
             else corporate_action_policy
         )
 
-        # Revalidate against trusted PointInTimeCorporateActionLedger
-        if ca_ledger is not None:
-            try:
-                self.corporate_action_evidence.validate_against_trusted_ledger(
-                    ca_ledger,
-                    research_start=self.research_window.start,
-                    research_end=self.research_window.end,
-                    canonical_instruments=sorted(canonical_experiment_instruments),
-                    policy=ca_policy,
-                )
-            except (CorporateActionMismatchError, LookupError, ValueError) as exc:
-                raise MissingEvidenceError(
-                    f"corporate-action evidence integrity mismatch: {exc}"
-                ) from exc
-        elif self.corporate_action_evidence.authoritative:
+        if ca_ledger is None:
             raise MissingEvidenceError(
-                "trusted corporate-action evidence ledger is required to validate authoritative "
-                "corporate-action evidence; serialized corporate-action evidence is a claim, not proof"
+                "trusted corporate-action evidence ledger is required for integrity validation; "
+                "serialized corporate-action evidence is an unverified claim, not proof; "
+                "missing trusted ledger => fail closed"
             )
 
-        # 6. Threshold evaluation if requested
+        canonical_experiment_instruments = tuple(sorted(self.instrument_dataset_fingerprints.keys()))
+        try:
+            self.corporate_action_evidence.validate_against_trusted_ledger(
+                ca_ledger,
+                research_start=self.research_window.start,
+                research_end=self.research_window.end,
+                canonical_instruments=canonical_experiment_instruments,
+                policy=ca_policy,
+            )
+        except (CorporateActionMismatchError, LookupError, ValueError) as exc:
+            raise MissingEvidenceError(
+                f"corporate-action evidence integrity mismatch: {exc}"
+            ) from exc
+
+        # 3. Threshold evaluation if requested
         if promotion_thresholds is not None:
             passed, violations = self.evaluate_promotion_gate(
                 promotion_thresholds,
