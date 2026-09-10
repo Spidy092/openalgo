@@ -74,7 +74,14 @@ def main() -> int:
     parser.add_argument("--backoff-seconds", required=True, type=_parse_decimal)
     parser.add_argument("--universe-rule-version", required=True)
     parser.add_argument("--adjustment-policy", required=True)
-    parser.add_argument("--lookback-calendar-days", required=True, type=int)
+    parser.add_argument("--lookback-trading-sessions", required=False, type=int, default=None)
+    parser.add_argument(
+        "--lookback-calendar-days",
+        required=False,
+        type=int,
+        default=None,
+        help="Deprecated alias for --lookback-trading-sessions (counts sourced trading sessions).",
+    )
     parser.add_argument("--estimated-rows-per-trading-day", required=True, type=int)
     parser.add_argument("--estimated-bytes-per-daily-row", required=True, type=int)
     parser.add_argument("--cost-model-identity", required=True)
@@ -86,6 +93,17 @@ def main() -> int:
     args = parser.parse_args()
 
     boundary = PITResearchBoundary(start=args.start, end=args.end)
+    if args.lookback_trading_sessions is None and args.lookback_calendar_days is None:
+        parser.error(
+            "one of --lookback-trading-sessions or deprecated --lookback-calendar-days is required"
+        )
+    if args.lookback_trading_sessions is not None and args.lookback_calendar_days is not None:
+        parser.error("use only one of --lookback-trading-sessions or --lookback-calendar-days")
+    lookback_trading_sessions = (
+        args.lookback_trading_sessions
+        if args.lookback_trading_sessions is not None
+        else args.lookback_calendar_days
+    )
     thresholds = ResearchUniverseThresholds(
         max_last_price_rupees=args.max_last_price,
         min_median_daily_notional_proxy_rupees=args.min_median_daily_notional,
@@ -117,7 +135,7 @@ def main() -> int:
         rate_limit=rate_limit,
         universe_rule_version=args.universe_rule_version,
         adjustment_policy=args.adjustment_policy,
-        lookback_calendar_days=args.lookback_calendar_days,
+        lookback_trading_sessions=lookback_trading_sessions,
         estimated_rows_per_trading_day=args.estimated_rows_per_trading_day,
         estimated_bytes_per_row=args.estimated_bytes_per_daily_row,
         cost_model_identity=args.cost_model_identity,

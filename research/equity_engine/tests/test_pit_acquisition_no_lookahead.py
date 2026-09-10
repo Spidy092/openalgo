@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, time
+from dataclasses import replace
+from datetime import date, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -24,7 +25,9 @@ import pytest
 
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.pit_historical_acquisition import (
+    RAW_ACQUISITION_ONLY,
     AcquisitionRateLimit,
+    CorporateActionEvidenceClaim,
     IncompletePrefilterError,
     PITAcquisitionError,
     PITFormationPolicy,
@@ -34,7 +37,10 @@ from equity_engine.pit_historical_acquisition import (
     build_stage_a_prefilter_timeline,
     build_stage_b_plan,
     build_stage_b_plan_from_timeline,
+    canonical_eligible_intervals,
+    consume_research_bars,
     prior_completed_trading_session,
+    symbol_ranges_for,
 )
 from equity_engine.tick_size import FixedTickSizePolicy
 from equity_engine.universe import CorporateActionAssessment, ResearchUniverseThresholds
@@ -43,11 +49,35 @@ KEY_A = "NSE_EQ|INE000000001"
 KEY_B = "NSE_EQ|INE000000002"
 
 
+def _prior_trading_day(day: date) -> date:
+    current = day - timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current
+
+
 def _write_manifest(
     tmp_path: Path,
     dates: tuple[date, ...],
     rows_by_date: dict[date, list[dict[str, object]]],
+    *,
+    prepend_history: bool = True,
 ) -> Path:
+    if prepend_history:
+        # Prepend one sourced ineligible session so the strict trading-session
+        # lookback resolves from evidence instead of failing on fixtures.
+        seen: dict[str, str] = {}
+        for rows in rows_by_date.values():
+            for row in rows:
+                seen.setdefault(str(row["instrument_key"]), str(row["symbol"]))
+        prior = _prior_trading_day(dates[0])
+        rows_by_date = {
+            prior: [
+                _row(prior, key, symbol, eligible=False) for key, symbol in sorted(seen.items())
+            ],
+            **rows_by_date,
+        }
+        dates = (prior, *dates)
     daily_dir = tmp_path / "daily" / "2026"
     daily_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = tmp_path / "raw" / "2026"
@@ -171,6 +201,29 @@ def _midnight_frame(closes_by_date: dict[date, Decimal]) -> pd.DataFrame:
     )
 
 
+def _ca_claims(
+    keys: tuple[str, ...],
+    *,
+    as_of: date,
+    coverage_start: date,
+    coverage_end: date,
+    fingerprint: str = "e" * 64,
+) -> dict[str, CorporateActionEvidenceClaim]:
+    return {
+        key: CorporateActionEvidenceClaim(
+            instrument_key=key,
+            assessment_as_of=as_of,
+            coverage_start=coverage_start,
+            coverage_end=coverage_end,
+            source_fingerprint=fingerprint,
+            policy_identity="ca-policy-v1",
+            blocking_events=(),
+            complete=True,
+        )
+        for key in keys
+    }
+
+
 def _prefilter_kwargs(plan, frame):  # type: ignore[no-untyped-def]
     key = KEY_A
     return {
@@ -206,7 +259,7 @@ def test_midnight_t_candle_with_absurd_close_cannot_change_result(tmp_path: Path
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -214,6 +267,8 @@ def test_midnight_t_candle_with_absurd_close_cannot_change_result(tmp_path: Path
     without_t = _midnight_frame({sep7: Decimal("100")})
     with_t = _midnight_frame({sep7: Decimal("100"), sep8: Decimal("999999")})
 
+    # Monday first-eligible with a 1-session lookback reaches Friday, never Sunday.
+    assert plan.candidates[0].start == date(2026, 9, 4)
     base = build_stage_a_prefilter(**_prefilter_kwargs(plan, without_t))
     leaked = build_stage_a_prefilter(**_prefilter_kwargs(plan, with_t))
 
@@ -241,13 +296,14 @@ def test_monday_uses_friday_prior_session(tmp_path: Path) -> None:
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
     )
-    # Lookback must reach the sourced Friday session, never Sunday.
-    assert plan.candidates[0].start == fri
+    # Lookback reaches the sourced Thursday session; the Monday reference price
+    # below proves the weekend is skipped for prior-session resolution.
+    assert plan.candidates[0].start == date(2026, 9, 3)
     frame = _midnight_frame({fri: Decimal("100"), mon: Decimal("999999")})
     result = build_stage_a_prefilter(
         **{**_prefilter_kwargs(plan, frame), "selection_cutoff": mon},
@@ -274,7 +330,7 @@ def test_holiday_following_session_uses_previous_trading_session(tmp_path: Path)
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -306,7 +362,7 @@ def test_new_listing_with_no_prior_session_fails_closed(tmp_path: Path) -> None:
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -360,7 +416,7 @@ def test_eligibility_gap_prior_session_must_be_eligible(tmp_path: Path) -> None:
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -408,7 +464,7 @@ def test_delisted_stock_remains_in_early_window_union(tmp_path: Path) -> None:
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -443,7 +499,14 @@ def test_delisted_stock_remains_in_early_window_union(tmp_path: Path) -> None:
     assert final_by_key[KEY_A].eligible is True
     assert final_by_key[KEY_B].eligible is False
 
-    timeline = build_stage_a_prefilter_timeline(**base_kwargs, selection_cutoffs=(d2, d4))  # type: ignore[arg-type]
+    timeline = build_stage_a_prefilter_timeline(
+        **base_kwargs,  # type: ignore[arg-type]
+        selection_cutoffs=(d2, d4),
+        corporate_action_claims_by_cutoff={
+            d2: _ca_claims((KEY_A, KEY_B), as_of=d2, coverage_start=d1, coverage_end=d2),
+            d4: _ca_claims((KEY_A, KEY_B), as_of=d4, coverage_start=d1, coverage_end=d4),
+        },
+    )
     assert [r.selection_cutoff for r in timeline] == [d2, d4]
     union = build_stage_b_plan_from_timeline(
         stage_a_plan=plan,
@@ -468,6 +531,7 @@ def test_delisted_stock_remains_in_early_window_union(tmp_path: Path) -> None:
         expected_rows_per_trading_day=75,
         estimated_bytes_per_row=80,
         rate_limit=_rate_limit(),
+        window_cutoffs=(d4,),
     )
     assert {c.instrument_key for c in final_only.candidates} == {KEY_A}
 
@@ -488,7 +552,7 @@ def test_symbol_change_uses_pit_symbol_without_lookahead(tmp_path: Path) -> None
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -525,7 +589,7 @@ def test_timeline_cutoffs_must_be_sorted_inside_boundary(tmp_path: Path) -> None
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -551,3 +615,310 @@ def test_timeline_cutoffs_must_be_sorted_inside_boundary(tmp_path: Path) -> None
             estimated_bytes_per_row=80,
             rate_limit=_rate_limit(),
         )
+
+
+def _stage_a_plan_for(
+    tmp_path: Path,
+    dates: tuple[date, ...],
+    rows_by_date: dict[date, list[dict[str, object]]],
+    boundary: tuple[date, date] | None = None,
+):  # type: ignore[no-untyped-def]
+    manifest = _write_manifest(tmp_path, dates, rows_by_date)
+    return build_stage_a_plan(
+        universe_manifest_path=manifest,
+        boundary=PITResearchBoundary(
+            start=boundary[0] if boundary else dates[0], end=boundary[1] if boundary else dates[-1]
+        ),
+        approved_capital_rupees=Decimal("1000"),
+        thresholds=_thresholds(),
+        formation_policy=_policy(),
+        rate_limit=_rate_limit(),
+        universe_rule_version="nse-cm-v15-point-in-time",
+        adjustment_policy="raw-unadjusted-block-structural-actions",
+        lookback_trading_sessions=1,
+        estimated_rows_per_trading_day=1,
+        estimated_bytes_per_row=80,
+        cost_model_identity="documented-current-terms-explicit-scenario",
+    )
+
+
+def _single_kwargs(plan, frames, keys):  # type: ignore[no-untyped-def]
+    return {
+        "stage_a_plan": plan,
+        "daily_frames": frames,
+        "daily_dataset_fingerprints": dict.fromkeys(keys, "d" * 64),
+        "tick_policies": {
+            key: FixedTickSizePolicy(tick_size_rupees=Decimal("0.05"), source="s") for key in keys
+        },
+        "corporate_actions": {
+            key: CorporateActionAssessment(complete=True, blocking_events=()) for key in keys
+        },
+        "minimum_tradable_quantities": dict.fromkeys(keys, 1),
+        "cost_provider": CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
+    }
+
+
+def test_lookback_requires_full_sourced_sessions_fail_closed(tmp_path: Path) -> None:
+    sep7, sep8 = date(2026, 9, 7), date(2026, 9, 8)
+    manifest = _write_manifest(
+        tmp_path,
+        (sep7, sep8),
+        {sep7: [_row(sep7, KEY_A, "OPEN")], sep8: [_row(sep8, KEY_A, "OPEN")]},
+        prepend_history=False,
+    )
+    with pytest.raises(PITAcquisitionError, match="lookback"):
+        build_stage_a_plan(
+            universe_manifest_path=manifest,
+            boundary=PITResearchBoundary(start=sep7, end=sep8),
+            approved_capital_rupees=Decimal("1000"),
+            thresholds=_thresholds(),
+            formation_policy=_policy(),
+            rate_limit=_rate_limit(),
+            universe_rule_version="nse-cm-v15-point-in-time",
+            adjustment_policy="raw-unadjusted-block-structural-actions",
+            lookback_trading_sessions=1,
+            estimated_rows_per_trading_day=1,
+            estimated_bytes_per_row=80,
+            cost_model_identity="documented-current-terms-explicit-scenario",
+        )
+
+
+def test_eligibility_gap_raw_bars_removed_by_mandatory_mask(tmp_path: Path) -> None:
+    mon, tue, wed, thu = (date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10))
+    plan = _stage_a_plan_for(
+        tmp_path,
+        (mon, tue, wed, thu),
+        {
+            mon: [_row(mon, KEY_A, "OPEN")],
+            tue: [_row(tue, KEY_A, "OPEN", eligible=False)],
+            wed: [_row(wed, KEY_A, "OPEN")],
+            thu: [_row(thu, KEY_A, "OPEN")],
+        },
+    )
+    frames = {
+        KEY_A: _midnight_frame(
+            {mon: Decimal("100"), tue: Decimal("101"), wed: Decimal("102"), thu: Decimal("103")}
+        )
+    }
+    prefilter = build_stage_a_prefilter(
+        **_single_kwargs(plan, frames, (KEY_A,)),
+        selection_cutoff=thu,  # type: ignore[arg-type]
+    )
+    assert prefilter.decisions[0].eligible is True
+    stage_b = build_stage_b_plan(
+        stage_a_plan=plan,
+        prefilter=prefilter,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+        window_cutoffs=(thu,),
+    )
+    detail = stage_b.details[0]
+    assert detail.data_class == RAW_ACQUISITION_ONLY
+    assert detail.raw_start == mon and detail.raw_end == thu
+    assert detail.eligible_dates == (mon, wed, thu)
+    assert detail.eligible_intervals == ((mon, mon), (wed, thu))
+    # The raw range physically contains Tuesday; the mask must remove it.
+    raw = _midnight_frame(
+        {
+            mon: Decimal("100"),
+            tue: Decimal("999999"),
+            wed: Decimal("102"),
+            thu: Decimal("103"),
+        }
+    )
+    research = consume_research_bars(raw, detail)
+    assert tuple(research.index.date) == (mon, wed, thu)
+    assert (research["close"] == 999999).sum() == 0
+
+
+def test_consumer_without_mask_fails_closed(tmp_path: Path) -> None:
+    frame = _midnight_frame({date(2026, 9, 7): Decimal("100")})
+    with pytest.raises(TypeError):
+        consume_research_bars(frame)  # type: ignore[call-arg]
+    mon, tue = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path, (mon, tue), {mon: [_row(mon, KEY_A, "OPEN")], tue: [_row(tue, KEY_A, "OPEN")]}
+    )
+    frames = {KEY_A: _midnight_frame({mon: Decimal("100"), tue: Decimal("101")})}
+    prefilter = build_stage_a_prefilter(
+        **_single_kwargs(plan, frames, (KEY_A,)),
+        selection_cutoff=tue,  # type: ignore[arg-type]
+    )
+    stage_b = build_stage_b_plan(
+        stage_a_plan=plan,
+        prefilter=prefilter,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+        window_cutoffs=(tue,),
+    )
+    thin = _midnight_frame({mon: Decimal("100")})
+    with pytest.raises(PITAcquisitionError, match="missing eligible observations"):
+        consume_research_bars(thin, stage_b.details[0])
+
+
+def test_multi_window_cannot_use_single_final_cutoff(tmp_path: Path) -> None:
+    d1, d2 = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path, (d1, d2), {d1: [_row(d1, KEY_A, "OPEN")], d2: [_row(d2, KEY_A, "OPEN")]}
+    )
+    frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
+    prefilter = build_stage_a_prefilter(
+        **_single_kwargs(plan, frames, (KEY_A,)),
+        selection_cutoff=d2,  # type: ignore[arg-type]
+    )
+    with pytest.raises(IncompletePrefilterError, match="timeline"):
+        build_stage_b_plan(
+            stage_a_plan=plan,
+            prefilter=prefilter,
+            interval_minutes=5,
+            expected_rows_per_trading_day=75,
+            estimated_bytes_per_row=80,
+            rate_limit=_rate_limit(),
+            window_cutoffs=(d1, d2),
+        )
+
+
+def test_future_ca_evidence_rejected_for_earlier_cutoff(tmp_path: Path) -> None:
+    d1, d2 = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path, (d1, d2), {d1: [_row(d1, KEY_A, "OPEN")], d2: [_row(d2, KEY_A, "OPEN")]}
+    )
+    frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
+    future_claim = CorporateActionEvidenceClaim(
+        instrument_key=KEY_A,
+        assessment_as_of=date(2026, 9, 10),
+        coverage_start=d1,
+        coverage_end=d2,
+        source_fingerprint="e" * 64,
+        policy_identity="ca-policy-v1",
+        blocking_events=(),
+        complete=True,
+    )
+    result = build_stage_a_prefilter(
+        **_single_kwargs(plan, frames, (KEY_A,)),  # type: ignore[arg-type]
+        selection_cutoff=d2,
+        corporate_action_claims={KEY_A: future_claim},
+    )
+    assert result.decisions[0].eligible is False
+    assert any("after decision cutoff" in failure for failure in result.failures)
+    assert result.decisions[0].ca_source_fingerprint == "e" * 64
+
+
+def test_delist_relist_union_and_intervals(tmp_path: Path) -> None:
+    d1, d2, d3, d4, d5 = (
+        date(2026, 9, 7),
+        date(2026, 9, 8),
+        date(2026, 9, 9),
+        date(2026, 9, 10),
+        date(2026, 9, 11),
+    )
+    assert canonical_eligible_intervals((d1, d2, d5)) == ((d1, d2), (d5, d5))
+    plan = _stage_a_plan_for(
+        tmp_path,
+        (d1, d2, d3, d4, d5),
+        {
+            d1: [_row(d1, KEY_A, "OPEN")],
+            d2: [_row(d2, KEY_A, "OPEN", eligible=False)],
+            d3: [_row(d3, KEY_A, "OPEN", eligible=False)],
+            d4: [_row(d4, KEY_A, "OPEN", eligible=False)],
+            d5: [_row(d5, KEY_A, "OPEN")],
+        },
+    )
+    frames = {
+        KEY_A: _midnight_frame(
+            {
+                d1: Decimal("100"),
+                d2: Decimal("101"),
+                d3: Decimal("102"),
+                d4: Decimal("103"),
+                d5: Decimal("104"),
+            }
+        )
+    }
+    kwargs = _single_kwargs(plan, frames, (KEY_A,))
+    early = build_stage_a_prefilter(**kwargs, selection_cutoff=d2)  # type: ignore[arg-type]
+    assert {d.instrument_key: d.eligible for d in early.decisions} == {KEY_A: True}
+    timeline = build_stage_a_prefilter_timeline(
+        **kwargs,  # type: ignore[arg-type]
+        selection_cutoffs=(d2, d5),
+        corporate_action_claims_by_cutoff={
+            d2: _ca_claims((KEY_A,), as_of=d2, coverage_start=d1, coverage_end=d2),
+            d5: _ca_claims((KEY_A,), as_of=d5, coverage_start=d1, coverage_end=d5),
+        },
+    )
+    union = build_stage_b_plan_from_timeline(
+        stage_a_plan=plan,
+        prefilters=timeline,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+    )
+    detail = union.details[0]
+    # Relisted names stay acquired for the early window that authorized them.
+    assert detail.eligible_dates == (d1,)
+    assert detail.eligible_intervals == ((d1, d1),)
+    assert detail.authorizing_cutoffs == (d2,)
+
+
+def test_symbol_lineage_preserved_in_stage_b(tmp_path: Path) -> None:
+    d1, d2 = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path,
+        (d1, d2),
+        {d1: [_row(d1, KEY_A, "OLDNAME")], d2: [_row(d2, KEY_A, "NEWNAME")]},
+    )
+    frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
+    kwargs = _single_kwargs(plan, frames, (KEY_A,))
+    timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
+    union = build_stage_b_plan_from_timeline(
+        stage_a_plan=plan,
+        prefilters=timeline,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+    )
+    detail = union.details[0]
+    assert detail.symbol_lineage == ((d1, "OLDNAME"), (d2, "NEWNAME"))
+    assert detail.symbol_ranges == ((d1, d1, "OLDNAME"), (d2, d2, "NEWNAME"))
+    assert detail.download_symbol == "NEWNAME"
+    assert symbol_ranges_for(((d1, "X"), (d2, "X"))) == ((d1, d2, "X"),)
+
+
+def test_stage_b_details_deterministic_fingerprint(tmp_path: Path) -> None:
+    d1, d2 = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path, (d1, d2), {d1: [_row(d1, KEY_A, "OPEN")], d2: [_row(d2, KEY_A, "OPEN")]}
+    )
+    frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
+    kwargs = _single_kwargs(plan, frames, (KEY_A,))
+    first_timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
+    second_timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
+    first = build_stage_b_plan_from_timeline(
+        stage_a_plan=plan,
+        prefilters=first_timeline,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+    )
+    second = build_stage_b_plan_from_timeline(
+        stage_a_plan=plan,
+        prefilters=second_timeline,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+    )
+    assert first.fingerprint == second.fingerprint
+    assert first.details[0].data_class == RAW_ACQUISITION_ONLY
+    assert first.details[0].membership_fingerprint == plan.source.manifest_sha256
+    assert first.details[0].authorizing_prefilter_fingerprints == (first_timeline[0].fingerprint,)
+    tampered = replace(first.details[0], download_symbol="TAMPERED")
+    forged = replace(first, details=(tampered,))
+    assert forged.fingerprint != first.fingerprint

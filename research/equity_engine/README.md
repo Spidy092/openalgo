@@ -68,7 +68,7 @@ python scripts/pit_historical_plan.py \
   --max-attempts 4 --backoff-seconds 1 \
   --universe-rule-version nse-cm-v15-point-in-time \
   --adjustment-policy raw-unadjusted-block-structural-actions \
-  --lookback-calendar-days 1 \
+  --lookback-trading-sessions 1 \
   --estimated-rows-per-trading-day 1 \
   --estimated-bytes-per-daily-row 80 \
   --cost-model-identity documented-current-terms-explicit-scenario \

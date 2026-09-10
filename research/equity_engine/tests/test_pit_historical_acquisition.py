@@ -36,11 +36,15 @@ from equity_engine.universe import CorporateActionAssessment, ResearchUniverseTh
 
 
 def _source_manifest(tmp_path: Path) -> Path:
-    dates = (date(2026, 9, 7), date(2026, 9, 8))
+    # 2026-09-04 (Friday) is sourced lookback history before the boundary and is
+    # ineligible, so the strict trading-session lookback resolves without
+    # changing the boundary population.
+    dates = (date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8))
+    eligible_by_date = {date(2026, 9, 4): False, date(2026, 9, 7): True, date(2026, 9, 8): True}
     daily_dir = tmp_path / "daily" / "2026"
     daily_dir.mkdir(parents=True)
     days = []
-    for offset, trade_date in enumerate(dates):
+    for trade_date in dates:
         raw_dir = tmp_path / "raw" / "2026"
         raw_dir.mkdir(parents=True, exist_ok=True)
         raw_path = raw_dir / f"NSE_CM_security_{trade_date.strftime('%d%m%Y')}.csv.gz"
@@ -60,7 +64,7 @@ def _source_manifest(tmp_path: Path) -> Path:
                     "isin": "INE000000001",
                     "series": "EQ",
                     "tick_size_rupees": "0.05",
-                    "eligible": True,
+                    "eligible": eligible_by_date[trade_date],
                     "snapshot_sha256": raw_hash,
                     "source_row_number": 2,
                     "source_url": (
@@ -75,7 +79,7 @@ def _source_manifest(tmp_path: Path) -> Path:
                 "report_date": trade_date.isoformat(),
                 "snapshot_sha256": raw_hash,
                 "records": 1,
-                "eligible_records": 1,
+                "eligible_records": 1 if eligible_by_date[trade_date] else 0,
                 "source_url": (
                     "https://nsearchives.nseindia.com/web/sites/default/files/"
                     f"NSE_CM_security_{trade_date.strftime('%d%m%Y')}.csv.gz"
@@ -147,7 +151,7 @@ def _plan(tmp_path: Path):
         rate_limit=_rate_limit(),
         universe_rule_version="nse-cm-v15-point-in-time",
         adjustment_policy="raw-unadjusted-block-structural-actions",
-        lookback_calendar_days=1,
+        lookback_trading_sessions=1,
         estimated_rows_per_trading_day=1,
         estimated_bytes_per_row=80,
         cost_model_identity="documented-current-terms-explicit-scenario",
@@ -195,7 +199,7 @@ def test_source_loader_preserves_actual_dates_and_excludes_no_holiday_as_missing
     manifest = _source_manifest(tmp_path)
     source = load_pit_universe_source(manifest)
 
-    assert source.trading_dates == (date(2026, 9, 7), date(2026, 9, 8))
+    assert source.trading_dates == (date(2026, 9, 4), date(2026, 9, 7), date(2026, 9, 8))
     assert source.eligible_instrument_keys == ("NSE_EQ|INE000000001",)
     assert source.manifest_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
 
@@ -221,7 +225,7 @@ def test_stage_a_plan_is_deterministic_and_has_explicit_estimates(tmp_path: Path
         rate_limit=first.rate_limit,
         universe_rule_version=first.universe_rule_version,
         adjustment_policy=first.adjustment_policy,
-        lookback_calendar_days=first.lookback_calendar_days,
+        lookback_trading_sessions=first.lookback_trading_sessions,
         estimated_rows_per_trading_day=first.estimated_rows_per_trading_day,
         estimated_bytes_per_row=first.estimated_bytes_per_row,
         cost_model_identity=first.cost_model_identity,
@@ -277,6 +281,7 @@ def test_stage_a_prefilter_is_complete_only_when_all_daily_data_is_present(tmp_p
             expected_rows_per_trading_day=75,
             estimated_bytes_per_row=80,
             rate_limit=_rate_limit(),
+            window_cutoffs=(plan.boundary.end,),
         )
 
 
@@ -290,6 +295,7 @@ def test_stage_b_is_bound_to_complete_prefilter_and_estimates_minute_storage(tmp
         expected_rows_per_trading_day=75,
         estimated_bytes_per_row=80,
         rate_limit=_rate_limit(),
+        window_cutoffs=(plan.boundary.end,),
     )
     combined = PITHistoricalAcquisitionPlan(stage_a=plan, stage_b=stage_b)
 
@@ -314,6 +320,7 @@ def test_stage_b_rejects_prefilter_from_another_stage_a_plan(tmp_path: Path):
             expected_rows_per_trading_day=75,
             estimated_bytes_per_row=80,
             rate_limit=_rate_limit(),
+            window_cutoffs=(plan.boundary.end,),
         )
 
 
@@ -397,7 +404,7 @@ def test_dry_run_plan_cli_reads_only_the_manifest_and_reports_stage_a_estimates(
         "test-rule",
         "--adjustment-policy",
         "raw",
-        "--lookback-calendar-days",
+        "--lookback-trading-sessions",
         "1",
         "--estimated-rows-per-trading-day",
         "1",

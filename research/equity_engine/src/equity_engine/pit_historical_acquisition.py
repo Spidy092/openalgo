@@ -44,6 +44,7 @@ from .upstox_history import UPSTOX_DAILY_HISTORY_START
 PIT_ACQUISITION_SCHEMA = "openalgo-pit-historical-acquisition/v1"
 STAGE_A_SCHEMA = "openalgo-pit-historical-acquisition/stage-a/v1"
 STAGE_B_SCHEMA = "openalgo-pit-historical-acquisition/stage-b/v1"
+RAW_ACQUISITION_ONLY = "RAW_ACQUISITION_ONLY"
 SUPPORTED_RESEARCH_START = NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE
 SUPPORTED_PRICE_DATA_START = UPSTOX_DAILY_HISTORY_START
 
@@ -111,6 +112,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def _decimal_text(value: Decimal | None) -> str | None:
     return format(value, "f") if value is not None else None
+
+
+def _require_content_fingerprint(name: str, value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PITAcquisitionError(f"{name} is required")
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise PITAcquisitionError(f"{name} must be a 64-character lowercase hex digest")
+    return value
 
 
 def _thresholds_dict(thresholds: ResearchUniverseThresholds) -> dict[str, object]:
@@ -264,6 +273,71 @@ class AcquisitionRateLimit:
             "minimum_interval_seconds": _decimal_text(self.minimum_interval_seconds),
             "policy_id": self.policy_id,
             "source_reference": self.source_reference,
+        }
+
+
+@dataclass(frozen=True)
+class CorporateActionEvidenceClaim:
+    """Date-bounded corporate-action evidence CLAIM for one instrument and cutoff.
+
+    This branch binds the claim into plan identity but does NOT authenticate it;
+    convergence with the trusted corporate-action ledger verifies content. A claim
+    whose ``assessment_as_of`` is after the decision cutoff is rejected so
+    future or current evidence is never silently reused for earlier cutoffs.
+    """
+
+    instrument_key: str
+    assessment_as_of: date
+    coverage_start: date
+    coverage_end: date
+    source_fingerprint: str
+    policy_identity: str
+    blocking_events: tuple[str, ...]
+    complete: bool
+
+    def __post_init__(self) -> None:
+        if not self.instrument_key.strip():
+            raise PITAcquisitionError("corporate-action claim instrument_key is required")
+        if self.coverage_start > self.coverage_end:
+            raise PITAcquisitionError("corporate-action claim coverage range is invalid")
+        _require_content_fingerprint(
+            "corporate-action claim source_fingerprint", self.source_fingerprint
+        )
+        if not self.policy_identity.strip():
+            raise PITAcquisitionError("corporate-action claim policy_identity is required")
+        for event in self.blocking_events:
+            if not str(event).strip():
+                raise PITAcquisitionError("corporate-action blocking event identity is required")
+        if type(self.complete) is not bool:
+            raise PITAcquisitionError("corporate-action claim completeness must be boolean")
+
+    def validate_for_cutoff(self, selection_cutoff: date, expected_dates: tuple[date, ...]) -> None:
+        """Fail closed when this claim cannot serve the given decision cutoff."""
+        if self.assessment_as_of > selection_cutoff:
+            raise PITAcquisitionError(
+                f"corporate-action evidence for {self.instrument_key} is assessed as of "
+                f"{self.assessment_as_of.isoformat()}, after decision cutoff "
+                f"{selection_cutoff.isoformat()}; future evidence is rejected"
+            )
+        if expected_dates and (
+            self.coverage_start > min(expected_dates) or self.coverage_end < max(expected_dates)
+        ):
+            raise PITAcquisitionError(
+                f"corporate-action evidence for {self.instrument_key} covers "
+                f"{self.coverage_start.isoformat()} through {self.coverage_end.isoformat()}, "
+                "which does not cover the decision trading dates"
+            )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "assessment_as_of": self.assessment_as_of.isoformat(),
+            "blocking_events": list(self.blocking_events),
+            "complete": self.complete,
+            "coverage_end": self.coverage_end.isoformat(),
+            "coverage_start": self.coverage_start.isoformat(),
+            "instrument_key": self.instrument_key,
+            "policy_identity": self.policy_identity,
+            "source_fingerprint": self.source_fingerprint,
         }
 
 
@@ -570,7 +644,7 @@ class StageAPlan:
     rate_limit: AcquisitionRateLimit
     universe_rule_version: str
     adjustment_policy: str
-    lookback_calendar_days: int
+    lookback_trading_sessions: int
     estimated_rows_per_trading_day: int
     estimated_bytes_per_row: int
     estimated_requests: int
@@ -582,8 +656,8 @@ class StageAPlan:
         _validate_capital(self.approved_capital_rupees)
         if not self.candidates:
             raise ValueError("Stage A requires at least one PIT candidate")
-        if self.lookback_calendar_days < 1:
-            raise ValueError("lookback_calendar_days must be positive and explicit")
+        if self.lookback_trading_sessions < 1:
+            raise ValueError("lookback_trading_sessions must be positive and explicit")
         if self.estimated_rows_per_trading_day < 1 or self.estimated_bytes_per_row < 1:
             raise ValueError("Stage A storage estimates must be positive and explicit")
         for name, value in (
@@ -606,7 +680,7 @@ class StageAPlan:
             "estimated_rows": self.estimated_rows,
             "estimated_rows_per_trading_day": self.estimated_rows_per_trading_day,
             "formation_policy": self.formation_policy.as_dict(),
-            "lookback_calendar_days": self.lookback_calendar_days,
+            "lookback_trading_sessions": self.lookback_trading_sessions,
             "rate_limit": self.rate_limit.as_dict(),
             "source_manifest_sha256": self.source.manifest_sha256,
             "source_manifest_schema_version": self.source.schema_version,
@@ -648,7 +722,7 @@ def build_stage_a_plan(
     rate_limit: AcquisitionRateLimit,
     universe_rule_version: str,
     adjustment_policy: str,
-    lookback_calendar_days: int,
+    lookback_trading_sessions: int,
     estimated_rows_per_trading_day: int,
     estimated_bytes_per_row: int,
     cost_model_identity: str,
@@ -665,7 +739,9 @@ def build_stage_a_plan(
         first_date = memberships[0].trade_date
         # Locate the download start from the actual sourced normal trading
         # sessions, never from naive calendar-day subtraction. A Monday first
-        # date with a 1-day lookback must reach Friday, not Sunday.
+        # date with a 1-session lookback must reach Friday, not Sunday. When the
+        # full requested lookback is not sourced, fail closed instead of
+        # silently acquiring a shorter history.
         try:
             first_index = source.trading_dates.index(first_date)
         except ValueError as exc:
@@ -673,7 +749,13 @@ def build_stage_a_plan(
                 f"first eligible date {first_date.isoformat()} for {key} is not a "
                 "sourced normal trading session"
             ) from exc
-        request_start: date = source.trading_dates[max(0, first_index - lookback_calendar_days)]
+        if first_index < lookback_trading_sessions:
+            raise PITAcquisitionError(
+                f"Stage A price lookback for {key} requires "
+                f"{lookback_trading_sessions} sourced trading sessions before "
+                f"{first_date.isoformat()}, which are not all available; fail closed"
+            )
+        request_start: date = source.trading_dates[first_index - lookback_trading_sessions]
         if request_start < SUPPORTED_PRICE_DATA_START:
             raise PITAcquisitionError(
                 f"Stage A price lookback for {key} precedes supported Upstox history"
@@ -709,7 +791,7 @@ def build_stage_a_plan(
         rate_limit=rate_limit,
         universe_rule_version=universe_rule_version,
         adjustment_policy=adjustment_policy,
-        lookback_calendar_days=lookback_calendar_days,
+        lookback_trading_sessions=lookback_trading_sessions,
         estimated_rows_per_trading_day=estimated_rows_per_trading_day,
         estimated_bytes_per_row=estimated_bytes_per_row,
         estimated_requests=estimated_requests,
@@ -750,10 +832,16 @@ class StageAPrefilterDecision:
     median_daily_volume_shares: Decimal | None
     evidence_as_of: pd.Timestamp | None = None
     prior_completed_session: date | None = None
+    ca_evidence_as_of: date | None = None
+    ca_source_fingerprint: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
             "affordable_quantity": self.affordable_quantity,
+            "ca_evidence_as_of": (
+                self.ca_evidence_as_of.isoformat() if self.ca_evidence_as_of is not None else None
+            ),
+            "ca_source_fingerprint": self.ca_source_fingerprint,
             "cash_required_rupees": _decimal_text(self.cash_required_rupees),
             "daily_dataset_fingerprint": self.daily_dataset_fingerprint,
             "eligible": self.eligible,
@@ -870,6 +958,8 @@ def _prefilter_rejection(
     volume: Decimal | None = None,
     evidence_as_of: pd.Timestamp | None = None,
     prior_completed_session: date | None = None,
+    ca_evidence_as_of: date | None = None,
+    ca_source_fingerprint: str | None = None,
 ) -> StageAPrefilterDecision:
     return StageAPrefilterDecision(
         instrument_key=key,
@@ -887,6 +977,8 @@ def _prefilter_rejection(
         median_daily_volume_shares=volume,
         evidence_as_of=evidence_as_of,
         prior_completed_session=prior_completed_session,
+        ca_evidence_as_of=ca_evidence_as_of,
+        ca_source_fingerprint=ca_source_fingerprint,
     )
 
 
@@ -901,8 +993,16 @@ def build_stage_a_prefilter(
     cost_provider: CostProvider,
     selection_cutoff: date,
     selection_as_of: pd.Timestamp | None = None,
+    corporate_action_claims: Mapping[str, CorporateActionEvidenceClaim] | None = None,
 ) -> StageAPrefilterResult:
-    """Evaluate Stage-A daily data without using prices after the formation decision."""
+    """Evaluate Stage-A daily data without using prices after the formation decision.
+
+    When ``corporate_action_claims`` is supplied, each instrument uses its
+    date-bounded claim (``assessment_as_of`` must not be after the decision
+    cutoff); the opaque ``corporate_actions`` mapping is then ignored for covered
+    instruments. The claim is bound into the decision but never authenticated
+    here.
+    """
 
     if not stage_a_plan.boundary.start <= selection_cutoff <= stage_a_plan.boundary.end:
         raise ValueError("selection_cutoff must be inside the acquisition boundary")
@@ -1110,7 +1210,57 @@ def build_stage_a_prefilter(
             continue
         minimum_quantity = minimum_tradable_quantities.get(key)
         tick_policy = tick_policies.get(key)
-        corporate_action = corporate_actions.get(key)
+        ca_evidence_as_of: date | None = None
+        ca_source_fingerprint: str | None = None
+        corporate_action: CorporateActionAssessment | None = None
+        if corporate_action_claims is not None:
+            ca_claim = corporate_action_claims.get(key)
+            if ca_claim is None:
+                reason = f"missing Stage-A tick/lot/corporate-action evidence for {key}"
+                failures.append(reason)
+                decisions.append(
+                    _prefilter_rejection(
+                        key=key,
+                        symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
+                        fingerprint=fingerprint,
+                        reasons=[reason],
+                        reference_price=reference_price,
+                        reference_timestamp=reference_timestamp,
+                        observed_days=len(expected_dates),
+                        evidence_as_of=selection_as_of,
+                        prior_completed_session=calendar_prior_session,
+                    )
+                )
+                continue
+            try:
+                ca_claim.validate_for_cutoff(selection_cutoff, expected_dates)
+            except PITAcquisitionError as exc:
+                reason = str(exc)
+                failures.append(reason)
+                decisions.append(
+                    _prefilter_rejection(
+                        key=key,
+                        symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
+                        fingerprint=fingerprint,
+                        reasons=[reason],
+                        reference_price=reference_price,
+                        reference_timestamp=reference_timestamp,
+                        observed_days=len(expected_dates),
+                        evidence_as_of=selection_as_of,
+                        prior_completed_session=calendar_prior_session,
+                        ca_evidence_as_of=ca_claim.assessment_as_of,
+                        ca_source_fingerprint=ca_claim.source_fingerprint,
+                    )
+                )
+                continue
+            corporate_action = CorporateActionAssessment(
+                complete=ca_claim.complete,
+                blocking_events=tuple(ca_claim.blocking_events),
+            )
+            ca_evidence_as_of = ca_claim.assessment_as_of
+            ca_source_fingerprint = ca_claim.source_fingerprint
+        else:
+            corporate_action = corporate_actions.get(key)
         if minimum_quantity is None or tick_policy is None or corporate_action is None:
             reason = f"missing Stage-A tick/lot/corporate-action evidence for {key}"
             failures.append(reason)
@@ -1125,6 +1275,8 @@ def build_stage_a_prefilter(
                     observed_days=len(expected_dates),
                     evidence_as_of=selection_as_of,
                     prior_completed_session=calendar_prior_session,
+                    ca_evidence_as_of=ca_evidence_as_of,
+                    ca_source_fingerprint=ca_source_fingerprint,
                 )
             )
             continue
@@ -1187,6 +1339,8 @@ def build_stage_a_prefilter(
                 median_daily_volume_shares=liquidity.median_daily_volume_shares,
                 evidence_as_of=selection_as_of,
                 prior_completed_session=calendar_prior_session,
+                ca_evidence_as_of=ca_evidence_as_of,
+                ca_source_fingerprint=ca_source_fingerprint,
             )
         )
     return StageAPrefilterResult(
@@ -1214,12 +1368,18 @@ def build_stage_a_prefilter_timeline(
     minimum_tradable_quantities: Mapping[str, int],
     cost_provider: CostProvider,
     selection_cutoffs: tuple[date, ...],
+    corporate_action_claims_by_cutoff: Mapping[date, Mapping[str, CorporateActionEvidenceClaim]]
+    | None = None,
 ) -> tuple[StageAPrefilterResult, ...]:
     """Build deterministic window-scoped prefilters, each strictly point-in-time.
 
     Every timeline entry may use only evidence available at or before its own
     formation cutoff. The Stage-B union must be derived from this timeline, never
     from a single final-day prefilter alone.
+
+    When more than one cutoff is present, date-bounded corporate-action claims
+    are required per cutoff so future evidence cannot leak into earlier windows;
+    a shared opaque mapping is then refused.
     """
     if not selection_cutoffs:
         raise ValueError("selection_cutoffs must contain at least one window cutoff")
@@ -1228,6 +1388,27 @@ def build_stage_a_prefilter_timeline(
     for cutoff in selection_cutoffs:
         if not stage_a_plan.boundary.start <= cutoff <= stage_a_plan.boundary.end:
             raise ValueError("every timeline cutoff must be inside the acquisition boundary")
+    if corporate_action_claims_by_cutoff is None:
+        if len(selection_cutoffs) > 1:
+            raise ValueError(
+                "multi-cutoff timelines require date-bounded corporate-action claims "
+                "per cutoff; reusing one opaque mapping across cutoffs is refused"
+            )
+        return tuple(
+            build_stage_a_prefilter(
+                stage_a_plan=stage_a_plan,
+                daily_frames=daily_frames,
+                daily_dataset_fingerprints=daily_dataset_fingerprints,
+                tick_policies=tick_policies,
+                corporate_actions=corporate_actions,
+                minimum_tradable_quantities=minimum_tradable_quantities,
+                cost_provider=cost_provider,
+                selection_cutoff=cutoff,
+            )
+            for cutoff in selection_cutoffs
+        )
+    if set(corporate_action_claims_by_cutoff) != set(selection_cutoffs):
+        raise ValueError("corporate-action claims must be supplied for exactly every cutoff")
     return tuple(
         build_stage_a_prefilter(
             stage_a_plan=stage_a_plan,
@@ -1238,9 +1419,191 @@ def build_stage_a_prefilter_timeline(
             minimum_tradable_quantities=minimum_tradable_quantities,
             cost_provider=cost_provider,
             selection_cutoff=cutoff,
+            corporate_action_claims=corporate_action_claims_by_cutoff[cutoff],
         )
         for cutoff in selection_cutoffs
     )
+
+
+def canonical_eligible_intervals(
+    eligible_dates: tuple[date, ...],
+) -> tuple[tuple[date, date], ...]:
+    """Collapse sorted eligible dates into canonical contiguous [start, end] intervals."""
+    if not eligible_dates:
+        raise PITAcquisitionError("eligible dates must not be empty")
+    if tuple(sorted(set(eligible_dates))) != eligible_dates:
+        raise PITAcquisitionError("eligible dates must be sorted unique")
+    intervals: list[tuple[date, date]] = []
+    start = previous = eligible_dates[0]
+    for day in eligible_dates[1:]:
+        if (day - previous).days == 1:
+            previous = day
+            continue
+        intervals.append((start, previous))
+        start = previous = day
+    intervals.append((start, previous))
+    return tuple(intervals)
+
+
+def symbol_ranges_for(
+    symbol_by_date: tuple[tuple[date, str], ...],
+) -> tuple[tuple[date, date, str], ...]:
+    """Collapse date-scoped symbols into canonical contiguous ranges."""
+    if not symbol_by_date:
+        raise PITAcquisitionError("symbol lineage must not be empty")
+    ordered = tuple(sorted(symbol_by_date))
+    if len({day for day, _ in ordered}) != len(ordered):
+        raise PITAcquisitionError("symbol lineage dates must be unique")
+    for _, symbol in ordered:
+        if not str(symbol).strip():
+            raise PITAcquisitionError("symbol lineage symbols cannot be blank")
+    ranges: list[tuple[date, date, str]] = []
+    range_start, current_symbol = ordered[0][0], ordered[0][1]
+    range_end = ordered[0][0]
+    for day, symbol in ordered[1:]:
+        if symbol == current_symbol and (day - range_end).days == 1:
+            range_end = day
+            continue
+        ranges.append((range_start, range_end, current_symbol))
+        range_start, range_end, current_symbol = day, day, symbol
+    ranges.append((range_start, range_end, current_symbol))
+    return tuple(ranges)
+
+
+def stage_b_eligibility_mask_fingerprint(
+    instrument_key: str, eligible_dates: tuple[date, ...], source_manifest_sha256: str
+) -> str:
+    """Fingerprint the exact eligibility mask for one Stage-B instrument."""
+    return _fingerprint(
+        {
+            "instrument_key": instrument_key,
+            "eligible_dates": [day.isoformat() for day in eligible_dates],
+            "source_manifest_sha256": source_manifest_sha256,
+        }
+    )
+
+
+@dataclass(frozen=True)
+class StageBInstrumentAcquisition:
+    """Per-instrument Stage-B provenance: broad RAW range plus exact eligible mask.
+
+    The downloader may fetch the continuous ``raw_start`` through ``raw_end``
+    range, so gap bars can exist physically. The resulting raw Parquet is labelled
+    :data:`RAW_ACQUISITION_ONLY` and must never enter research directly: only
+    :func:`consume_research_bars` with this mask yields research bars.
+    Date-scoped ``symbol_lineage`` (not just the latest symbol) is preserved.
+    """
+
+    instrument_key: str
+    data_class: str
+    raw_start: date
+    raw_end: date
+    eligible_dates: tuple[date, ...]
+    eligible_intervals: tuple[tuple[date, date], ...]
+    eligibility_mask_fingerprint: str
+    membership_fingerprint: str
+    authorizing_cutoffs: tuple[date, ...]
+    authorizing_prefilter_fingerprints: tuple[str, ...]
+    symbol_lineage: tuple[tuple[date, str], ...]
+    symbol_ranges: tuple[tuple[date, date, str], ...]
+    download_symbol: str
+
+    def __post_init__(self) -> None:
+        if not self.instrument_key.strip():
+            raise PITAcquisitionError("Stage-B instrument_key is required")
+        if self.data_class != RAW_ACQUISITION_ONLY:
+            raise PITAcquisitionError("Stage-B raw data must be labelled RAW_ACQUISITION_ONLY")
+        if self.raw_start > self.raw_end:
+            raise PITAcquisitionError("Stage-B raw range is invalid")
+        if (
+            not self.eligible_dates
+            or tuple(sorted(set(self.eligible_dates))) != self.eligible_dates
+        ):
+            raise PITAcquisitionError("Stage-B eligible dates must be sorted unique")
+        if self.raw_start > min(self.eligible_dates) or self.raw_end < max(self.eligible_dates):
+            raise PITAcquisitionError("Stage-B raw range must cover every eligible date")
+        if canonical_eligible_intervals(self.eligible_dates) != self.eligible_intervals:
+            raise PITAcquisitionError("Stage-B eligible intervals are not canonical")
+        _require_content_fingerprint(
+            "Stage-B eligibility mask fingerprint", self.eligibility_mask_fingerprint
+        )
+        if not self.membership_fingerprint.strip():
+            raise PITAcquisitionError("Stage-B membership fingerprint is required")
+        if not self.authorizing_cutoffs or tuple(sorted(set(self.authorizing_cutoffs))) != tuple(
+            self.authorizing_cutoffs
+        ):
+            raise PITAcquisitionError("Stage-B authorizing cutoffs must be sorted unique")
+        if not self.authorizing_prefilter_fingerprints:
+            raise PITAcquisitionError("Stage-B authorizing prefilter fingerprints are required")
+        if not self.symbol_lineage:
+            raise PITAcquisitionError("Stage-B symbol lineage must not be empty")
+        if tuple(day for day, _ in self.symbol_lineage) != self.eligible_dates:
+            raise PITAcquisitionError(
+                "Stage-B symbol lineage must cover exactly the eligible dates"
+            )
+        if symbol_ranges_for(self.symbol_lineage) != self.symbol_ranges:
+            raise PITAcquisitionError("Stage-B symbol ranges are not canonical")
+        if not self.download_symbol.strip():
+            raise PITAcquisitionError("Stage-B download symbol is required")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "authorizing_cutoffs": [day.isoformat() for day in self.authorizing_cutoffs],
+            "authorizing_prefilter_fingerprints": list(self.authorizing_prefilter_fingerprints),
+            "data_class": self.data_class,
+            "download_symbol": self.download_symbol,
+            "eligibility_mask_fingerprint": self.eligibility_mask_fingerprint,
+            "eligible_dates": [day.isoformat() for day in self.eligible_dates],
+            "eligible_intervals": [
+                {"end": end.isoformat(), "start": start.isoformat()}
+                for start, end in self.eligible_intervals
+            ],
+            "instrument_key": self.instrument_key,
+            "membership_fingerprint": self.membership_fingerprint,
+            "raw_end": self.raw_end.isoformat(),
+            "raw_start": self.raw_start.isoformat(),
+            "symbol_lineage": [
+                {"date": day.isoformat(), "symbol": symbol} for day, symbol in self.symbol_lineage
+            ],
+            "symbol_ranges": [
+                {"end": end.isoformat(), "start": start.isoformat(), "symbol": symbol}
+                for start, end, symbol in self.symbol_ranges
+            ],
+        }
+
+
+def filter_frame_to_eligible_bars(
+    frame: pd.DataFrame, eligible_dates: tuple[date, ...]
+) -> pd.DataFrame:
+    """Return only bars on eligible dates; gap bars from a broad RAW range are removed.
+
+    Fails closed when any eligible date has no observation. Extra physical dates
+    (for example D3/D4 inside a raw D1-D5 range) are dropped and never enter research.
+    """
+    if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+        raise PITAcquisitionError("research frame timestamps must be timezone-aware")
+    if not eligible_dates:
+        raise PITAcquisitionError("eligible dates must not be empty")
+    eligible_set = set(eligible_dates)
+    observed = set(frame.index.date)
+    missing = [day for day in eligible_dates if day not in observed]
+    if missing:
+        raise PITAcquisitionError(
+            "raw acquisition is missing eligible observations: "
+            + ", ".join(day.isoformat() for day in missing)
+        )
+    return frame.loc[[ts.date() in eligible_set for ts in frame.index]].copy()
+
+
+def consume_research_bars(frame: pd.DataFrame, detail: StageBInstrumentAcquisition) -> pd.DataFrame:
+    """Apply the mandatory eligibility mask before VectorBT/simulator consumption.
+
+    ``detail`` has no default: a consumer without the mask fails closed with a
+    missing-argument error instead of silently consuming RAW_ACQUISITION_ONLY data.
+    """
+    if detail.data_class != RAW_ACQUISITION_ONLY:
+        raise PITAcquisitionError("research bars require RAW_ACQUISITION_ONLY source detail")
+    return filter_frame_to_eligible_bars(frame, detail.eligible_dates)
 
 
 @dataclass(frozen=True)
@@ -1250,6 +1613,7 @@ class StageBPlan:
     stage_a_plan_fingerprint: str
     prefilter_fingerprint: str
     candidates: tuple[HistoricalBatchCandidate, ...]
+    details: tuple[StageBInstrumentAcquisition, ...]
     interval_minutes: int
     expected_rows_per_trading_day: int
     estimated_bytes_per_row: int
@@ -1290,6 +1654,7 @@ class StageBPlan:
                 }
                 for item in self.candidates
             ],
+            "details": [item.as_dict() for item in self.details],
             "estimated_bytes_per_row": self.estimated_bytes_per_row,
             "estimated_requests": self.estimated_requests,
             "estimated_rows": self.estimated_rows,
@@ -1347,13 +1712,14 @@ def build_stage_b_plan(
     expected_rows_per_trading_day: int,
     estimated_bytes_per_row: int,
     rate_limit: AcquisitionRateLimit,
+    window_cutoffs: tuple[date, ...],
 ) -> StageBPlan:
     """Create Stage B only from a complete, cryptographically bound Stage-A result.
 
-    A single-prefilter plan covers exactly that prefilter's point-in-time cutoff.
-    Multi-window research must use :func:`build_stage_b_plan_from_timeline` so the
-    acquisition population is the union across window cutoffs instead of the final
-    day alone.
+    ``window_cutoffs`` declares every research cutoff/fold for this acquisition.
+    More than one cutoff requires :func:`build_stage_b_plan_from_timeline`; the
+    legacy single-final-prefilter path is refused for multi-window research so a
+    final-day snapshot can never silently decide multi-year history.
     """
 
     if not prefilter.complete:
@@ -1370,11 +1736,28 @@ def build_stage_b_plan(
         raise IncompletePrefilterError(
             "Stage B prefilter cutoff must lie inside the requested acquisition boundary"
         )
+    if not window_cutoffs or tuple(sorted(set(window_cutoffs))) != tuple(window_cutoffs):
+        raise IncompletePrefilterError("window_cutoffs must be sorted unique dates")
+    if any(
+        not stage_a_plan.boundary.start <= cutoff <= stage_a_plan.boundary.end
+        for cutoff in window_cutoffs
+    ):
+        raise IncompletePrefilterError("every window cutoff must lie inside the boundary")
+    if len(window_cutoffs) > 1:
+        raise IncompletePrefilterError(
+            "multi-window acquisition requires build_stage_b_plan_from_timeline; "
+            "the single-prefilter path cannot represent more than one research cutoff"
+        )
+    if prefilter.selection_cutoff != window_cutoffs[0]:
+        raise IncompletePrefilterError(
+            "single-window prefilter cutoff must equal the declared window cutoff"
+        )
     if interval_minutes != 5:
         raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
 
     date_by_key = {item.instrument_key: item for item in stage_a_plan.candidates}
     candidates: list[HistoricalBatchCandidate] = []
+    details: list[StageBInstrumentAcquisition] = []
     trading_day_counts: dict[str, int] = {}
     for decision in prefilter.decisions:
         if not decision.eligible:
@@ -1387,6 +1770,11 @@ def build_stage_b_plan(
         dates = tuple(
             day for day in source_candidate.eligible_dates if day <= prefilter.selection_cutoff
         )
+        lineage = tuple(
+            (day, symbol)
+            for day, symbol in source_candidate.symbol_by_date
+            if day <= prefilter.selection_cutoff
+        )
         candidates.append(
             HistoricalBatchCandidate(
                 instrument_key=decision.instrument_key,
@@ -1396,7 +1784,27 @@ def build_stage_b_plan(
             )
         )
         trading_day_counts[decision.instrument_key] = len(dates)
+        details.append(
+            StageBInstrumentAcquisition(
+                instrument_key=decision.instrument_key,
+                data_class=RAW_ACQUISITION_ONLY,
+                raw_start=min(dates),
+                raw_end=max(dates),
+                eligible_dates=dates,
+                eligible_intervals=canonical_eligible_intervals(dates),
+                eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
+                    decision.instrument_key, dates, stage_a_plan.source.manifest_sha256
+                ),
+                membership_fingerprint=stage_a_plan.source.manifest_sha256,
+                authorizing_cutoffs=(prefilter.selection_cutoff,),
+                authorizing_prefilter_fingerprints=(prefilter.fingerprint,),
+                symbol_lineage=lineage,
+                symbol_ranges=symbol_ranges_for(lineage),
+                download_symbol=decision.symbol,
+            )
+        )
     candidates.sort(key=lambda item: item.instrument_key)
+    details.sort(key=lambda item: item.instrument_key)
     if not candidates:
         raise IncompletePrefilterError("complete Stage-A prefilter produced no Stage-B candidates")
     plan = plan_historical_batch(
@@ -1414,6 +1822,7 @@ def build_stage_b_plan(
         stage_a_plan_fingerprint=stage_a_plan.fingerprint,
         prefilter_fingerprint=prefilter.fingerprint,
         candidates=tuple(candidates),
+        details=tuple(details),
         interval_minutes=interval_minutes,
         expected_rows_per_trading_day=expected_rows_per_trading_day,
         estimated_bytes_per_row=estimated_bytes_per_row,
@@ -1483,8 +1892,8 @@ def build_stage_b_plan_from_timeline(
         raise IncompletePrefilterError("timeline prefilters produced no eligible candidates")
 
     candidates: list[HistoricalBatchCandidate] = []
+    details: list[StageBInstrumentAcquisition] = []
     trading_day_counts: dict[str, int] = {}
-    latest_symbol: dict[str, tuple[date, str]] = {}
     for key in sorted(covered):
         source_candidate = date_by_key.get(key)
         if source_candidate is None:
@@ -1497,13 +1906,15 @@ def build_stage_b_plan_from_timeline(
         )
         if not union_dates:
             raise IncompletePrefilterError(f"no eligible dates covered for {key}")
-        for prefilter in covered[key]:
-            for decision in prefilter.decisions:
-                if decision.instrument_key == key and decision.eligible:
-                    current = latest_symbol.get(key)
-                    if current is None or prefilter.selection_cutoff >= current[0]:
-                        latest_symbol[key] = (prefilter.selection_cutoff, decision.symbol)
-        symbol = latest_symbol[key][1]
+        authorizing = sorted(covered[key], key=lambda item: item.selection_cutoff)
+        lineage = tuple(
+            (day, symbol)
+            for day, symbol in source_candidate.symbol_by_date
+            if day <= max_covered_cutoff
+        )
+        # Download label uses the latest sourced symbol in range; the full
+        # date-scoped lineage below remains the historical provenance.
+        symbol = dict(lineage)[max(union_dates)]
         candidates.append(
             HistoricalBatchCandidate(
                 instrument_key=key,
@@ -1513,7 +1924,27 @@ def build_stage_b_plan_from_timeline(
             )
         )
         trading_day_counts[key] = len(union_dates)
+        details.append(
+            StageBInstrumentAcquisition(
+                instrument_key=key,
+                data_class=RAW_ACQUISITION_ONLY,
+                raw_start=min(union_dates),
+                raw_end=max(union_dates),
+                eligible_dates=union_dates,
+                eligible_intervals=canonical_eligible_intervals(union_dates),
+                eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
+                    key, union_dates, stage_a_plan.source.manifest_sha256
+                ),
+                membership_fingerprint=stage_a_plan.source.manifest_sha256,
+                authorizing_cutoffs=tuple(item.selection_cutoff for item in authorizing),
+                authorizing_prefilter_fingerprints=tuple(item.fingerprint for item in authorizing),
+                symbol_lineage=lineage,
+                symbol_ranges=symbol_ranges_for(lineage),
+                download_symbol=symbol,
+            )
+        )
     candidates.sort(key=lambda item: item.instrument_key)
+    details.sort(key=lambda item: item.instrument_key)
     plan = plan_historical_batch(
         candidates=candidates,
         interval_minutes=interval_minutes,
@@ -1536,6 +1967,7 @@ def build_stage_b_plan_from_timeline(
         stage_a_plan_fingerprint=stage_a_plan.fingerprint,
         prefilter_fingerprint=combined_fingerprint,
         candidates=tuple(candidates),
+        details=tuple(details),
         interval_minutes=interval_minutes,
         expected_rows_per_trading_day=expected_rows_per_trading_day,
         estimated_bytes_per_row=estimated_bytes_per_row,
