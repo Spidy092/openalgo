@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -53,6 +53,10 @@ class UniverseFingerprintMismatchError(ExperimentValidationError):
 
 class MissingEvidenceError(ExperimentValidationError):
     """Raised when required concrete evidence is missing (arbitrary booleans are forbidden)."""
+
+
+class CostEvidenceMismatchError(ExperimentValidationError):
+    """Raised when a serialized cost-evidence claim disagrees with trusted evidence."""
 
 
 class DataLeakageError(ExperimentValidationError):
@@ -283,18 +287,9 @@ class CostModelIdentity:
 
 
 def _record_identity(record: Any) -> str:
-    """Return a stable identity for one ledger record selected by a policy."""
+    """Return the SHA-256 identity of a record's complete canonical payload."""
 
-    return ":".join(
-        (
-            record.component.value,
-            record.product.value,
-            record.side.value,
-            record.effective_from.isoformat(),
-            record.effective_to.isoformat() if record.effective_to else "",
-            record.evidence_class.value,
-        )
-    )
+    return canonical_sha256(record.to_dict())
 
 
 @dataclass(frozen=True)
@@ -303,8 +298,9 @@ class CostEvidenceIdentity:
 
     This is deliberately separate from ``CostModelIdentity``. A free-form
     rates mapping can describe a scenario, but it cannot claim verified
-    historical-account costs. Use ``from_ledger`` so the ledger digest and
-    selected effective-dated records are created from the canonical ledger.
+    historical-account costs. The fields in this class are an artifact claim,
+    including when loaded from serialized JSON. Promotion must revalidate the
+    claim against a trusted ledger; construction alone is never verification.
     """
 
     ledger_schema_version: str
@@ -318,8 +314,6 @@ class CostEvidenceIdentity:
     selected_record_ids: tuple[str, ...]
     unknown_components: tuple[str, ...]
     scenario_identity: str | None = None
-    _verified_ledger_fingerprint: str | None = field(default=None, repr=False, compare=False)
-    _verified_historical_actual: bool | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -339,13 +333,6 @@ class CostEvidenceIdentity:
         if self.evidence_classification == HISTORICAL_ACTUAL_LABEL:
             if not self.historical_actual:
                 raise ValueError("historical actual classification requires historical_actual=True")
-            if (
-                self._verified_ledger_fingerprint != self.ledger_fingerprint
-                or self._verified_historical_actual is not True
-            ):
-                raise ValueError(
-                    "historical actual cost evidence must be created from verified ledger evidence"
-                )
         elif self.historical_actual:
             raise ValueError(
                 "historical_actual=True requires HISTORICAL_ACTUAL_COSTS classification"
@@ -386,8 +373,6 @@ class CostEvidenceIdentity:
             ),
             unknown_components=tuple(sorted(set(assessment.unknowns))),
             scenario_identity=scenario_identity,
-            _verified_ledger_fingerprint=fingerprint,
-            _verified_historical_actual=assessment.historical_actual,
         )
 
     @classmethod
@@ -426,9 +411,84 @@ class CostEvidenceIdentity:
                 "public broker scenario is not account-specific historical evidence",
             ),
             scenario_identity=scenario_identity,
-            _verified_ledger_fingerprint=fingerprint,
-            _verified_historical_actual=False,
         )
+
+    def _derive_from_trusted_ledger(
+        self,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        trusted_scenario_identity: str | None,
+    ) -> CostEvidenceIdentity:
+        """Derive the expected claim using only canonical trusted evidence.
+
+        ``self`` is deliberately used only to locate the requested date/product
+        and select the supported resolution mode. All evidence-bearing values,
+        policy labels, and scenario labels are re-derived or supplied through
+        the explicit trusted context; serialized claim values are never used as
+        verification inputs.
+        """
+
+        try:
+            product = LedgerProduct(self.product_scope)
+        except ValueError as exc:
+            raise CostEvidenceMismatchError(
+                f"unsupported cost product in claim: {self.product_scope!r}"
+            ) from exc
+
+        if self.evidence_mode == "historical_resolution":
+            expected = CostEvidenceIdentity.from_ledger(
+                ledger,
+                on_date=self.resolved_on_date,
+                product=product,
+            )
+        elif self.evidence_mode == "public_scenario":
+            if trusted_scenario_identity is None:
+                raise CostEvidenceMismatchError(
+                    "trusted scenario identity is required to validate a public scenario claim"
+                )
+            expected = CostEvidenceIdentity.from_public_scenario(
+                ledger,
+                on_date=self.resolved_on_date,
+                product=product,
+                scenario_identity=trusted_scenario_identity,
+            )
+        else:
+            raise CostEvidenceMismatchError(
+                f"unsupported cost-evidence mode in claim: {self.evidence_mode!r}"
+            )
+        return expected
+
+    def validate_against_trusted_ledger(
+        self,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        trusted_scenario_identity: str | None = None,
+    ) -> None:
+        """Fail closed unless this claim exactly matches a trusted ledger resolution.
+
+        The comparison covers the ledger schema and fingerprint, classification,
+        historical-actual flag, product, resolved date, complete selected record
+        identities, unknown components, policy identity, evidence mode, and
+        scenario identity. This method is the integrity boundary used by
+        promotion; ``CostEvidenceIdentity`` construction is not.
+        """
+
+        expected = self._derive_from_trusted_ledger(
+            ledger,
+            trusted_scenario_identity=trusted_scenario_identity,
+        )
+        actual_payload = self.as_dict()
+        expected_payload = expected.as_dict()
+        mismatches = tuple(
+            key
+            for key in sorted(expected_payload)
+            if actual_payload.get(key) != expected_payload.get(key)
+        )
+        if mismatches:
+            raise CostEvidenceMismatchError(
+                "cost evidence claim does not match trusted ledger; mismatched fields: "
+                + ", ".join(mismatches)
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -933,12 +993,34 @@ class ExperimentArtifact:
         return json.dumps(self.as_dict(), indent=indent, sort_keys=True) + "\n"
 
     def evaluate_promotion_gate(
-        self, thresholds: PromotionThresholds
+        self,
+        thresholds: PromotionThresholds,
+        *,
+        trusted_cost_ledger: EffectiveDatedCostLedger | None = None,
+        trusted_scenario_identity: str | None = None,
     ) -> tuple[bool, tuple[str, ...]]:
-        """Evaluate concrete promotion evidence plus the cost-evidence boundary."""
+        """Evaluate promotion evidence after revalidating cost evidence.
+
+        A promotion decision always requires ``trusted_cost_ledger``. The
+        serialized ``CostEvidenceIdentity`` on the artifact is only a claim;
+        it cannot establish historical actual costs by itself.
+        """
 
         passed, violations = self.promotion_evidence.evaluate_gate(thresholds)
         cost_violations = list(violations)
+        if trusted_cost_ledger is None:
+            cost_violations.append(
+                "trusted cost evidence ledger is required for promotion; "
+                "serialized cost evidence is a claim, not proof"
+            )
+        else:
+            try:
+                self.cost_evidence_identity.validate_against_trusted_ledger(
+                    trusted_cost_ledger,
+                    trusted_scenario_identity=trusted_scenario_identity,
+                )
+            except (CostEvidenceMismatchError, LookupError, ValueError) as exc:
+                cost_violations.append(f"cost evidence integrity mismatch: {exc}")
         if (
             self.cost_evidence_identity.evidence_classification != HISTORICAL_ACTUAL_LABEL
             or not self.cost_evidence_identity.historical_actual
@@ -956,6 +1038,8 @@ class ExperimentArtifact:
         dataset_manifests: Mapping[str, MarketDataManifest] | None = None,
         prefilter_artifact: Mapping[str, Any] | None = None,
         promotion_thresholds: PromotionThresholds | None = None,
+        trusted_cost_ledger: EffectiveDatedCostLedger | None = None,
+        trusted_scenario_identity: str | None = None,
     ) -> None:
         """Enforce strict fail-closed validation of all fingerprints and evidence.
 
@@ -968,6 +1052,29 @@ class ExperimentArtifact:
         """
         if self.live_orders_called:
             raise LiveOrderAttemptError("live-order execution is strictly forbidden in research")
+
+        # Cost evidence is a claim in the serialized artifact. Revalidate it
+        # whenever trusted evidence is supplied, and never permit a claimed
+        # historical actual (or any promotion request) without that evidence.
+        if trusted_cost_ledger is not None:
+            try:
+                self.cost_evidence_identity.validate_against_trusted_ledger(
+                    trusted_cost_ledger,
+                    trusted_scenario_identity=trusted_scenario_identity,
+                )
+            except (CostEvidenceMismatchError, LookupError, ValueError) as exc:
+                raise MissingEvidenceError(
+                    f"cost evidence integrity mismatch: {exc}"
+                ) from exc
+        elif (
+            self.cost_evidence_identity.evidence_classification == HISTORICAL_ACTUAL_LABEL
+            or self.cost_evidence_identity.historical_actual
+        ):
+            raise MissingEvidenceError(
+                "trusted cost evidence ledger is required to validate or promote cost evidence; "
+                "serialized cost evidence is a claim, not proof; cost evidence is not verified "
+                "HISTORICAL_ACTUAL_COSTS"
+            )
 
         # 1. Dataset fingerprint verification
         if dataset_frames is not None:
@@ -1037,7 +1144,11 @@ class ExperimentArtifact:
 
         # 5. Threshold evaluation if requested
         if promotion_thresholds is not None:
-            passed, violations = self.evaluate_promotion_gate(promotion_thresholds)
+            passed, violations = self.evaluate_promotion_gate(
+                promotion_thresholds,
+                trusted_cost_ledger=trusted_cost_ledger,
+                trusted_scenario_identity=trusted_scenario_identity,
+            )
             if not passed:
                 raise MissingEvidenceError(
                     "experiment failed promotion gate criteria: " + "; ".join(violations)

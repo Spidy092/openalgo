@@ -27,9 +27,11 @@ from equity_engine.cost_ledger import (
 from equity_engine.experiment import (
     ApprovedCapital,
     BaselineComparisonEvidence,
+    canonical_sha256,
     ConcretePromotionEvidence,
     CorporateActionEvidenceIdentity,
     CostEvidenceIdentity,
+    CostEvidenceMismatchError,
     CostModelIdentity,
     CostReconciliationEvidence,
     DataLeakageError,
@@ -241,6 +243,143 @@ def test_experiment_identity_binds_cost_ledger_fingerprint() -> None:
     )
 
 
+def test_verification_fields_are_not_public_constructor_inputs() -> None:
+    with pytest.raises(TypeError, match="_verified_ledger_fingerprint"):
+        CostEvidenceIdentity(
+            ledger_schema_version="effective-dated-cost-ledger/v1",
+            ledger_fingerprint="a" * 64,
+            evidence_classification=INCOMPLETE_LABEL,
+            historical_actual=False,
+            product_scope=LedgerProduct.INTRADAY.value,
+            evidence_mode="historical_resolution",
+            policy_identity="untrusted",
+            resolved_on_date=date(2026, 9, 8),
+            selected_record_ids=(),
+            unknown_components=(),
+            _verified_ledger_fingerprint="a" * 64,
+        )
+
+
+def test_kiro_forged_historical_claim_cannot_pass_promotion_or_integrity() -> None:
+    forged = CostEvidenceIdentity(
+        ledger_schema_version="effective-dated-cost-ledger/v1",
+        ledger_fingerprint="f" * 64,
+        evidence_classification=HISTORICAL_ACTUAL_LABEL,
+        historical_actual=True,
+        product_scope=LedgerProduct.INTRADAY.value,
+        evidence_mode="historical_resolution",
+        policy_identity="effective-dated-cost-ledger/default-resolution/v1",
+        resolved_on_date=date(2026, 9, 8),
+        selected_record_ids=("0" * 64,),
+        unknown_components=(),
+    )
+    experiment = _experiment(cost_evidence_identity=forged)
+    ledger = EffectiveDatedCostLedger()
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    passed, violations = experiment.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("trusted cost evidence ledger is required" in item for item in violations)
+    with pytest.raises(MissingEvidenceError, match="trusted cost evidence ledger is required"):
+        experiment.validate_integrity(promotion_thresholds=thresholds)
+    with pytest.raises(MissingEvidenceError, match="cost evidence integrity mismatch"):
+        experiment.validate_integrity(
+            promotion_thresholds=thresholds,
+            trusted_cost_ledger=ledger,
+        )
+
+
+def test_forged_ledger_fingerprint_is_rejected_against_trusted_ledger() -> None:
+    ledger = EffectiveDatedCostLedger()
+    identity = _cost_identity()
+    forged = replace(identity, ledger_fingerprint="b" * 64)
+
+    with pytest.raises(CostEvidenceMismatchError, match="ledger_fingerprint"):
+        forged.validate_against_trusted_ledger(ledger)
+
+
+def test_unrelated_genuine_ledger_is_rejected() -> None:
+    ledger = EffectiveDatedCostLedger()
+    identity = _cost_identity()
+    unrelated = replace(ledger.records[-1], source_refs=("unrelated-genuine-source",))
+    changed_ledger = EffectiveDatedCostLedger(records=ledger.records[:-1] + (unrelated,))
+
+    with pytest.raises(CostEvidenceMismatchError, match="ledger_fingerprint"):
+        identity.validate_against_trusted_ledger(changed_ledger)
+
+
+@pytest.mark.parametrize("change", ("rate", "source", "unknowns"))
+def test_complete_record_changes_are_rejected(change: str) -> None:
+    ledger = EffectiveDatedCostLedger()
+    identity = _cost_identity()
+    records = list(ledger.records)
+    if change == "rate":
+        index = next(i for i, record in enumerate(records) if record.rate is not None)
+        records[index] = replace(records[index], rate=records[index].rate + Decimal("0.000001"))
+    elif change == "source":
+        index = 0
+        records[index] = replace(records[index], source_refs=("changed-record-source",))
+    else:
+        index = next(i for i, record in enumerate(records) if record.unknowns)
+        records[index] = replace(records[index], unknowns=records[index].unknowns + ("tampered",))
+
+    changed_ledger = EffectiveDatedCostLedger(records=tuple(records))
+    with pytest.raises(CostEvidenceMismatchError, match="ledger_fingerprint|selected_record_ids"):
+        identity.validate_against_trusted_ledger(changed_ledger)
+
+
+def test_selected_record_id_is_complete_canonical_sha256() -> None:
+    ledger = EffectiveDatedCostLedger()
+    record = ledger.records[0]
+    identity = _cost_identity()
+    expected = canonical_sha256(record.to_dict())
+
+    assert expected in identity.selected_record_ids
+    assert len(expected) == 64
+    changed = replace(record, formula=(record.formula or "") + "+tampered")
+    assert canonical_sha256(changed.to_dict()) != expected
+
+
+def test_sep_9_record_cannot_be_claimed_for_sep_8() -> None:
+    ledger = EffectiveDatedCostLedger()
+    sep_9 = CostEvidenceIdentity.from_ledger(
+        ledger,
+        on_date=date(2026, 9, 9),
+        product=LedgerProduct.INTRADAY,
+    )
+    forged_sep_8 = replace(sep_9, resolved_on_date=date(2026, 9, 8))
+
+    with pytest.raises(CostEvidenceMismatchError, match="selected_record_ids"):
+        forged_sep_8.validate_against_trusted_ledger(ledger)
+
+
+def test_public_scenario_cannot_be_claimed_as_historical_actual() -> None:
+    ledger = EffectiveDatedCostLedger()
+    scenario = CostEvidenceIdentity.from_public_scenario(
+        ledger,
+        on_date=date(2026, 9, 9),
+        product=LedgerProduct.INTRADAY,
+        scenario_identity="upstox-public-terms",
+    )
+    forged = replace(
+        scenario,
+        evidence_classification=HISTORICAL_ACTUAL_LABEL,
+        historical_actual=True,
+    )
+
+    with pytest.raises(CostEvidenceMismatchError, match="evidence_classification"):
+        forged.validate_against_trusted_ledger(
+            ledger,
+            trusted_scenario_identity="upstox-public-terms",
+        )
+
+
 def test_modifying_ledger_fingerprint_changes_experiment_fingerprint() -> None:
     experiment = _experiment()
     changed_identity = replace(
@@ -264,19 +403,23 @@ def test_changing_cost_evidence_policy_changes_experiment_fingerprint() -> None:
 
 
 def test_free_form_rates_cannot_claim_historical_actual_costs() -> None:
-    with pytest.raises(ValueError, match="verified ledger evidence"):
-        CostEvidenceIdentity(
-            ledger_schema_version="effective-dated-cost-ledger/v1",
-            ledger_fingerprint="a" * 64,
-            evidence_classification=HISTORICAL_ACTUAL_LABEL,
-            historical_actual=True,
-            product_scope="INTRADAY",
-            evidence_mode="free_form_rates",
-            policy_identity="unverified",
-            resolved_on_date=date(2026, 9, 8),
-            selected_record_ids=(),
-            unknown_components=(),
-        )
+    claim = CostEvidenceIdentity(
+        ledger_schema_version="effective-dated-cost-ledger/v1",
+        ledger_fingerprint="a" * 64,
+        evidence_classification=HISTORICAL_ACTUAL_LABEL,
+        historical_actual=True,
+        product_scope="INTRADAY",
+        evidence_mode="free_form_rates",
+        policy_identity="unverified",
+        resolved_on_date=date(2026, 9, 8),
+        selected_record_ids=(),
+        unknown_components=(),
+    )
+
+    # Claims remain loadable as artifacts, but a free-form configuration is
+    # rejected at the trusted-evidence integrity boundary.
+    with pytest.raises(ValueError, match="unsupported cost-evidence mode"):
+        claim.validate_against_trusted_ledger(EffectiveDatedCostLedger())
 
 
 def test_unknown_gst_stays_unknown_through_experiment_provenance() -> None:
@@ -335,11 +478,18 @@ def test_experiment_builder_rejects_sep_9_cost_evidence_for_sep_8_window() -> No
 
 
 def test_sep_9_snapshot_is_explicitly_nonhistorical() -> None:
+    ledger = EffectiveDatedCostLedger()
     identity = _cost_identity(on_date=ACCOUNT_SNAPSHOT_DATE)
 
     assert identity.evidence_classification == INCOMPLETE_LABEL
     assert identity.historical_actual is False
-    assert any("account_snapshot" in record for record in identity.selected_record_ids)
+    snapshot_ids = {
+        identity_value
+        for record in ledger.records
+        if record.evidence_class is EvidenceClass.ACCOUNT_SNAPSHOT
+        for identity_value in (canonical_sha256(record.to_dict()),)
+    }
+    assert snapshot_ids.intersection(identity.selected_record_ids)
 
 
 def test_public_gst_scenario_is_explicit_and_not_default_historical_evidence() -> None:
