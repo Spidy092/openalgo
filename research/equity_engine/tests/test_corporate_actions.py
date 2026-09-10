@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -26,6 +27,7 @@ from equity_engine.experiment import (
     BaselineComparisonEvidence,
     ConcretePromotionEvidence,
     CorporateActionEvidenceIdentity,
+    CorporateActionMismatchError,
     CostEvidenceIdentity,
     CostModelIdentity,
     CostReconciliationEvidence,
@@ -808,8 +810,7 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
         coverage_start=date(2026, 1, 1),
         coverage_end=date(2026, 5, 31),  # Ends early; research window is until 2026-06-30
         covered_instruments=("NSE_EQ|INE002A01018",),
-        _verified_ledger_fingerprint="fp_ca_001",
-        _verified_covered_instruments=("NSE_EQ|INE002A01018",),
+        authoritative=False,
     )
     exp = _sample_experiment(corporate_action_evidence=uncovered_evidence)
     with pytest.raises(MissingEvidenceError, match="cannot claim corporate-action-complete unless evidence covers"):
@@ -823,6 +824,7 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
             blocking_events=(),
             evidence_fingerprint="fp_ca_001",
             covered_instruments=("NSE_EQ|INE002A01018",),
+            authoritative=False,
         )
 
     # 3. Missing date-scoped coverage fails closed
@@ -834,8 +836,7 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
         coverage_start=None,
         coverage_end=None,
         covered_instruments=("NSE_EQ|INE002A01018",),
-        _verified_ledger_fingerprint="fp_ca_001",
-        _verified_covered_instruments=("NSE_EQ|INE002A01018",),
+        authoritative=False,
     )
     exp_no_dates = _sample_experiment(corporate_action_evidence=no_dates_evidence)
     with pytest.raises(MissingEvidenceError, match=r"got coverage \[None, None\]"):
@@ -869,10 +870,15 @@ def test_corporate_action_evidence_identity_from_ledger_integration() -> None:
     assert ca_identity.covered_instruments == ("NSE_EQ|INE002A01018",)
     assert ca_identity.blocking_events == ()
     assert ca_identity.evidence_fingerprint == ledger.fingerprint()
+    assert ca_identity.authoritative is True
 
-    # Verify that experiment artifact validates integrity cleanly with ledger-derived identity
+    # Authoritative claim derived from ledger requires trusted ledger to validate integrity
     exp = _sample_experiment(corporate_action_evidence=ca_identity)
-    exp.validate_integrity()
+    with pytest.raises(MissingEvidenceError, match="trusted corporate-action evidence ledger is required"):
+        exp.validate_integrity()
+
+    # Revalidation against trusted ledger passes cleanly
+    exp.validate_integrity(trusted_corporate_action_ledger=ledger)
     assert exp.deterministic_fingerprint() is not None
 
 
@@ -982,7 +988,89 @@ def test_fix2_empty_instrument_population_fails_closed() -> None:
         )
 
 
-def test_fix3_identity_trust_and_ledger_revalidation() -> None:
+def test_exploit_private_parameters_removed_and_forged_identity_rejected() -> None:
+    # 1. Private verification parameters must NOT exist on constructor
+    with pytest.raises(TypeError, match="unexpected keyword argument '_verified_ledger_fingerprint'"):
+        CorporateActionEvidenceIdentity(
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="f" * 64,
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 6, 30),
+            covered_instruments=("NSE_EQ|INE002A01018",),
+            _verified_ledger_fingerprint="f" * 64,  # type: ignore[call-arg]
+        )
+
+    with pytest.raises(TypeError, match="unexpected keyword argument '_verified_covered_instruments'"):
+        CorporateActionEvidenceIdentity(
+            source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="f" * 64,
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 6, 30),
+            covered_instruments=("NSE_EQ|INE002A01018",),
+            _verified_covered_instruments=("NSE_EQ|INE002A01018",),  # type: ignore[call-arg]
+        )
+
+    # 2. Construct forged identity manually with complete=True, fake fingerprint, correct coverage,
+    # covered instruments, no blocking events, claiming authoritative=True
+    forged = CorporateActionEvidenceIdentity(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint="f" * 64,
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        events_count=0,
+        policy_identity="DEFAULT",
+        authoritative=True,
+    )
+
+    exp_forged = _sample_experiment(corporate_action_evidence=forged)
+
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    # Cannot pass promotion gate without trusted ledger
+    passed, violations = exp_forged.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("trusted corporate-action evidence ledger is required for promotion" in v for v in violations)
+
+    # Cannot pass promotion integrity check without trusted ledger
+    with pytest.raises(MissingEvidenceError, match="trusted corporate-action evidence ledger is required"):
+        exp_forged.validate_integrity(promotion_thresholds=thresholds)
+
+    # Cannot claim authoritative evidence without trusted ledger
+    with pytest.raises(MissingEvidenceError, match="trusted corporate-action evidence ledger is required"):
+        exp_forged.validate_integrity()
+
+    # Real ledger rejects forged claim
+    real_ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    real_ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    with pytest.raises(MissingEvidenceError, match="corporate-action evidence integrity mismatch"):
+        exp_forged.validate_integrity(trusted_corporate_action_ledger=real_ledger)
+
+
+def test_genuine_ledger_derived_claim_plus_same_ledger_passes_revalidation() -> None:
     ledger = PointInTimeCorporateActionLedger()
     ts = datetime(2026, 1, 1, tzinfo=UTC)
     ledger.add_coverage(
@@ -996,71 +1084,20 @@ def test_fix3_identity_trust_and_ledger_revalidation() -> None:
             is_complete=True,
         )
     )
-
-    # Legitimate ledger-derived identity
-    legit_identity = CorporateActionEvidenceIdentity.from_ledger(
+    claim = CorporateActionEvidenceIdentity.from_ledger(
         ledger,
         research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
         instruments=("NSE_EQ|INE002A01018",),
     )
-    assert legit_identity.is_authoritative is True
 
-    # Manually constructed identity is not authoritative
-    spoofed_identity = CorporateActionEvidenceIdentity(
-        source="NSE",
-        complete=True,
-        blocking_events=(),
-        evidence_fingerprint=legit_identity.evidence_fingerprint,
-        coverage_start=date(2026, 1, 1),
-        coverage_end=date(2026, 6, 30),
-        covered_instruments=("NSE_EQ|INE002A01018",),
-    )
-    assert spoofed_identity.is_authoritative is False
+    # Direct revalidation against same ledger
+    claim.validate_against_trusted_ledger(ledger)
 
-    # Experiment with spoofed identity and no ledger fails closed
-    exp_spoofed = _sample_experiment(corporate_action_evidence=spoofed_identity)
-    with pytest.raises(MissingEvidenceError, match="not authoritative"):
-        exp_spoofed.validate_integrity()
+    # Experiment integrity validation with same ledger passes
+    exp = _sample_experiment(corporate_action_evidence=claim)
+    exp.validate_integrity(trusted_corporate_action_ledger=ledger)
 
-    # Revalidation against trusted ledger passes for legitimate identity
-    exp_legit = _sample_experiment(corporate_action_evidence=legit_identity)
-    exp_legit.validate_integrity(corporate_action_ledger=ledger)
-
-    # Tampering with 7 dimensions in evidence identity when checked against trusted ledger:
-    # 1. Tampered fingerprint
-    tampered_fp_identity = CorporateActionEvidenceIdentity.from_ledger(
-        ledger,
-        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
-        instruments=("NSE_EQ|INE002A01018",),
-    )
-    object.__setattr__(tampered_fp_identity, "evidence_fingerprint", "fp_tampered")
-    exp_tampered_fp = _sample_experiment(corporate_action_evidence=tampered_fp_identity)
-    with pytest.raises(MissingEvidenceError, match="corporate-action ledger fingerprint mismatch"):
-        exp_tampered_fp.validate_integrity(corporate_action_ledger=ledger)
-
-    # 2. Tampered event count
-    tampered_count_identity = CorporateActionEvidenceIdentity.from_ledger(
-        ledger,
-        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
-        instruments=("NSE_EQ|INE002A01018",),
-    )
-    object.__setattr__(tampered_count_identity, "events_count", 999)
-    exp_tampered_count = _sample_experiment(corporate_action_evidence=tampered_count_identity)
-    with pytest.raises(MissingEvidenceError, match="corporate-action event count mismatch"):
-        exp_tampered_count.validate_integrity(corporate_action_ledger=ledger)
-
-    # 3. Tampered policy
-    tampered_policy_identity = CorporateActionEvidenceIdentity.from_ledger(
-        ledger,
-        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
-        instruments=("NSE_EQ|INE002A01018",),
-    )
-    object.__setattr__(tampered_policy_identity, "policy_identity", "tampered_policy")
-    exp_tampered_policy = _sample_experiment(corporate_action_evidence=tampered_policy_identity)
-    with pytest.raises(MissingEvidenceError, match="corporate-action policy identity mismatch"):
-        exp_tampered_policy.validate_integrity(corporate_action_ledger=ledger)
-
-    # Promotion gate fails closed on unauthoritative identity
+    # Promotion evaluation passes corporate action boundary with trusted ledger
     thresholds = PromotionThresholds(
         min_trades=100,
         min_profit_factor=Decimal("1.2"),
@@ -1068,9 +1105,281 @@ def test_fix3_identity_trust_and_ledger_revalidation() -> None:
         min_walk_forward_windows=1,
         max_cost_reconciliation_error_inr=Decimal("0.01"),
     )
-    passed, violations = exp_spoofed.evaluate_promotion_gate(thresholds)
+    passed, violations = exp.evaluate_promotion_gate(
+        thresholds,
+        trusted_corporate_action_ledger=ledger,
+    )
+    assert not any("corporate-action" in v for v in violations)
+
+
+def test_unrelated_ledger_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    claim = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+
+    unrelated_ledger = PointInTimeCorporateActionLedger()
+    unrelated_ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="UNRELATED_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+
+    with pytest.raises(CorporateActionMismatchError, match="evidence_fingerprint"):
+        claim.validate_against_trusted_ledger(unrelated_ledger)
+
+    exp = _sample_experiment(corporate_action_evidence=claim)
+    with pytest.raises(MissingEvidenceError, match="corporate-action evidence integrity mismatch"):
+        exp.validate_integrity(trusted_corporate_action_ledger=unrelated_ledger)
+
+
+def test_modified_event_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    claim = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+
+    # Modified ledger with added event
+    modified_ledger = PointInTimeCorporateActionLedger()
+    modified_ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    modified_ledger.add_record(
+        CorporateActionRecord(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            event_type=CorporateActionEventType.DIVIDEND,
+            effective_date=date(2026, 3, 1),
+            announcement_date=date(2026, 2, 1),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            amount=Decimal("5.0"),
+        )
+    )
+
+    with pytest.raises(CorporateActionMismatchError, match="evidence_fingerprint"):
+        claim.validate_against_trusted_ledger(modified_ledger)
+
+
+def test_modified_coverage_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    claim = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+
+    forged_start = replace(claim, coverage_start=date(2026, 1, 2))
+    with pytest.raises(CorporateActionMismatchError, match="coverage_start"):
+        forged_start.validate_against_trusted_ledger(ledger, research_start=date(2026, 1, 1))
+
+    forged_end = replace(claim, coverage_end=date(2026, 6, 29))
+    with pytest.raises(CorporateActionMismatchError, match="coverage_end"):
+        forged_end.validate_against_trusted_ledger(ledger, research_end=date(2026, 6, 30))
+
+
+def test_changed_policy_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    claim = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+
+    forged = replace(claim, policy_identity="TAMPERED_POLICY")
+    with pytest.raises(CorporateActionMismatchError, match="policy_identity"):
+        forged.validate_against_trusted_ledger(ledger)
+
+
+def test_partial_instruments_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    for inst, isin in [("NSE_EQ|INE001A01010", "INE001A01010"), ("NSE_EQ|INE002A01018", "INE002A01018")]:
+        ledger.add_coverage(
+            CoverageScope(
+                instrument_key=inst,
+                isin=isin,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 6, 30),
+                source="NSE_FEED",
+                retrieval_timestamp=ts,
+                is_complete=True,
+            )
+        )
+
+    claim_partial = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    with pytest.raises(CorporateActionMismatchError, match="covered_instruments"):
+        claim_partial.validate_against_trusted_ledger(
+            ledger,
+            canonical_instruments=("NSE_EQ|INE001A01010", "NSE_EQ|INE002A01018"),
+        )
+
+
+def test_extra_instruments_rejected() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    for inst, isin in [("NSE_EQ|INE001A01010", "INE001A01010"), ("NSE_EQ|INE002A01018", "INE002A01018")]:
+        ledger.add_coverage(
+            CoverageScope(
+                instrument_key=inst,
+                isin=isin,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 6, 30),
+                source="NSE_FEED",
+                retrieval_timestamp=ts,
+                is_complete=True,
+            )
+        )
+
+    claim_both = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE001A01010", "NSE_EQ|INE002A01018"),
+    )
+    with pytest.raises(CorporateActionMismatchError, match="covered_instruments"):
+        claim_both.validate_against_trusted_ledger(
+            ledger,
+            canonical_instruments=("NSE_EQ|INE002A01018",),
+        )
+
+
+def test_missing_trusted_ledger_blocks_promotion() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    claim = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    exp = _sample_experiment(corporate_action_evidence=claim)
+
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+    passed, violations = exp.evaluate_promotion_gate(thresholds, trusted_corporate_action_ledger=None)
     assert passed is False
-    assert any("not verified authoritative" in v for v in violations)
+    assert any("trusted corporate-action evidence ledger is required for promotion" in v for v in violations)
+
+
+def test_non_authoritative_claim_allowed_in_research_artifact_but_blocks_promotion() -> None:
+    non_auth_claim = CorporateActionEvidenceIdentity(
+        source="CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint="fp_claim_001",
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        events_count=0,
+        policy_identity="DEFAULT",
+        authoritative=False,
+    )
+    exp = _sample_experiment(corporate_action_evidence=non_auth_claim)
+
+    # Research artifact carries non-authoritative claim and passes integrity validation
+    exp.validate_integrity()
+
+    # But cannot pass promotion
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+    passed, violations = exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("trusted corporate-action evidence ledger is required for promotion" in v for v in violations)
+    assert any("corporate-action evidence is non-authoritative claim" in v for v in violations)
+
+    # And cannot pass promotion integrity check
+    with pytest.raises(MissingEvidenceError, match="experiment failed promotion gate criteria"):
+        exp.validate_integrity(promotion_thresholds=thresholds)
 
 
 def test_fix4_exact_instrument_coverage_enforcement() -> None:

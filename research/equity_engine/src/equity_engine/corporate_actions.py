@@ -987,6 +987,5 @@ class PointInTimeCorporateActionLedger:
             covered_instruments=instrument_list,
             events_count=events_count,
             policy_identity=effective_policy.policy_identity,
-            _verified_ledger_fingerprint=self.fingerprint(),
-            _verified_covered_instruments=instrument_list,
+            authoritative=True,
         )
