@@ -120,11 +120,58 @@ def _thresholds_dict(thresholds: ResearchUniverseThresholds) -> dict[str, object
         "min_median_daily_notional_proxy_rupees": _decimal_text(
             thresholds.min_median_daily_notional_proxy_rupees
         ),
-        "min_median_daily_volume_shares": _decimal_text(
-            thresholds.min_median_daily_volume_shares
-        ),
+        "min_median_daily_volume_shares": _decimal_text(thresholds.min_median_daily_volume_shares),
         "min_observed_trading_days": thresholds.min_observed_trading_days,
     }
+
+
+def prior_completed_trading_session(
+    selection_cutoff: date, trading_dates: tuple[date, ...]
+) -> date:
+    """Return the exact previous sourced normal trading session strictly before cutoff.
+
+    Never infers from ``timestamp <= midnight`` alone. Daily candles timestamped
+    at midnight for date T contain T's completed close, so T must never supply a
+    decision made on T. Monday resolves to Friday (or the previous actual trading
+    session); a holiday-following session resolves to the previous actual trading
+    session. Fails closed when no prior session exists (for example a new listing
+    whose first eligible date is the cutoff itself).
+    """
+    prior: date | None = None
+    for trading_date in trading_dates:
+        if trading_date < selection_cutoff and (prior is None or trading_date > prior):
+            prior = trading_date
+    if prior is None:
+        raise PITAcquisitionError(
+            f"no prior completed trading session exists before {selection_cutoff.isoformat()}; "
+            "reference price is unknown and must not use the current day close"
+        )
+    return prior
+
+
+def _prior_session_close(
+    frame: pd.DataFrame, prior_session: date, *, instrument_key: str
+) -> tuple[Decimal, pd.Timestamp]:
+    """Return the close of the exact prior session date, failing closed if absent.
+
+    Selects rows by trading ``date == prior_session`` only. A daily candle
+    timestamped ``T 00:00 Asia/Kolkata`` belongs to date T and must never satisfy
+    a decision with ``selection_cutoff == T``.
+    """
+    session_rows = frame.loc[[ts.date() == prior_session for ts in frame.index]]
+    if session_rows.empty:
+        raise PITAcquisitionError(
+            f"no Stage-A daily observation for prior completed session "
+            f"{prior_session.isoformat()} for {instrument_key}; fail closed"
+        )
+    reference_timestamp = session_rows.index[-1]
+    try:
+        reference_price = Decimal(str(session_rows.iloc[-1]["close"]))
+    except (InvalidOperation, ValueError, KeyError) as exc:
+        raise PITAcquisitionError(
+            f"reference price is invalid for {instrument_key} on {prior_session.isoformat()}"
+        ) from exc
+    return reference_price, reference_timestamp
 
 
 @dataclass(frozen=True)
@@ -322,7 +369,9 @@ def load_pit_universe_source(manifest_path: Path) -> PITUniverseSource:
         )
 
     try:
-        trading_dates = tuple(date.fromisoformat(str(item)) for item in calendar["normal_trading_dates"])
+        trading_dates = tuple(
+            date.fromisoformat(str(item)) for item in calendar["normal_trading_dates"]
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise IncompleteUniverseManifestError(
             "NSE universe manifest has no valid normal trading-date list"
@@ -339,7 +388,9 @@ def load_pit_universe_source(manifest_path: Path) -> PITUniverseSource:
         try:
             report_date = date.fromisoformat(str(raw_day["report_date"]))
         except (KeyError, TypeError, ValueError) as exc:
-            raise IncompleteUniverseManifestError("NSE universe day has invalid report_date") from exc
+            raise IncompleteUniverseManifestError(
+                "NSE universe day has invalid report_date"
+            ) from exc
         if report_date in day_by_date:
             raise IncompleteUniverseManifestError(f"duplicate NSE universe date {report_date}")
         day_by_date[report_date] = raw_day
@@ -498,8 +549,7 @@ class PITHistoricalRequest:
             "start": self.start.isoformat(),
             "symbol": self.symbol,
             "symbol_by_date": [
-                {"date": day.isoformat(), "symbol": symbol}
-                for day, symbol in self.symbol_by_date
+                {"date": day.isoformat(), "symbol": symbol} for day, symbol in self.symbol_by_date
             ],
         }
 
@@ -613,7 +663,17 @@ def build_stage_a_plan(
     for key, memberships in sorted(eligible_by_key.items()):
         memberships.sort(key=lambda item: item.trade_date)
         first_date = memberships[0].trade_date
-        request_start = first_date - pd.Timedelta(days=lookback_calendar_days)
+        # Locate the download start from the actual sourced normal trading
+        # sessions, never from naive calendar-day subtraction. A Monday first
+        # date with a 1-day lookback must reach Friday, not Sunday.
+        try:
+            first_index = source.trading_dates.index(first_date)
+        except ValueError as exc:
+            raise PITAcquisitionError(
+                f"first eligible date {first_date.isoformat()} for {key} is not a "
+                "sourced normal trading session"
+            ) from exc
+        request_start: date = source.trading_dates[max(0, first_index - lookback_calendar_days)]
         if request_start < SUPPORTED_PRICE_DATA_START:
             raise PITAcquisitionError(
                 f"Stage A price lookback for {key} precedes supported Upstox history"
@@ -629,12 +689,16 @@ def build_stage_a_plan(
             )
         )
     if not candidates:
-        raise PITAcquisitionError("source universe has no eligible candidates in requested boundary")
+        raise PITAcquisitionError(
+            "source universe has no eligible candidates in requested boundary"
+        )
     estimated_requests = sum(
         historical_request_count(start=item.start, end=item.end, interval="daily")
         for item in candidates
     )
-    estimated_rows = sum(len(item.eligible_dates) for item in candidates) * estimated_rows_per_trading_day
+    estimated_rows = (
+        sum(len(item.eligible_dates) for item in candidates) * estimated_rows_per_trading_day
+    )
     return StageAPlan(
         boundary=boundary,
         source=source,
@@ -684,6 +748,8 @@ class StageAPrefilterDecision:
     entry_charges_rupees: Decimal | None
     median_daily_notional_proxy_rupees: Decimal | None
     median_daily_volume_shares: Decimal | None
+    evidence_as_of: pd.Timestamp | None = None
+    prior_completed_session: date | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -692,12 +758,20 @@ class StageAPrefilterDecision:
             "daily_dataset_fingerprint": self.daily_dataset_fingerprint,
             "eligible": self.eligible,
             "entry_charges_rupees": _decimal_text(self.entry_charges_rupees),
+            "evidence_as_of": (
+                self.evidence_as_of.isoformat() if self.evidence_as_of is not None else None
+            ),
             "instrument_key": self.instrument_key,
             "median_daily_notional_proxy_rupees": _decimal_text(
                 self.median_daily_notional_proxy_rupees
             ),
             "median_daily_volume_shares": _decimal_text(self.median_daily_volume_shares),
             "observed_trading_days": self.observed_trading_days,
+            "prior_completed_session": (
+                self.prior_completed_session.isoformat()
+                if self.prior_completed_session is not None
+                else None
+            ),
             "reasons": list(self.reasons),
             "reference_price_rupees": _decimal_text(self.reference_price_rupees),
             "reference_price_timestamp": (
@@ -794,6 +868,8 @@ def _prefilter_rejection(
     entry_charges: Decimal | None = None,
     notional_proxy: Decimal | None = None,
     volume: Decimal | None = None,
+    evidence_as_of: pd.Timestamp | None = None,
+    prior_completed_session: date | None = None,
 ) -> StageAPrefilterDecision:
     return StageAPrefilterDecision(
         instrument_key=key,
@@ -809,6 +885,8 @@ def _prefilter_rejection(
         entry_charges_rupees=entry_charges,
         median_daily_notional_proxy_rupees=notional_proxy,
         median_daily_volume_shares=volume,
+        evidence_as_of=evidence_as_of,
+        prior_completed_session=prior_completed_session,
     )
 
 
@@ -834,8 +912,16 @@ def build_stage_a_prefilter(
     else:
         selection_as_of = pd.Timestamp(selection_as_of)
         if selection_as_of.tzinfo is None or selection_as_of > cutoff_timestamp:
-            raise ValueError("selection_as_of must be timezone-aware and not after the price cutoff")
-    effective_cutoff = selection_as_of
+            raise ValueError(
+                "selection_as_of must be timezone-aware and not after the price cutoff"
+            )
+
+    try:
+        calendar_prior_session: date | None = prior_completed_trading_session(
+            selection_cutoff, stage_a_plan.source.trading_dates
+        )
+    except PITAcquisitionError:
+        calendar_prior_session = None
 
     decisions: list[StageAPrefilterDecision] = []
     failures: list[str] = []
@@ -843,6 +929,7 @@ def build_stage_a_prefilter(
         key = candidate.instrument_key
         fingerprint = daily_dataset_fingerprints.get(key)
         frame = daily_frames.get(key)
+        symbol_by_date = dict(candidate.symbol_by_date)
         if not fingerprint or frame is None:
             reason = f"missing Stage-A daily data or fingerprint for {key}"
             failures.append(reason)
@@ -852,6 +939,8 @@ def build_stage_a_prefilter(
                     symbol=candidate.symbol,
                     fingerprint=fingerprint,
                     reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
@@ -860,7 +949,12 @@ def build_stage_a_prefilter(
             failures.append(reason)
             decisions.append(
                 _prefilter_rejection(
-                    key=key, symbol=candidate.symbol, fingerprint=fingerprint, reasons=[reason]
+                    key=key,
+                    symbol=candidate.symbol,
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
@@ -870,22 +964,33 @@ def build_stage_a_prefilter(
             failures.append(reason)
             decisions.append(
                 _prefilter_rejection(
-                    key=key, symbol=candidate.symbol, fingerprint=fingerprint, reasons=[reason]
+                    key=key,
+                    symbol=candidate.symbol,
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
 
-        before_cutoff = frame.loc[frame.index <= effective_cutoff]
+        # Strict PIT history: only trading dates strictly before the formation
+        # cutoff. A daily candle timestamped T 00:00 belongs to date T and must
+        # never inform a decision with selection_cutoff == T.
+        history_frame = frame.loc[[ts.date() < selection_cutoff for ts in frame.index]]
         if stage_a_plan.formation_policy.price_reference_policy == "prior_completed_session_close":
-            expected_dates = tuple(day for day in candidate.eligible_dates if day < selection_cutoff)
+            expected_dates = tuple(
+                day for day in candidate.eligible_dates if day < selection_cutoff
+            )
         else:
-            expected_dates = tuple(day for day in candidate.eligible_dates if day <= selection_cutoff)
-        observed_dates = set(before_cutoff.index.date)
+            expected_dates = tuple(
+                day for day in candidate.eligible_dates if day <= selection_cutoff
+            )
+        observed_dates = set(history_frame.index.date)
         missing_dates = tuple(day for day in expected_dates if day not in observed_dates)
         if missing_dates:
-            reason = (
-                f"missing Stage-A daily observations for {key}: "
-                + ", ".join(day.isoformat() for day in missing_dates)
+            reason = f"missing Stage-A daily observations for {key}: " + ", ".join(
+                day.isoformat() for day in missing_dates
             )
             failures.append(reason)
             decisions.append(
@@ -895,38 +1000,81 @@ def build_stage_a_prefilter(
                     fingerprint=fingerprint,
                     reasons=[reason],
                     observed_days=len(observed_dates.intersection(expected_dates)),
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
         if not expected_dates:
             reason = f"no point-in-time eligible membership date available by {selection_cutoff} for {key}"
-            failures.append(reason)
             decisions.append(
                 _prefilter_rejection(
-                    key=key, symbol=candidate.symbol, fingerprint=fingerprint, reasons=[reason]
+                    key=key,
+                    symbol=candidate.symbol,
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
 
-        reference_frame = before_cutoff
-        if reference_frame.empty:
+        if calendar_prior_session is None:
+            reason = (
+                f"no prior completed trading session exists before {selection_cutoff} for {key}; "
+                "reference price is unknown"
+            )
+            decisions.append(
+                _prefilter_rejection(
+                    key=key,
+                    symbol=candidate.symbol,
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=None,
+                )
+            )
+            continue
+        if calendar_prior_session not in set(expected_dates):
+            reason = (
+                f"no PIT eligible prior completed session {calendar_prior_session.isoformat()} "
+                f"for {key} by {selection_cutoff}; fail closed without using the current close"
+            )
+            decisions.append(
+                _prefilter_rejection(
+                    key=key,
+                    symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    observed_days=len(expected_dates),
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
+                )
+            )
+            continue
+
+        try:
+            reference_price, reference_timestamp = _prior_session_close(
+                frame, calendar_prior_session, instrument_key=key
+            )
+        except PITAcquisitionError as exc:
+            reason = str(exc)
+            failures.append(reason)
+            decisions.append(
+                _prefilter_rejection(
+                    key=key,
+                    symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
+                    fingerprint=fingerprint,
+                    reasons=[reason],
+                    observed_days=len(expected_dates),
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
+                )
+            )
+            continue
+
+        if history_frame.empty:
             reason = f"no Stage-A daily price is available by the formation cutoff for {key}"
-            failures.append(reason)
-            decisions.append(
-                _prefilter_rejection(
-                    key=key, symbol=candidate.symbol, fingerprint=fingerprint, reasons=[reason]
-                )
-            )
-            continue
-
-        expected_date_set = set(expected_dates)
-        eligible_frame = before_cutoff.loc[
-            [timestamp.date() in expected_date_set for timestamp in before_cutoff.index]
-        ]
-        reference_timestamp = reference_frame.index[-1]
-        reference_price = Decimal(str(reference_frame.iloc[-1]["close"]))
-        if not reference_price.is_finite() or reference_price <= 0:
-            reason = f"reference price is invalid for {key}"
             failures.append(reason)
             decisions.append(
                 _prefilter_rejection(
@@ -934,8 +1082,29 @@ def build_stage_a_prefilter(
                     symbol=candidate.symbol,
                     fingerprint=fingerprint,
                     reasons=[reason],
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
+                )
+            )
+            continue
+
+        expected_date_set = set(expected_dates)
+        eligible_frame = history_frame.loc[
+            [timestamp.date() in expected_date_set for timestamp in history_frame.index]
+        ]
+        if not reference_price.is_finite() or reference_price <= 0:
+            reason = f"reference price is invalid for {key}"
+            failures.append(reason)
+            decisions.append(
+                _prefilter_rejection(
+                    key=key,
+                    symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
+                    fingerprint=fingerprint,
+                    reasons=[reason],
                     reference_price=reference_price,
                     reference_timestamp=reference_timestamp,
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
@@ -948,12 +1117,14 @@ def build_stage_a_prefilter(
             decisions.append(
                 _prefilter_rejection(
                     key=key,
-                    symbol=candidate.symbol,
+                    symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
                     fingerprint=fingerprint,
                     reasons=[reason],
                     reference_price=reference_price,
                     reference_timestamp=reference_timestamp,
                     observed_days=len(expected_dates),
+                    evidence_as_of=selection_as_of,
+                    prior_completed_session=calendar_prior_session,
                 )
             )
             continue
@@ -1002,7 +1173,7 @@ def build_stage_a_prefilter(
         decisions.append(
             StageAPrefilterDecision(
                 instrument_key=key,
-                symbol=candidate.symbol,
+                symbol=symbol_by_date.get(calendar_prior_session, candidate.symbol),
                 eligible=decision.eligible,
                 reasons=decision.violations,
                 daily_dataset_fingerprint=fingerprint,
@@ -1014,6 +1185,8 @@ def build_stage_a_prefilter(
                 entry_charges_rupees=affordability.entry_charges,
                 median_daily_notional_proxy_rupees=liquidity.median_daily_notional_proxy_rupees,
                 median_daily_volume_shares=liquidity.median_daily_volume_shares,
+                evidence_as_of=selection_as_of,
+                prior_completed_session=calendar_prior_session,
             )
         )
     return StageAPrefilterResult(
@@ -1028,6 +1201,45 @@ def build_stage_a_prefilter(
         cost_model_identity=stage_a_plan.cost_model_identity,
         decisions=tuple(sorted(decisions, key=lambda item: item.instrument_key)),
         failures=tuple(sorted(failures)),
+    )
+
+
+def build_stage_a_prefilter_timeline(
+    *,
+    stage_a_plan: StageAPlan,
+    daily_frames: Mapping[str, pd.DataFrame],
+    daily_dataset_fingerprints: Mapping[str, str],
+    tick_policies: Mapping[str, TickPolicy],
+    corporate_actions: Mapping[str, CorporateActionAssessment],
+    minimum_tradable_quantities: Mapping[str, int],
+    cost_provider: CostProvider,
+    selection_cutoffs: tuple[date, ...],
+) -> tuple[StageAPrefilterResult, ...]:
+    """Build deterministic window-scoped prefilters, each strictly point-in-time.
+
+    Every timeline entry may use only evidence available at or before its own
+    formation cutoff. The Stage-B union must be derived from this timeline, never
+    from a single final-day prefilter alone.
+    """
+    if not selection_cutoffs:
+        raise ValueError("selection_cutoffs must contain at least one window cutoff")
+    if tuple(sorted(set(selection_cutoffs))) != tuple(selection_cutoffs):
+        raise ValueError("selection_cutoffs must be sorted unique dates")
+    for cutoff in selection_cutoffs:
+        if not stage_a_plan.boundary.start <= cutoff <= stage_a_plan.boundary.end:
+            raise ValueError("every timeline cutoff must be inside the acquisition boundary")
+    return tuple(
+        build_stage_a_prefilter(
+            stage_a_plan=stage_a_plan,
+            daily_frames=daily_frames,
+            daily_dataset_fingerprints=daily_dataset_fingerprints,
+            tick_policies=tick_policies,
+            corporate_actions=corporate_actions,
+            minimum_tradable_quantities=minimum_tradable_quantities,
+            cost_provider=cost_provider,
+            selection_cutoff=cutoff,
+        )
+        for cutoff in selection_cutoffs
     )
 
 
@@ -1050,6 +1262,8 @@ class StageBPlan:
     estimated_requests: int
     estimated_rows: int
     estimated_storage_bytes: int
+    timeline_cutoffs: tuple[date, ...] = ()
+    timeline_prefilter_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_capital(self.approved_capital_rupees)
@@ -1088,6 +1302,8 @@ class StageBPlan:
             "source_manifest_sha256": self.source_manifest_sha256,
             "stage_a_plan_fingerprint": self.stage_a_plan_fingerprint,
             "thresholds": _thresholds_dict(self.thresholds),
+            "timeline_cutoffs": [item.isoformat() for item in self.timeline_cutoffs],
+            "timeline_prefilter_fingerprints": list(self.timeline_prefilter_fingerprints),
             "universe_rule_version": self.universe_rule_version,
         }
 
@@ -1132,19 +1348,27 @@ def build_stage_b_plan(
     estimated_bytes_per_row: int,
     rate_limit: AcquisitionRateLimit,
 ) -> StageBPlan:
-    """Create Stage B only from a complete, cryptographically bound Stage-A result."""
+    """Create Stage B only from a complete, cryptographically bound Stage-A result.
+
+    A single-prefilter plan covers exactly that prefilter's point-in-time cutoff.
+    Multi-window research must use :func:`build_stage_b_plan_from_timeline` so the
+    acquisition population is the union across window cutoffs instead of the final
+    day alone.
+    """
 
     if not prefilter.complete:
         raise IncompletePrefilterError("Stage B is blocked until Stage-A prefilter is complete")
     if prefilter.stage_a_plan_fingerprint != stage_a_plan.fingerprint:
         raise IncompletePrefilterError("prefilter is not bound to the supplied Stage-A plan")
     if prefilter.source_manifest_sha256 != stage_a_plan.source.manifest_sha256:
-        raise IncompletePrefilterError("prefilter source universe fingerprint does not match Stage A")
+        raise IncompletePrefilterError(
+            "prefilter source universe fingerprint does not match Stage A"
+        )
     if prefilter.approved_capital_rupees != stage_a_plan.approved_capital_rupees:
         raise IncompletePrefilterError("prefilter approved capital differs from Stage A")
-    if prefilter.selection_cutoff != stage_a_plan.boundary.end:
+    if not stage_a_plan.boundary.start <= prefilter.selection_cutoff <= stage_a_plan.boundary.end:
         raise IncompletePrefilterError(
-            "Stage B requires a prefilter covering the complete requested acquisition boundary"
+            "Stage B prefilter cutoff must lie inside the requested acquisition boundary"
         )
     if interval_minutes != 5:
         raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
@@ -1160,7 +1384,9 @@ def build_stage_b_plan(
             raise IncompletePrefilterError(
                 f"prefilter contains an instrument absent from Stage A: {decision.instrument_key}"
             )
-        dates = tuple(day for day in source_candidate.eligible_dates if day <= prefilter.selection_cutoff)
+        dates = tuple(
+            day for day in source_candidate.eligible_dates if day <= prefilter.selection_cutoff
+        )
         candidates.append(
             HistoricalBatchCandidate(
                 instrument_key=decision.instrument_key,
@@ -1200,6 +1426,130 @@ def build_stage_b_plan(
         estimated_requests=plan.estimated_requests,
         estimated_rows=plan.estimated_rows or 0,
         estimated_storage_bytes=plan.estimated_storage_bytes or 0,
+        timeline_cutoffs=(prefilter.selection_cutoff,),
+        timeline_prefilter_fingerprints=(prefilter.fingerprint,),
+    )
+
+
+def build_stage_b_plan_from_timeline(
+    *,
+    stage_a_plan: StageAPlan,
+    prefilters: tuple[StageAPrefilterResult, ...],
+    interval_minutes: int,
+    expected_rows_per_trading_day: int,
+    estimated_bytes_per_row: int,
+    rate_limit: AcquisitionRateLimit,
+) -> StageBPlan:
+    """Create Stage B as the union of point-in-time eligible stocks/ranges.
+
+    Each timeline prefilter covers one immutable research window cutoff using only
+    evidence at or before that cutoff. The acquisition population is the union
+    across all cutoffs: a stock eligible in an early window remains acquired for
+    that early window even when it is later delisted, illiquid, or renamed. This
+    must not degenerate to stocks passing on the final day alone.
+    """
+    if not prefilters:
+        raise IncompletePrefilterError("Stage B timeline requires at least one prefilter")
+    cutoffs = tuple(item.selection_cutoff for item in prefilters)
+    if tuple(sorted(set(cutoffs))) != cutoffs:
+        raise IncompletePrefilterError("timeline cutoffs must be sorted unique dates")
+    for prefilter in prefilters:
+        if not prefilter.complete:
+            raise IncompletePrefilterError(
+                "Stage B timeline is blocked until every window prefilter is complete"
+            )
+        if prefilter.stage_a_plan_fingerprint != stage_a_plan.fingerprint:
+            raise IncompletePrefilterError("timeline prefilter is not bound to Stage-A plan")
+        if prefilter.source_manifest_sha256 != stage_a_plan.source.manifest_sha256:
+            raise IncompletePrefilterError("timeline prefilter source fingerprint mismatch")
+        if prefilter.approved_capital_rupees != stage_a_plan.approved_capital_rupees:
+            raise IncompletePrefilterError("timeline prefilter approved capital mismatch")
+        if (
+            not stage_a_plan.boundary.start
+            <= prefilter.selection_cutoff
+            <= stage_a_plan.boundary.end
+        ):
+            raise IncompletePrefilterError("timeline cutoff must lie inside the boundary")
+    if interval_minutes != 5:
+        raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
+
+    date_by_key = {item.instrument_key: item for item in stage_a_plan.candidates}
+    covered: dict[str, list[StageAPrefilterResult]] = {}
+    for prefilter in prefilters:
+        for decision in prefilter.decisions:
+            if decision.eligible:
+                covered.setdefault(decision.instrument_key, []).append(prefilter)
+    if not covered:
+        raise IncompletePrefilterError("timeline prefilters produced no eligible candidates")
+
+    candidates: list[HistoricalBatchCandidate] = []
+    trading_day_counts: dict[str, int] = {}
+    latest_symbol: dict[str, tuple[date, str]] = {}
+    for key in sorted(covered):
+        source_candidate = date_by_key.get(key)
+        if source_candidate is None:
+            raise IncompletePrefilterError(
+                f"timeline prefilter contains an instrument absent from Stage A: {key}"
+            )
+        max_covered_cutoff = max(item.selection_cutoff for item in covered[key])
+        union_dates = tuple(
+            day for day in source_candidate.eligible_dates if day <= max_covered_cutoff
+        )
+        if not union_dates:
+            raise IncompletePrefilterError(f"no eligible dates covered for {key}")
+        for prefilter in covered[key]:
+            for decision in prefilter.decisions:
+                if decision.instrument_key == key and decision.eligible:
+                    current = latest_symbol.get(key)
+                    if current is None or prefilter.selection_cutoff >= current[0]:
+                        latest_symbol[key] = (prefilter.selection_cutoff, decision.symbol)
+        symbol = latest_symbol[key][1]
+        candidates.append(
+            HistoricalBatchCandidate(
+                instrument_key=key,
+                symbol=symbol,
+                start=min(union_dates),
+                end=max(union_dates),
+            )
+        )
+        trading_day_counts[key] = len(union_dates)
+    candidates.sort(key=lambda item: item.instrument_key)
+    plan = plan_historical_batch(
+        candidates=candidates,
+        interval_minutes=interval_minutes,
+        resolution="minutes",
+        expected_rows_per_trading_day=expected_rows_per_trading_day,
+        estimated_bytes_per_row=estimated_bytes_per_row,
+        trading_day_counts=trading_day_counts,
+        affordability_prefilter_applied=True,
+    )
+    timeline_fingerprints = tuple(item.fingerprint for item in prefilters)
+    if len(timeline_fingerprints) == 1:
+        combined_fingerprint = timeline_fingerprints[0]
+    else:
+        combined_fingerprint = _fingerprint(
+            {"timeline_prefilter_fingerprints": list(timeline_fingerprints)}
+        )
+    return StageBPlan(
+        boundary=stage_a_plan.boundary,
+        source_manifest_sha256=stage_a_plan.source.manifest_sha256,
+        stage_a_plan_fingerprint=stage_a_plan.fingerprint,
+        prefilter_fingerprint=combined_fingerprint,
+        candidates=tuple(candidates),
+        interval_minutes=interval_minutes,
+        expected_rows_per_trading_day=expected_rows_per_trading_day,
+        estimated_bytes_per_row=estimated_bytes_per_row,
+        approved_capital_rupees=stage_a_plan.approved_capital_rupees,
+        thresholds=stage_a_plan.thresholds,
+        formation_policy=stage_a_plan.formation_policy,
+        rate_limit=rate_limit,
+        universe_rule_version=stage_a_plan.universe_rule_version,
+        adjustment_policy=stage_a_plan.adjustment_policy,
+        estimated_requests=plan.estimated_requests,
+        estimated_rows=plan.estimated_rows or 0,
+        estimated_storage_bytes=plan.estimated_storage_bytes or 0,
+        timeline_cutoffs=cutoffs,
+        timeline_prefilter_fingerprints=timeline_fingerprints,
     )
 
 
