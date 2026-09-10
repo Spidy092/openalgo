@@ -23,7 +23,6 @@ from typing import Any
 
 import pandas as pd
 import pytest
-
 from equity_engine.cost_ledger import INCOMPLETE_LABEL, EffectiveDatedCostLedger, LedgerProduct
 from equity_engine.experiment import (
     EXPERIMENT_SCHEMA_VERSION,
@@ -260,6 +259,9 @@ def baseline_experiment() -> ExperimentArtifact:
             complete=True,
             blocking_events=(),
             evidence_fingerprint="sha256_ca_evidence_001",
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 6, 30),
+            covered_instruments=("NSE_EQ|INE002A01018",),
         ),
         cost_model_identity=CostModelIdentity(
             model_name="documented",

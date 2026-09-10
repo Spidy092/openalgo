@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
 import pandas as pd
 
@@ -23,8 +24,8 @@ from .historical_membership import (
     HistoricalTradingEligibilityPolicy,
     filter_frame_to_eligible_dates,
 )
-from .models import Exchange
 from .market_sessions import filter_to_continuous_session
+from .models import Exchange
 from .tick_size import assess_tick_policy_coverage
 from .tournament import CandidateEvaluation, RankingMetric, evaluate_candidate_exact
 from .universe import CorporateActionAssessment
@@ -48,6 +49,31 @@ class DatedCorporateActionEvidence:
             )
         if not self.source.strip():
             raise ValueError("corporate-action evidence source is required")
+
+    @classmethod
+    def from_ledger(
+        cls,
+        ledger: Any,
+        *,
+        instrument_key: str,
+        window_start: date,
+        window_end: date,
+        policy: Any = None,
+        source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+    ) -> DatedCorporateActionEvidence:
+        """Derive dated evidence directly from the canonical corporate action ledger."""
+        assessment = ledger.assess_window(
+            instrument_key,
+            window_start,
+            window_end,
+            policy=policy,
+        )
+        return cls(
+            window_start=window_start,
+            window_end=window_end,
+            assessment=assessment,
+            source=source,
+        )
 
 
 @dataclass(frozen=True)

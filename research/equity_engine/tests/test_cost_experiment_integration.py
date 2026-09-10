@@ -9,7 +9,6 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
-
 from equity_engine.cost_ledger import (
     ACCOUNT_SNAPSHOT_DATE,
     GST_RATE,
@@ -122,6 +121,9 @@ def _experiment(
             complete=True,
             blocking_events=(),
             evidence_fingerprint="corporate-action-fingerprint",
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 9, 8),
+            covered_instruments=("NSE_EQ|INE002A01018",),
         ),
         cost_model_identity=CostModelIdentity(
             model_name="documented",

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -242,20 +242,72 @@ class CorporateActionEvidenceIdentity:
     complete: bool
     blocking_events: tuple[str, ...]
     evidence_fingerprint: str
+    coverage_start: date | None = None
+    coverage_end: date | None = None
+    covered_instruments: tuple[str, ...] = ()
+    events_count: int = 0
+    policy_identity: str = "DEFAULT"
 
     def __post_init__(self) -> None:
         if not self.complete:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
+        if self.coverage_start is not None and self.coverage_end is not None:
+            if self.coverage_start > self.coverage_end:
+                raise ValueError("coverage_start must be on or before coverage_end")
+
+    def covers_window(self, start: date, end: date) -> bool:
+        if self.coverage_start is None or self.coverage_end is None:
+            return False
+        return self.coverage_start <= start and self.coverage_end >= end
+
+    @classmethod
+    def from_ledger(
+        cls,
+        ledger: Any,
+        *,
+        research_window: ResearchWindowConfig | Any,
+        instruments: Iterable[str] = (),
+        policy: Any = None,
+        source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
+    ) -> CorporateActionEvidenceIdentity:
+        start = (
+            research_window.start
+            if hasattr(research_window, "start")
+            else research_window[0]
+        )
+        end = (
+            research_window.end
+            if hasattr(research_window, "end")
+            else research_window[1]
+        )
+        return ledger.to_evidence_identity(
+            research_start=start,
+            research_end=end,
+            instruments=instruments,
+            policy=policy,
+            source=source,
+        )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "source": self.source,
             "complete": self.complete,
             "blocking_events": list(self.blocking_events),
             "evidence_fingerprint": self.evidence_fingerprint,
         }
+        if self.coverage_start is not None:
+            payload["coverage_start"] = self.coverage_start.isoformat()
+        if self.coverage_end is not None:
+            payload["coverage_end"] = self.coverage_end.isoformat()
+        if self.covered_instruments:
+            payload["covered_instruments"] = list(self.covered_instruments)
+        if self.events_count:
+            payload["events_count"] = self.events_count
+        if self.policy_identity != "DEFAULT":
+            payload["policy_identity"] = self.policy_identity
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1035,7 +1087,38 @@ class ExperimentArtifact:
                 "event-driven simulation evidence artifact is missing"
             )
 
-        # 5. Threshold evaluation if requested
+        # 5. Fail-closed corporate-action evidence verification
+        if not self.corporate_action_evidence.complete:
+            raise MissingEvidenceError("corporate-action evidence is incomplete")
+        if (
+            self.corporate_action_evidence.coverage_start is None
+            or self.corporate_action_evidence.coverage_end is None
+            or not self.corporate_action_evidence.covers_window(
+                self.research_window.start, self.research_window.end
+            )
+        ):
+            cov_start = (
+                self.corporate_action_evidence.coverage_start.isoformat()
+                if self.corporate_action_evidence.coverage_start
+                else "None"
+            )
+            cov_end = (
+                self.corporate_action_evidence.coverage_end.isoformat()
+                if self.corporate_action_evidence.coverage_end
+                else "None"
+            )
+            raise MissingEvidenceError(
+                "experiment cannot claim corporate-action-complete unless evidence covers "
+                f"exact research window [{self.research_window.start.isoformat()}, {self.research_window.end.isoformat()}]; "
+                f"got coverage [{cov_start}, {cov_end}]"
+            )
+        if self.corporate_action_evidence.blocking_events:
+            raise MissingEvidenceError(
+                "experiment has unresolved blocking corporate actions: "
+                + ", ".join(self.corporate_action_evidence.blocking_events)
+            )
+
+        # 6. Threshold evaluation if requested
         if promotion_thresholds is not None:
             passed, violations = self.evaluate_promotion_gate(promotion_thresholds)
             if not passed:
