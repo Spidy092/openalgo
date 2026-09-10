@@ -328,9 +328,29 @@ class ContinuousSessionResearchInput:
 
     frame: pd.DataFrame
     descriptor: ValidatedDatasetDescriptor
+    market_data_manifest: MarketDataManifest
+
+    def validate_integrity(self) -> None:
+        """Fail closed if the in-memory research frame changed after validation."""
+
+        try:
+            current_fingerprint = dataframe_fingerprint(self.frame, self.market_data_manifest)
+        except (TypeError, ValueError) as exc:
+            raise HandoffValidationError(
+                "in-memory research frame is no longer fingerprintable"
+            ) from exc
+        if current_fingerprint != self.descriptor.research_data_fingerprint:
+            raise HandoffValidationError("in-memory research frame changed after validation")
+
+    def frame_for_research(self) -> pd.DataFrame:
+        """Return a detached research copy only after integrity verification."""
+
+        self.validate_integrity()
+        return self.frame.copy(deep=True)
 
     @property
     def fingerprint(self) -> str:
+        self.validate_integrity()
         return self.descriptor.deterministic_fingerprint()
 
     @property
@@ -574,6 +594,7 @@ def build_continuous_session_research_input(
     return ContinuousSessionResearchInput(
         frame=continuous.copy(deep=True),
         descriptor=descriptor,
+        market_data_manifest=verified.artifact.market_data_manifest,
     )
 
 

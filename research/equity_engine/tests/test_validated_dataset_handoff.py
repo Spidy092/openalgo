@@ -152,6 +152,44 @@ def test_descriptor_claim_not_bound_to_verified_acquisition_fails_closed(tmp_pat
         )
 
 
+def test_research_input_integrity_succeeds_before_consumption(tmp_path: Path) -> None:
+    _, descriptor, research_input = _run(_artifact(tmp_path))
+
+    assert research_input.validate_integrity() is None
+    assert research_input.fingerprint == descriptor.deterministic_fingerprint()
+    detached = research_input.frame_for_research()
+    detached.iloc[0, detached.columns.get_loc("close")] += 1
+    assert research_input.validate_integrity() is None
+
+
+@pytest.mark.parametrize("mutation", ["row", "timestamp", "volume", "value"])
+def test_research_input_mutation_fails_integrity_and_trusted_access(
+    tmp_path: Path, mutation: str
+) -> None:
+    artifact = _artifact(tmp_path)
+    _, _, research_input = _run(artifact)
+    original_raw = artifact.raw_path.read_bytes()
+
+    if mutation == "row":
+        research_input.frame.drop(index=research_input.frame.index[0], inplace=True)
+    elif mutation == "timestamp":
+        changed_index = list(research_input.frame.index)
+        changed_index[0] = pd.Timestamp("2026-09-07 09:20", tz="Asia/Kolkata")
+        research_input.frame.index = pd.DatetimeIndex(changed_index)
+    elif mutation == "volume":
+        research_input.frame.iloc[0, research_input.frame.columns.get_loc("volume")] += 1
+    else:
+        research_input.frame.iloc[0, research_input.frame.columns.get_loc("close")] += 1
+
+    with pytest.raises(HandoffValidationError, match="changed after validation"):
+        research_input.validate_integrity()
+    with pytest.raises(HandoffValidationError, match="changed after validation"):
+        _ = research_input.fingerprint
+    with pytest.raises(HandoffValidationError, match="changed after validation"):
+        research_input.frame_for_research()
+    assert artifact.raw_path.read_bytes() == original_raw
+
+
 @pytest.mark.parametrize("status", [AcquisitionStatus.PARTIAL, AcquisitionStatus.FAILED])
 def test_non_complete_artifacts_fail_closed(tmp_path: Path, status: AcquisitionStatus) -> None:
     with pytest.raises(HandoffValidationError, match="not research-ready"):
