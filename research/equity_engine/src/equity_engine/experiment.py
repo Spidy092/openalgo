@@ -12,8 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +21,7 @@ import pandas as pd
 
 from .cost_ledger import (
     HISTORICAL_ACTUAL_LABEL,
+    INCOMPLETE_LABEL,
     SCENARIO_LABEL,
     SUPPORTED_RESEARCH_START,
     EffectiveDatedCostLedger,
@@ -37,6 +38,7 @@ EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v2"
 VECTORBT_RESEARCH_VERSION = "1.1.0"
 SIMULATOR_RESEARCH_VERSION = "openalgo-event-simulator-v1"
 DEFAULT_COST_EVIDENCE_POLICY = "effective-dated-cost-ledger/default-resolution/v1"
+COST_EVIDENCE_COVERAGE_SCHEMA_VERSION = "effective-dated-cost-evidence-coverage/v1"
 
 
 class ExperimentValidationError(ValueError):
@@ -57,6 +59,10 @@ class MissingEvidenceError(ExperimentValidationError):
 
 class CostEvidenceMismatchError(ExperimentValidationError):
     """Raised when a serialized cost-evidence claim disagrees with trusted evidence."""
+
+
+class CostEvidenceCoverageError(ExperimentValidationError):
+    """Raised when a cost-evidence coverage claim has a gap or ambiguity."""
 
 
 class DataLeakageError(ExperimentValidationError):
@@ -507,6 +513,284 @@ class CostEvidenceIdentity:
 
 
 @dataclass(frozen=True)
+class CostEvidenceRegimeIdentity:
+    """One inclusive effective-date interval in a window-level cost coverage claim."""
+
+    start: date
+    end: date
+    selected_record_ids: tuple[str, ...]
+    evidence_classification: str
+    historical_actual: bool
+    unknown_components: tuple[str, ...]
+    covered: bool
+
+    def __post_init__(self) -> None:
+        if self.start > self.end:
+            raise ValueError("cost evidence regime start must be on or before end")
+        if self.historical_actual and self.evidence_classification != HISTORICAL_ACTUAL_LABEL:
+            raise ValueError(
+                "historical actual regime must use HISTORICAL_ACTUAL_COSTS classification"
+            )
+        for record_id in self.selected_record_ids:
+            if len(record_id) != 64 or any(
+                character not in "0123456789abcdef" for character in record_id
+            ):
+                raise ValueError("selected cost record IDs must be hexadecimal SHA-256 digests")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "covered": self.covered,
+            "end": self.end.isoformat(),
+            "evidence_classification": self.evidence_classification,
+            "historical_actual": self.historical_actual,
+            "selected_record_ids": list(self.selected_record_ids),
+            "start": self.start.isoformat(),
+            "unknown_components": list(self.unknown_components),
+        }
+
+
+@dataclass(frozen=True)
+class CostEvidenceCoverageIdentity:
+    """Immutable, date-scoped cost evidence coverage for an entire research window."""
+
+    schema_version: str
+    research_start: date
+    research_end: date
+    ledger_schema_version: str
+    ledger_fingerprint: str
+    product_scope: str
+    evidence_mode: str
+    policy_identity: str
+    scenario_identity: str | None
+    regimes: tuple[CostEvidenceRegimeIdentity, ...]
+    coverage_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if self.research_start > self.research_end:
+            raise ValueError("cost evidence coverage start must be on or before end")
+        if not self.schema_version.strip():
+            raise ValueError("cost evidence coverage schema version is required")
+        if not self.ledger_schema_version.strip():
+            raise ValueError("cost evidence coverage ledger schema version is required")
+        if len(self.ledger_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.ledger_fingerprint
+        ):
+            raise ValueError("cost evidence coverage ledger fingerprint must be hexadecimal")
+        if not self.product_scope.strip():
+            raise ValueError("cost evidence coverage product scope is required")
+        if not self.evidence_mode.strip() or not self.policy_identity.strip():
+            raise ValueError("cost evidence coverage mode and policy are required")
+        if not self.regimes:
+            raise ValueError("cost evidence coverage requires at least one regime")
+        if len(self.coverage_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.coverage_fingerprint
+        ):
+            raise ValueError("coverage_fingerprint must be a hexadecimal digest")
+        if self.regimes[0].start != self.research_start:
+            raise ValueError("cost evidence regimes must begin at research_start")
+        if self.regimes[-1].end != self.research_end:
+            raise ValueError("cost evidence regimes must end at research_end")
+        for previous, current in zip(self.regimes, self.regimes[1:]):
+            if current.start != previous.end + timedelta(days=1):
+                raise ValueError("cost evidence regimes must be ordered and gap-free")
+
+    @property
+    def historical_actual(self) -> bool:
+        """Return true only when every covered regime has complete actual evidence."""
+
+        return bool(self.regimes) and all(
+            regime.covered
+            and regime.historical_actual
+            and regime.evidence_classification == HISTORICAL_ACTUAL_LABEL
+            and not regime.unknown_components
+            for regime in self.regimes
+        )
+
+    @property
+    def evidence_classification(self) -> str:
+        if self.historical_actual:
+            return HISTORICAL_ACTUAL_LABEL
+        if self.evidence_mode == "public_scenario":
+            return SCENARIO_LABEL
+        return INCOMPLETE_LABEL
+
+    def _fingerprint_payload(self) -> dict[str, Any]:
+        return {
+            "evidence_classification": self.evidence_classification,
+            "evidence_mode": self.evidence_mode,
+            "historical_actual": self.historical_actual,
+            "ledger_fingerprint": self.ledger_fingerprint,
+            "ledger_schema_version": self.ledger_schema_version,
+            "policy_identity": self.policy_identity,
+            "product_scope": self.product_scope,
+            "research_end": self.research_end.isoformat(),
+            "research_start": self.research_start.isoformat(),
+            "scenario_identity": self.scenario_identity,
+            "schema_version": self.schema_version,
+            "regimes": [regime.as_dict() for regime in self.regimes],
+        }
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = self._fingerprint_payload()
+        payload["coverage_fingerprint"] = self.coverage_fingerprint
+        return payload
+
+    def resolve_for_date(self, on_date: date) -> CostEvidenceRegimeIdentity:
+        """Resolve exactly one covered regime or fail closed."""
+
+        matches = [
+            regime for regime in self.regimes if regime.start <= on_date <= regime.end
+        ]
+        if len(matches) != 1:
+            raise CostEvidenceCoverageError(
+                f"cost evidence date {on_date.isoformat()} resolves to {len(matches)} regimes"
+            )
+        regime = matches[0]
+        if not regime.covered:
+            raise CostEvidenceCoverageError(
+                f"cost evidence date {on_date.isoformat()} is not covered by valid evidence"
+            )
+        return regime
+
+    @classmethod
+    def from_ledger(
+        cls,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        research_start: date,
+        research_end: date,
+        product: LedgerProduct,
+        evidence_mode: str = "historical_resolution",
+        policy_identity: str = DEFAULT_COST_EVIDENCE_POLICY,
+        scenario_identity: str | None = None,
+    ) -> CostEvidenceCoverageIdentity:
+        """Derive compact effective-date coverage without iterating calendar days."""
+
+        if evidence_mode != "historical_resolution":
+            raise ValueError(
+                "window coverage currently supports only historical_resolution evidence mode"
+            )
+        if research_start < SUPPORTED_RESEARCH_START:
+            raise UnsupportedResearchDate(
+                "cost evidence coverage cannot precede the supported research boundary"
+            )
+        if research_start > research_end:
+            raise ValueError("cost evidence coverage start must be on or before end")
+        boundaries = {research_start, research_end + timedelta(days=1)}
+        for record in ledger.records:
+            if record.effective_from <= research_end and (
+                record.effective_to is None or record.effective_to >= research_start
+            ):
+                if research_start < record.effective_from <= research_end:
+                    boundaries.add(record.effective_from)
+                if record.effective_to is not None and research_start <= record.effective_to < research_end:
+                    boundaries.add(record.effective_to + timedelta(days=1))
+
+        ordered_boundaries = sorted(boundaries)
+        regimes: list[CostEvidenceRegimeIdentity] = []
+        for start, next_boundary in zip(ordered_boundaries, ordered_boundaries[1:]):
+            end = next_boundary - timedelta(days=1)
+            assessment = ledger.describe(start, product)
+            regimes.append(
+                CostEvidenceRegimeIdentity(
+                    start=start,
+                    end=end,
+                    selected_record_ids=tuple(
+                        sorted({_record_identity(record) for record in assessment.records})
+                    ),
+                    evidence_classification=assessment.classification,
+                    historical_actual=assessment.historical_actual,
+                    unknown_components=tuple(sorted(set(assessment.unknowns))),
+                    covered=not any("no record covers" in item for item in assessment.unknowns),
+                )
+            )
+
+        compacted: list[CostEvidenceRegimeIdentity] = []
+
+        def regime_semantics(regime: CostEvidenceRegimeIdentity) -> tuple[Any, ...]:
+            return (
+                regime.selected_record_ids,
+                regime.evidence_classification,
+                regime.historical_actual,
+                regime.unknown_components,
+                regime.covered,
+            )
+
+        for regime in regimes:
+            if compacted and (
+                compacted[-1].end + timedelta(days=1) == regime.start
+                and regime_semantics(compacted[-1]) == regime_semantics(regime)
+            ):
+                compacted[-1] = replace(compacted[-1], end=regime.end)
+            else:
+                compacted.append(regime)
+        if any(not regime.covered for regime in compacted):
+            uncovered = ", ".join(
+                f"{regime.start.isoformat()}..{regime.end.isoformat()}"
+                for regime in compacted
+                if not regime.covered
+            )
+            raise CostEvidenceCoverageError(
+                "cost evidence coverage has uncovered intervals: " + uncovered
+            )
+
+        ledger_dict = ledger.to_dict()
+        provisional = cls(
+            schema_version=COST_EVIDENCE_COVERAGE_SCHEMA_VERSION,
+            research_start=research_start,
+            research_end=research_end,
+            ledger_schema_version=str(ledger_dict["schema_version"]),
+            ledger_fingerprint=ledger.fingerprint(),
+            product_scope=product.value,
+            evidence_mode=evidence_mode,
+            policy_identity=policy_identity,
+            scenario_identity=scenario_identity,
+            regimes=tuple(compacted),
+            coverage_fingerprint="0" * 64,
+        )
+        return replace(
+            provisional,
+            coverage_fingerprint=canonical_sha256(provisional._fingerprint_payload()),
+        )
+
+    def validate_against_trusted_ledger(
+        self,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        trusted_scenario_identity: str | None = None,
+    ) -> None:
+        """Rebuild the entire window coverage from the trusted ledger and compare it."""
+
+        try:
+            product = LedgerProduct(self.product_scope)
+        except ValueError as exc:
+            raise CostEvidenceCoverageError(
+                f"unsupported product in cost coverage claim: {self.product_scope!r}"
+            ) from exc
+        expected = CostEvidenceCoverageIdentity.from_ledger(
+            ledger,
+            research_start=self.research_start,
+            research_end=self.research_end,
+            product=product,
+            evidence_mode="historical_resolution",
+            policy_identity=DEFAULT_COST_EVIDENCE_POLICY,
+            scenario_identity=trusted_scenario_identity,
+        )
+        actual_payload = self.as_dict()
+        expected_payload = expected.as_dict()
+        if actual_payload != expected_payload:
+            mismatches = tuple(
+                key
+                for key in sorted(expected_payload)
+                if actual_payload.get(key) != expected_payload.get(key)
+            )
+            raise CostEvidenceCoverageError(
+                "cost evidence coverage claim does not match trusted ledger; mismatched fields: "
+                + ", ".join(mismatches)
+            )
+
+
+@dataclass(frozen=True)
 class StrategySpec:
     candidate_id: str
     strategy_name: str
@@ -895,6 +1179,7 @@ class ExperimentArtifact:
     promotion_evidence: ConcretePromotionEvidence
     code_commit_sha: str
     live_orders_called: bool = False
+    cost_evidence_coverage_identity: CostEvidenceCoverageIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.live_orders_called:
@@ -950,6 +1235,11 @@ class ExperimentArtifact:
             "corporate_action_evidence": self.corporate_action_evidence.as_dict(),
             "cost_model_identity": self.cost_model_identity.as_dict(),
             "cost_evidence_identity": self.cost_evidence_identity.as_dict(),
+            "cost_evidence_coverage_identity": (
+                self.cost_evidence_coverage_identity.as_dict()
+                if self.cost_evidence_coverage_identity is not None
+                else None
+            ),
             "cost_evidence_class": self.cost_evidence_class,
             "strategy_definitions": [s.as_dict() for s in self.strategy_definitions],
             "parameter_grid": {
@@ -992,6 +1282,52 @@ class ExperimentArtifact:
         """JSON-serialized experiment artifact."""
         return json.dumps(self.as_dict(), indent=indent, sort_keys=True) + "\n"
 
+    def validate_structure(self) -> None:
+        """Validate artifact shape, deterministic fields, and internal date consistency.
+
+        This method intentionally accepts unverified cost claims. It does not
+        authenticate a ledger, coverage claim, market dataset, or promotion
+        evidence. Use :meth:`validate_integrity` for that trusted-evidence
+        boundary.
+        """
+
+        if self.live_orders_called:
+            raise LiveOrderAttemptError("live-order execution is strictly forbidden in research")
+        if self.cost_evidence_class != self.cost_evidence_identity.evidence_classification:
+            raise ExperimentValidationError(
+                "cost_evidence_class must match the cost evidence claim classification"
+            )
+        if self.cost_evidence_identity.resolved_on_date > self.research_window.end:
+            raise DataLeakageError(
+                "cost evidence date "
+                f"{self.cost_evidence_identity.resolved_on_date} is after research window end "
+                f"{self.research_window.end}"
+            )
+        coverage = self.cost_evidence_coverage_identity
+        if coverage is not None:
+            if (
+                coverage.research_start != self.research_window.start
+                or coverage.research_end != self.research_window.end
+            ):
+                raise DataLeakageError(
+                    "cost evidence coverage must exactly match the research window"
+                )
+            if coverage.product_scope != self.cost_evidence_identity.product_scope:
+                raise ExperimentValidationError(
+                    "cost evidence coverage product must match the cost evidence claim"
+                )
+            if coverage.ledger_fingerprint != self.cost_evidence_identity.ledger_fingerprint:
+                raise ExperimentValidationError(
+                    "cost evidence coverage ledger must match the cost evidence claim"
+                )
+        for train_w in self.train_windows:
+            for test_w in self.validation_test_windows:
+                if train_w.window_id == test_w.window_id and train_w.end >= test_w.start:
+                    raise DataLeakageError(
+                        f"window {train_w.window_id} train end {train_w.end} must be strictly "
+                        f"before test start {test_w.start}"
+                    )
+
     def evaluate_promotion_gate(
         self,
         thresholds: PromotionThresholds,
@@ -1019,6 +1355,14 @@ class ExperimentArtifact:
                     trusted_cost_ledger,
                     trusted_scenario_identity=trusted_scenario_identity,
                 )
+                if self.cost_evidence_coverage_identity is None:
+                    raise CostEvidenceCoverageError(
+                        "cost evidence coverage identity is required for promotion"
+                    )
+                self.cost_evidence_coverage_identity.validate_against_trusted_ledger(
+                    trusted_cost_ledger,
+                    trusted_scenario_identity=trusted_scenario_identity,
+                )
             except (CostEvidenceMismatchError, LookupError, ValueError) as exc:
                 cost_violations.append(f"cost evidence integrity mismatch: {exc}")
         if (
@@ -1028,6 +1372,14 @@ class ExperimentArtifact:
             cost_violations.append(
                 "cost evidence is not verified HISTORICAL_ACTUAL_COSTS; "
                 "scenario/incomplete evidence cannot promote"
+            )
+        if (
+            self.cost_evidence_coverage_identity is None
+            or not self.cost_evidence_coverage_identity.historical_actual
+        ):
+            cost_violations.append(
+                "cost evidence coverage is not verified HISTORICAL_ACTUAL_COSTS for the full "
+                "research window; every regime must be complete historical evidence"
             )
         return (passed and not cost_violations, tuple(cost_violations))
 
@@ -1050,31 +1402,31 @@ class ExperimentArtifact:
             DataLeakageError: If test/validation windows overlap or contaminate train.
             LiveOrderAttemptError: If live order execution was marked true or invoked.
         """
-        if self.live_orders_called:
-            raise LiveOrderAttemptError("live-order execution is strictly forbidden in research")
-
         # Cost evidence is a claim in the serialized artifact. Revalidate it
-        # whenever trusted evidence is supplied, and never permit a claimed
-        # historical actual (or any promotion request) without that evidence.
-        if trusted_cost_ledger is not None:
-            try:
-                self.cost_evidence_identity.validate_against_trusted_ledger(
-                    trusted_cost_ledger,
-                    trusted_scenario_identity=trusted_scenario_identity,
-                )
-            except (CostEvidenceMismatchError, LookupError, ValueError) as exc:
-                raise MissingEvidenceError(
-                    f"cost evidence integrity mismatch: {exc}"
-                ) from exc
-        elif (
-            self.cost_evidence_identity.evidence_classification == HISTORICAL_ACTUAL_LABEL
-            or self.cost_evidence_identity.historical_actual
-        ):
+        # whenever trusted evidence is supplied. A missing ledger is always a
+        # fail-closed integrity result, including for incomplete/scenario claims.
+        if trusted_cost_ledger is None:
             raise MissingEvidenceError(
-                "trusted cost evidence ledger is required to validate or promote cost evidence; "
-                "serialized cost evidence is a claim, not proof; cost evidence is not verified "
-                "HISTORICAL_ACTUAL_COSTS"
+                "trusted cost evidence ledger is required for integrity validation; "
+                "serialized cost evidence is a claim, not proof"
             )
+        self.validate_structure()
+
+        try:
+            self.cost_evidence_identity.validate_against_trusted_ledger(
+                trusted_cost_ledger,
+                trusted_scenario_identity=trusted_scenario_identity,
+            )
+            if self.cost_evidence_coverage_identity is None:
+                raise CostEvidenceCoverageError(
+                    "cost evidence coverage identity is required for integrity validation"
+                )
+            self.cost_evidence_coverage_identity.validate_against_trusted_ledger(
+                trusted_cost_ledger,
+                trusted_scenario_identity=trusted_scenario_identity,
+            )
+        except (CostEvidenceMismatchError, CostEvidenceCoverageError, LookupError, ValueError) as exc:
+            raise MissingEvidenceError(f"cost evidence integrity mismatch: {exc}") from exc
 
         # 1. Dataset fingerprint verification
         if dataset_frames is not None:
@@ -1212,6 +1564,7 @@ class ExperimentOrchestrator:
         promotion_evidence: ConcretePromotionEvidence,
         random_seeds: dict[str, int] | None = None,
         created_at: str | None = None,
+        cost_evidence_coverage_identity: CostEvidenceCoverageIdentity | None = None,
     ) -> ExperimentArtifact:
         """Create and return an immutable ExperimentArtifact with strict fail-closed validation."""
         timestamp = (
@@ -1250,6 +1603,7 @@ class ExperimentOrchestrator:
             promotion_evidence=promotion_evidence,
             code_commit_sha=self._code_commit_sha,
             live_orders_called=False,
+            cost_evidence_coverage_identity=cost_evidence_coverage_identity,
         )
 
         # Immediate fail-closed validation of window leakage

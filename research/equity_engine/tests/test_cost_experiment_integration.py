@@ -31,10 +31,14 @@ from equity_engine.experiment import (
     ConcretePromotionEvidence,
     CorporateActionEvidenceIdentity,
     CostEvidenceIdentity,
+    CostEvidenceCoverageIdentity,
+    CostEvidenceCoverageError,
     CostEvidenceMismatchError,
+    CostEvidenceRegimeIdentity,
     CostModelIdentity,
     CostReconciliationEvidence,
     DataLeakageError,
+    ExperimentValidationError,
     EmbargoSpec,
     EventDrivenSimulationEvidence,
     ExperimentArtifact,
@@ -73,6 +77,7 @@ def _experiment(
     created_at: str = "2026-09-10T10:00:00+05:30",
 ) -> ExperimentArtifact:
     identity = cost_evidence_identity or _cost_identity()
+    ledger = EffectiveDatedCostLedger()
     orchestrator = ExperimentOrchestrator(code_commit_sha="baa4e10aa")
     return orchestrator.build_experiment(
         research_window=ResearchWindowConfig(
@@ -133,6 +138,12 @@ def _experiment(
         ),
         cost_evidence_identity=identity,
         cost_evidence_class=identity.evidence_classification,
+        cost_evidence_coverage_identity=CostEvidenceCoverageIdentity.from_ledger(
+            ledger,
+            research_start=date(2026, 1, 1),
+            research_end=date(2026, 9, 8),
+            product=LedgerProduct.INTRADAY,
+        ),
         strategy_definitions=(
             StrategySpec(
                 candidate_id="orb:15m",
@@ -288,7 +299,7 @@ def test_kiro_forged_historical_claim_cannot_pass_promotion_or_integrity() -> No
     assert any("trusted cost evidence ledger is required" in item for item in violations)
     with pytest.raises(MissingEvidenceError, match="trusted cost evidence ledger is required"):
         experiment.validate_integrity(promotion_thresholds=thresholds)
-    with pytest.raises(MissingEvidenceError, match="cost evidence integrity mismatch"):
+    with pytest.raises(ExperimentValidationError, match="cost evidence coverage ledger"):
         experiment.validate_integrity(
             promotion_thresholds=thresholds,
             trusted_cost_ledger=ledger,
@@ -378,6 +389,136 @@ def test_public_scenario_cannot_be_claimed_as_historical_actual() -> None:
             ledger,
             trusted_scenario_identity="upstox-public-terms",
         )
+
+
+def test_validate_structure_accepts_unverified_research_claim() -> None:
+    # Structural validation is intentionally not an authenticity assertion.
+    _experiment().validate_structure()
+
+
+def test_validate_integrity_requires_trusted_ledger_for_incomplete_claim() -> None:
+    with pytest.raises(MissingEvidenceError, match="trusted cost evidence ledger"):
+        _experiment().validate_integrity()
+
+
+def test_validate_integrity_requires_window_cost_coverage() -> None:
+    experiment = replace(_experiment(), cost_evidence_coverage_identity=None)
+
+    with pytest.raises(MissingEvidenceError, match="coverage identity"):
+        experiment.validate_integrity(trusted_cost_ledger=EffectiveDatedCostLedger())
+
+
+def test_jan_to_sep_coverage_binds_both_mii_regimes() -> None:
+    ledger = EffectiveDatedCostLedger()
+    coverage = CostEvidenceCoverageIdentity.from_ledger(
+        ledger,
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 9, 8),
+        product=LedgerProduct.INTRADAY,
+    )
+
+    assert [(regime.start, regime.end) for regime in coverage.regimes] == [
+        (date(2026, 1, 1), date(2026, 2, 28)),
+        (date(2026, 3, 1), date(2026, 9, 8)),
+    ]
+    assert coverage.regimes[0].selected_record_ids != coverage.regimes[1].selected_record_ids
+    assert coverage.evidence_classification == INCOMPLETE_LABEL
+    assert coverage.historical_actual is False
+    assert coverage.resolve_for_date(date(2026, 2, 28)) is coverage.regimes[0]
+    assert coverage.resolve_for_date(date(2026, 3, 1)) is coverage.regimes[1]
+
+
+@pytest.mark.parametrize("effective_from", (date(2024, 10, 1), date(2026, 3, 1)))
+def test_changing_either_cost_regime_changes_coverage_fingerprint(
+    effective_from: date,
+) -> None:
+    ledger = EffectiveDatedCostLedger()
+    original = CostEvidenceCoverageIdentity.from_ledger(
+        ledger,
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 9, 8),
+        product=LedgerProduct.INTRADAY,
+    )
+    records = list(ledger.records)
+    index = next(
+        i
+        for i, record in enumerate(records)
+        if record.component is LedgerComponent.TRANSACTION
+        and record.effective_from == effective_from
+    )
+    records[index] = replace(records[index], rate=records[index].rate + Decimal("0.000001"))
+    changed = CostEvidenceCoverageIdentity.from_ledger(
+        EffectiveDatedCostLedger(records=tuple(records)),
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 9, 8),
+        product=LedgerProduct.INTRADAY,
+    )
+
+    assert changed.coverage_fingerprint != original.coverage_fingerprint
+
+
+def test_uncovered_cost_evidence_date_fails_closed() -> None:
+    ledger = EffectiveDatedCostLedger(
+        records=tuple(
+            record
+            for record in EffectiveDatedCostLedger().records
+            if record.component is not LedgerComponent.CLEARING
+        )
+    )
+
+    with pytest.raises(CostEvidenceCoverageError, match="uncovered intervals"):
+        CostEvidenceCoverageIdentity.from_ledger(
+            ledger,
+            research_start=date(2026, 1, 1),
+            research_end=date(2026, 9, 8),
+            product=LedgerProduct.INTRADAY,
+        )
+
+
+def test_coverage_resolver_rejects_an_explicit_uncovered_regime() -> None:
+    regime = CostEvidenceRegimeIdentity(
+        start=date(2026, 1, 1),
+        end=date(2026, 9, 8),
+        selected_record_ids=(),
+        evidence_classification=INCOMPLETE_LABEL,
+        historical_actual=False,
+        unknown_components=("clearing: no record covers 2026-01-01",),
+        covered=False,
+    )
+    coverage = CostEvidenceCoverageIdentity(
+        schema_version="effective-dated-cost-evidence-coverage/v1",
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 9, 8),
+        ledger_schema_version="effective-dated-cost-ledger/v1",
+        ledger_fingerprint="a" * 64,
+        product_scope=LedgerProduct.INTRADAY.value,
+        evidence_mode="historical_resolution",
+        policy_identity="effective-dated-cost-ledger/default-resolution/v1",
+        scenario_identity=None,
+        regimes=(regime,),
+        coverage_fingerprint="b" * 64,
+    )
+
+    with pytest.raises(CostEvidenceCoverageError, match="not covered"):
+        coverage.resolve_for_date(date(2026, 6, 1))
+
+
+def test_sep_9_snapshot_is_excluded_from_sep_8_ending_coverage() -> None:
+    ledger = EffectiveDatedCostLedger()
+    coverage = CostEvidenceCoverageIdentity.from_ledger(
+        ledger,
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 9, 8),
+        product=LedgerProduct.INTRADAY,
+    )
+    snapshot_ids = {
+        canonical_sha256(record.to_dict())
+        for record in ledger.records
+        if record.evidence_class is EvidenceClass.ACCOUNT_SNAPSHOT
+    }
+
+    assert all(not snapshot_ids.intersection(regime.selected_record_ids) for regime in coverage.regimes)
+    assert coverage.research_end == date(2026, 9, 8)
 
 
 def test_modifying_ledger_fingerprint_changes_experiment_fingerprint() -> None:
@@ -538,7 +679,10 @@ def test_incomplete_historical_evidence_cannot_pass_promotion_gate() -> None:
     assert passed is False
     assert any("not verified HISTORICAL_ACTUAL_COSTS" in violation for violation in violations)
     with pytest.raises(MissingEvidenceError, match="not verified HISTORICAL_ACTUAL_COSTS"):
-        experiment.validate_integrity(promotion_thresholds=thresholds)
+        experiment.validate_integrity(
+            promotion_thresholds=thresholds,
+            trusted_cost_ledger=EffectiveDatedCostLedger(),
+        )
 
 
 def test_pre_boundary_and_mii_transition_semantics_remain_exact() -> None:
