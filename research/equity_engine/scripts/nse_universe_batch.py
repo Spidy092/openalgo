@@ -10,6 +10,7 @@ from equity_engine.nse_batch_universe import NseBatchUniverseBuilder
 from equity_engine.nse_calendar import nse_cm_normal_session_calendar
 from equity_engine.nse_semantics import (
     EffectiveDatedNseCmSemanticsPolicy,
+    NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE,
     nse_cm_master_data_v15_semantics,
 )
 
@@ -27,8 +28,8 @@ def main() -> int:
             "Build a cached point-in-time NSE CM equity universe across sourced normal-session dates."
         )
     )
-    parser.add_argument("--start", type=_parse_date, default=date(2024, 7, 1))
-    parser.add_argument("--end", type=_parse_date, default=date(2026, 7, 31))
+    parser.add_argument("--start", type=_parse_date, required=True)
+    parser.add_argument("--end", type=_parse_date, required=True)
     parser.add_argument("--output-dir", default="data/nse_universe_batch")
     parser.add_argument(
         "--refresh-existing",
@@ -37,13 +38,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.start < date(2024, 7, 1):
+    if args.start < NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE:
         parser.error("exact NSE CM semantics are intentionally bounded to 2024-07-01 or later")
-    if args.end > date(2026, 7, 31):
-        parser.error(
-            "initial batch is capped at 2026-07-31; Aug-2026 CAS regime is validated separately"
-        )
-
     calendar = nse_cm_normal_session_calendar(start=args.start, end=args.end)
     policy = EffectiveDatedNseCmSemanticsPolicy([nse_cm_master_data_v15_semantics()])
     result = NseBatchUniverseBuilder(

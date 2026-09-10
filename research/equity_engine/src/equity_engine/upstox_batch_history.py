@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
@@ -18,6 +21,42 @@ from .upstox_history import UpstoxHistoricalDataProvider
 _TRANSIENT_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 UPSTOX_MINUTE_MAX_CALENDAR_DAYS = 28
 UPSTOX_DAILY_MAX_CALENDAR_DAYS = 3650
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_write_parquet(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        frame.to_parquet(temporary_path)
+        with temporary_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 class _HttpGetter(Protocol):
@@ -98,6 +137,7 @@ class HistoricalBatchPlan:
     estimated_storage_bytes: int | None
     affordability_prefilter_applied: bool
     note: str
+    resolution: str = "minutes"
 
 
 @dataclass(frozen=True)
@@ -143,8 +183,8 @@ def historical_request_count(*, start: date, end: date, interval: str) -> int:
     )
 
 
-def _chunk_count(start: date, end: date) -> int:
-    return historical_request_count(start=start, end=end, interval="minutes")
+def _chunk_count(start: date, end: date, *, resolution: str) -> int:
+    return historical_request_count(start=start, end=end, interval=resolution)
 
 
 def plan_historical_batch(
@@ -155,15 +195,22 @@ def plan_historical_batch(
     estimated_bytes_per_row: int | None = None,
     trading_day_counts: dict[str, int] | None = None,
     affordability_prefilter_applied: bool,
+    resolution: str = "minutes",
 ) -> HistoricalBatchPlan:
     if interval_minutes < 1 or interval_minutes > 15:
         raise ValueError("interval_minutes must be between 1 and 15")
+    if resolution not in {"minutes", "daily"}:
+        raise ValueError("resolution must be 'minutes' or 'daily'")
+    if resolution == "daily" and interval_minutes != 1:
+        raise ValueError("daily resolution requires interval_minutes=1")
     candidate_list = tuple(candidates)
     keys = [candidate.instrument_key for candidate in candidate_list]
     if len(keys) != len(set(keys)):
         raise ValueError("historical batch candidates must have unique instrument keys")
 
-    estimated_requests = sum(_chunk_count(item.start, item.end) for item in candidate_list)
+    estimated_requests = sum(
+        _chunk_count(item.start, item.end, resolution=resolution) for item in candidate_list
+    )
     estimated_rows: int | None = None
     estimated_storage: int | None = None
     if expected_rows_per_trading_day is not None:
@@ -197,6 +244,7 @@ def plan_historical_batch(
         estimated_storage_bytes=estimated_storage,
         affordability_prefilter_applied=affordability_prefilter_applied,
         note=note,
+        resolution=resolution,
     )
 
 
@@ -280,9 +328,10 @@ class UpstoxHistoricalBatchDownloader:
         access_token: str,
         output_dir: Path,
         interval_minutes: int = 5,
-        min_request_interval_seconds: float = 0.15,
-        max_attempts: int = 4,
-        backoff_seconds: float = 1.0,
+        resolution: str = "minutes",
+        min_request_interval_seconds: float,
+        max_attempts: int,
+        backoff_seconds: float,
         client: _HttpGetter | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
@@ -291,8 +340,16 @@ class UpstoxHistoricalBatchDownloader:
             raise ValueError("access_token is required")
         if interval_minutes < 1 or interval_minutes > 15:
             raise ValueError("interval_minutes must be between 1 and 15")
+        if resolution not in {"minutes", "daily"}:
+            raise ValueError("resolution must be 'minutes' or 'daily'")
+        if resolution == "daily" and interval_minutes != 1:
+            raise ValueError("daily resolution requires interval_minutes=1")
         self.output_dir = output_dir.resolve()
         self.interval_minutes = interval_minutes
+        self.resolution = resolution
+        self.min_request_interval_seconds = min_request_interval_seconds
+        self.max_attempts = max_attempts
+        self.backoff_seconds = backoff_seconds
         self._owned_client: httpx.Client | None = None
         inner: _HttpGetter
         if client is None:
@@ -320,7 +377,8 @@ class UpstoxHistoricalBatchDownloader:
     def _paths(self, candidate: HistoricalBatchCandidate) -> tuple[Path, Path]:
         safe_key = candidate.instrument_key.replace("|", "_").replace("/", "_")
         root = self.output_dir / safe_key
-        base = f"{candidate.start.isoformat()}_{candidate.end.isoformat()}_{self.interval_minutes}m"
+        suffix = "daily" if self.resolution == "daily" else f"{self.interval_minutes}m"
+        base = f"{candidate.start.isoformat()}_{candidate.end.isoformat()}_{suffix}"
         return root / f"{base}.parquet", root / f"{base}.manifest.json"
 
     def _existing_item(
@@ -329,7 +387,12 @@ class UpstoxHistoricalBatchDownloader:
         parquet_path: Path,
         manifest_path: Path,
     ) -> HistoricalBatchItemResult | None:
-        if not parquet_path.exists() or not manifest_path.exists():
+        if parquet_path.exists() != manifest_path.exists():
+            raise ValueError(
+                f"partial historical artifact for {candidate.instrument_key}; "
+                "resume requires both Parquet and manifest"
+            )
+        if not parquet_path.exists():
             return None
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         request = payload.get("request", {})
@@ -340,18 +403,35 @@ class UpstoxHistoricalBatchDownloader:
             "end": candidate.end.isoformat(),
             "interval_minutes": self.interval_minutes,
         }
-        if request != expected:
+        if request.get("resolution", "minutes") != self.resolution:
+            raise ValueError(
+                f"existing historical artifact resolution differs for {candidate.instrument_key}"
+            )
+        if {key: request.get(key) for key in expected} != expected:
             raise ValueError(
                 f"existing historical artifact request metadata differs for {candidate.instrument_key}"
             )
         frame = pd.read_parquet(parquet_path)
+        expected_rows = payload.get("rows")
+        if not isinstance(expected_rows, int) or expected_rows != len(frame):
+            raise ValueError("existing historical artifact row count is not verified")
+        expected_parquet_sha256 = payload.get("parquet_sha256")
+        if expected_parquet_sha256 is not None:
+            actual_parquet_sha256 = _sha256_file(parquet_path)
+            if expected_parquet_sha256 != actual_parquet_sha256:
+                raise ValueError(
+                    f"existing historical artifact bytes changed for {candidate.instrument_key}"
+                )
+        fingerprint = payload.get("fingerprint_sha256")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("existing historical artifact fingerprint is missing")
         return HistoricalBatchItemResult(
             instrument_key=candidate.instrument_key,
             symbol=candidate.symbol,
             start=candidate.start,
             end=candidate.end,
             rows=len(frame),
-            fingerprint=str(payload["fingerprint_sha256"]),
+            fingerprint=fingerprint,
             parquet=str(parquet_path),
             manifest=str(manifest_path),
             retrieval="cached",
@@ -383,24 +463,31 @@ class UpstoxHistoricalBatchDownloader:
                         items.append(existing)
                         continue
 
-                    dataset = self.provider.fetch_minutes(
-                        instrument_token=candidate.instrument_key,
-                        symbol=candidate.symbol,
-                        exchange="NSE",
-                        start=candidate.start,
-                        end=candidate.end,
-                        interval_minutes=self.interval_minutes,
-                        universe_rule_version=universe_rule_version,
-                        adjustment_policy=adjustment_policy,
-                    )
+                    fetch_kwargs = {
+                        "instrument_token": candidate.instrument_key,
+                        "symbol": candidate.symbol,
+                        "exchange": "NSE",
+                        "start": candidate.start,
+                        "end": candidate.end,
+                        "universe_rule_version": universe_rule_version,
+                        "adjustment_policy": adjustment_policy,
+                    }
+                    if self.resolution == "daily":
+                        dataset = self.provider.fetch_daily(**fetch_kwargs)
+                    else:
+                        dataset = self.provider.fetch_minutes(
+                            interval_minutes=self.interval_minutes,
+                            **fetch_kwargs,
+                        )
                     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-                    dataset.frame.to_parquet(parquet_path)
+                    _atomic_write_parquet(parquet_path, dataset.frame)
                     request = {
                         "instrument_key": candidate.instrument_key,
                         "symbol": candidate.symbol,
                         "start": candidate.start.isoformat(),
                         "end": candidate.end.isoformat(),
                         "interval_minutes": self.interval_minutes,
+                        "resolution": self.resolution,
                     }
                     payload = {
                         "schema_version": 1,
@@ -409,11 +496,17 @@ class UpstoxHistoricalBatchDownloader:
                         "fingerprint_sha256": dataset.fingerprint,
                         "fingerprint_schema": FINGERPRINT_SCHEMA,
                         "rows": len(dataset.frame),
+                        "parquet_sha256": _sha256_file(parquet_path),
+                        "rate_limit": {
+                            "backoff_seconds": self.backoff_seconds,
+                            "max_attempts": self.max_attempts,
+                            "minimum_interval_seconds": self.min_request_interval_seconds,
+                        },
                         "live_orders_called": False,
                     }
-                    manifest_path.write_text(
+                    _atomic_write_text(
+                        manifest_path,
                         json.dumps(payload, indent=2, default=str),
-                        encoding="utf-8",
                     )
                     items.append(
                         HistoricalBatchItemResult(
@@ -439,6 +532,12 @@ class UpstoxHistoricalBatchDownloader:
             "fingerprint_schema": FINGERPRINT_SCHEMA,
             "generated_at": datetime.now(UTC).isoformat(),
             "interval_minutes": self.interval_minutes,
+            "resolution": self.resolution,
+            "rate_limit": {
+                "backoff_seconds": self.backoff_seconds,
+                "max_attempts": self.max_attempts,
+                "minimum_interval_seconds": self.min_request_interval_seconds,
+            },
             "items": [asdict(item) for item in items],
             "failures": failures,
             "summary": {
@@ -448,10 +547,7 @@ class UpstoxHistoricalBatchDownloader:
                 "live_orders_called": False,
             },
         }
-        batch_manifest.write_text(
-            json.dumps(batch_payload, indent=2, default=str),
-            encoding="utf-8",
-        )
+        _atomic_write_text(batch_manifest, json.dumps(batch_payload, indent=2, default=str))
         return HistoricalBatchRunResult(
             items=tuple(items),
             failures=tuple(failures),
