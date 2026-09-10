@@ -25,13 +25,19 @@ import pandas as pd
 import pytest
 
 from equity_engine.experiment import (
+    COST_LEDGER_DEFAULT_SCHEMA_VERSION,
     EXPERIMENT_SCHEMA_VERSION,
+    HISTORICAL_ACTUAL_LABEL,
+    INCOMPLETE_LABEL,
+    SCENARIO_LABEL,
     ApprovedCapital,
     BaselineComparisonEvidence,
     ConcretePromotionEvidence,
     CorporateActionEvidenceIdentity,
+    CostEvidenceIdentity,
     CostModelIdentity,
     CostReconciliationEvidence,
+    CurrentCalibrationReference,
     DataLeakageError,
     DatasetFingerprintMismatchError,
     EmbargoSpec,
@@ -254,13 +260,12 @@ def baseline_experiment() -> ExperimentArtifact:
             blocking_events=(),
             evidence_fingerprint="sha256_ca_evidence_001",
         ),
-        cost_model_identity=CostModelIdentity(
-            model_name="documented",
-            effective_date="2026-03-01",
-            rates={"brokerage": "0.001", "brokerage_cap": "20", "gst": "0.18"},
+        cost_evidence_identity=CostEvidenceIdentity.for_historical_actual(
+            ledger_fingerprint="a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef0",
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
             source_refs=("https://upstox.com/brokerage-charges/",),
+            effective_window=("2026-01-01", "2026-06-30"),
         ),
-        cost_evidence_class="documented_snapshot",
         strategy_definitions=(
             StrategySpec(
                 candidate_id="orb:15m:vol1.5:buf5bps",
@@ -566,3 +571,324 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
 
     with pytest.raises(MissingEvidenceError, match="max drawdown 15.50% exceeds allowed 10.0%"):
         failing_exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+# 13. Cost evidence contract and effective-dated ledger consumption
+
+
+def test_free_form_rates_insertion_is_rejected() -> None:
+    # Attempting to pass free-form rates dict directly to CostEvidenceIdentity must fail
+    with pytest.raises(TypeError, match="unexpected keyword argument 'rates'"):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="1" * 64,
+            evidence_classification=HISTORICAL_ACTUAL_LABEL,
+            historical_actual=True,
+            rates={"brokerage": "0.001"},  # type: ignore[call-arg]
+        )
+
+    # Factory methods also reject free-form rates
+    with pytest.raises(TypeError):
+        CostEvidenceIdentity.for_historical_actual(
+            ledger_fingerprint="1" * 64,
+            rates={"brokerage": "0.001"},  # type: ignore[call-arg]
+        )
+    with pytest.raises(TypeError):
+        CostEvidenceIdentity.for_scenario(
+            scenario_id="scenario_1",
+            ledger_fingerprint="1" * 64,
+            rates={"brokerage": "0.001"},  # type: ignore[call-arg]
+        )
+
+
+def test_scenario_costs_must_remain_explicitly_historical_actual_false(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    # Specifying scenario_id with historical_actual=True must raise ValueError
+    with pytest.raises(
+        ValueError,
+        match="scenario cost evidence cannot be labeled historical_actual=True",
+    ):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="2" * 64,
+            evidence_classification=SCENARIO_LABEL,
+            historical_actual=True,
+            scenario_id="stress_high_turnover",
+        )
+
+    # Classification SCENARIO with historical_actual=True must raise ValueError
+    with pytest.raises(
+        ValueError,
+        match="scenario cost evidence cannot be labeled historical_actual=True",
+    ):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="2" * 64,
+            evidence_classification=SCENARIO_LABEL,
+            historical_actual=True,
+        )
+
+    # Valid scenario cost identity
+    scenario_cost = CostEvidenceIdentity.for_scenario(
+        scenario_id="stress_high_turnover",
+        ledger_fingerprint="2" * 64,
+        source_refs=("https://internal-wiki/research/scenario-costs",),
+    )
+    assert scenario_cost.historical_actual is False
+    assert scenario_cost.evidence_classification == SCENARIO_LABEL
+    assert scenario_cost.scenario_id == "stress_high_turnover"
+
+    # Valid scenario costs can be attached to an experiment for research
+    research_exp = replace(baseline_experiment, cost_evidence_identity=scenario_cost)
+    research_exp.validate_integrity()
+    assert research_exp.cost_evidence_identity.historical_actual is False
+
+
+def test_historical_actual_costs_require_verified_classification_and_no_unknowns() -> None:
+    # historical_actual=True with invalid classification fails
+    with pytest.raises(
+        ValueError, match="requires evidence_classification='HISTORICAL_ACTUAL_COSTS'"
+    ):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="3" * 64,
+            evidence_classification=INCOMPLETE_LABEL,
+            historical_actual=True,
+        )
+
+    # historical_actual=True with unknown components fails
+    with pytest.raises(ValueError, match="cannot have unpriced/unknown cost components"):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="3" * 64,
+            evidence_classification=HISTORICAL_ACTUAL_LABEL,
+            historical_actual=True,
+            unknown_components=("clearing_charge",),
+        )
+
+    # HISTORICAL_ACTUAL_COSTS classification with historical_actual=False fails
+    with pytest.raises(ValueError, match="requires historical_actual=True"):
+        CostEvidenceIdentity(
+            cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+            ledger_fingerprint="3" * 64,
+            evidence_classification=HISTORICAL_ACTUAL_LABEL,
+            historical_actual=False,
+        )
+
+    # Valid historical actual factory
+    hist_cost = CostEvidenceIdentity.for_historical_actual(
+        ledger_fingerprint="3" * 64,
+        effective_window=("2026-01-01", "2026-06-30"),
+    )
+    assert hist_cost.historical_actual is True
+    assert hist_cost.evidence_classification == HISTORICAL_ACTUAL_LABEL
+    assert hist_cost.unknown_components == ()
+    assert hist_cost.scenario_id is None
+
+
+def test_promotion_evidence_preserves_historical_actual_vs_scenario_distinction(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.20"),
+        max_drawdown_pct=Decimal("10.0"),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+
+    # Baseline with verified historical actual costs passes promotion
+    passed, violations = baseline_experiment.evaluate_promotion_gate(thresholds)
+    assert passed is True
+    assert violations == ()
+    baseline_experiment.validate_integrity(promotion_thresholds=thresholds)
+
+    # Experiment with scenario costs is valid for research, but MUST FAIL promotion gate
+    scenario_cost = CostEvidenceIdentity.for_scenario(
+        scenario_id="monte_carlo_slippage_x2",
+        ledger_fingerprint="4" * 64,
+    )
+    scenario_exp = replace(baseline_experiment, cost_evidence_identity=scenario_cost)
+
+    # Research validation passes
+    scenario_exp.validate_integrity()
+
+    # Promotion evaluation fails explicitly
+    passed, violations = scenario_exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("scenario/incomplete evidence cannot promote" in v for v in violations)
+
+    with pytest.raises(MissingEvidenceError, match="scenario/incomplete evidence cannot promote"):
+        scenario_exp.validate_integrity(promotion_thresholds=thresholds)
+
+    # Experiment with incomplete historical costs (e.g. unknown tax components)
+    incomplete_cost = CostEvidenceIdentity(
+        cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+        ledger_fingerprint="5" * 64,
+        evidence_classification=INCOMPLETE_LABEL,
+        historical_actual=False,
+        unknown_components=("stamp_duty_retroactive",),
+    )
+    incomplete_exp = replace(baseline_experiment, cost_evidence_identity=incomplete_cost)
+    incomplete_exp.validate_integrity()
+
+    passed, violations = incomplete_exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("stamp_duty_retroactive" in v for v in violations)
+    with pytest.raises(MissingEvidenceError, match="unpriced/unknown components"):
+        incomplete_exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+def test_cost_evidence_identity_deterministic_identity_and_binding(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    cost1 = CostEvidenceIdentity.for_historical_actual(
+        ledger_fingerprint="a" * 64,
+        cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+        source_refs=("ref1", "ref2"),
+        effective_window=("2026-01-01", "2026-06-30"),
+    )
+    cost2 = CostEvidenceIdentity.for_historical_actual(
+        ledger_fingerprint="a" * 64,
+        cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+        source_refs=("ref1", "ref2"),
+        effective_window=("2026-01-01", "2026-06-30"),
+    )
+    assert cost1.deterministic_identity() == cost2.deterministic_identity()
+    assert cost1.fingerprint() == cost2.fingerprint()
+
+    # Different ledger fingerprint produces different deterministic identity
+    cost_diff_fp = CostEvidenceIdentity.for_historical_actual(
+        ledger_fingerprint="b" * 64,
+        cost_ledger_schema_version=COST_LEDGER_DEFAULT_SCHEMA_VERSION,
+        source_refs=("ref1", "ref2"),
+        effective_window=("2026-01-01", "2026-06-30"),
+    )
+    assert cost1.deterministic_identity() != cost_diff_fp.deterministic_identity()
+
+    # Binding different cost evidence to experiment changes experiment deterministic fingerprint
+    exp1 = replace(baseline_experiment, cost_evidence_identity=cost1)
+    exp2 = replace(baseline_experiment, cost_evidence_identity=cost_diff_fp)
+    assert exp1.deterministic_fingerprint() != exp2.deterministic_fingerprint()
+    assert exp1.experiment_id != exp2.experiment_id
+
+
+def test_consuming_contract_from_ledger_interface() -> None:
+    class MockAssessment:
+        classification = HISTORICAL_ACTUAL_LABEL
+        historical_actual = True
+        unknown_components = ()
+
+    class MockEffectiveCostLedger:
+        schema_version = "effective-dated-cost-ledger/v1"
+        source_refs = ("https://nseindia.com/circulars/CMTR67133.pdf",)
+
+        def fingerprint(self) -> str:
+            return "f" * 64
+
+        def describe(self, on_date: Any) -> MockAssessment:
+            return MockAssessment()
+
+    mock_ledger = MockEffectiveCostLedger()
+
+    # 1. Historical actual derivation
+    identity = CostEvidenceIdentity.from_ledger(
+        mock_ledger,
+        on_date=date(2026, 3, 1),
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+    )
+    assert identity.cost_ledger_schema_version == "effective-dated-cost-ledger/v1"
+    assert identity.ledger_fingerprint == "f" * 64
+    assert identity.evidence_classification == HISTORICAL_ACTUAL_LABEL
+    assert identity.historical_actual is True
+    assert identity.unknown_components == ()
+    assert identity.effective_date == "2026-03-01"
+    assert identity.effective_window == ("2026-01-01", "2026-06-30")
+    assert identity.source_refs == ("https://nseindia.com/circulars/CMTR67133.pdf",)
+
+    # 2. Scenario derivation from ledger
+    scenario_identity = CostEvidenceIdentity.from_ledger(
+        mock_ledger,
+        scenario_id="custom_stress_scenario",
+        on_date="2026-03-01",
+    )
+    assert scenario_identity.scenario_id == "custom_stress_scenario"
+    assert scenario_identity.evidence_classification == SCENARIO_LABEL
+    assert scenario_identity.historical_actual is False
+
+    # 3. Invalid ledger missing fingerprint fails
+    class InvalidLedger:
+        schema_version = "v1"
+
+    with pytest.raises(TypeError, match="must provide a fingerprint"):
+        CostEvidenceIdentity.from_ledger(InvalidLedger())
+
+
+def test_current_calibration_reference_contract(baseline_experiment: ExperimentArtifact) -> None:
+    calib = CurrentCalibrationReference(
+        snapshot_fingerprint="c" * 64,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+        source_uri="gs://market-snapshots/nse/calibration-20260910.parquet",
+    )
+    assert calib.current_snapshot_not_historical_eligibility is True
+
+    with pytest.raises(
+        ValueError,
+        match="current calibration reference must have current_snapshot_not_historical_eligibility=True",
+    ):
+        CurrentCalibrationReference(
+            snapshot_fingerprint="c" * 64,
+            snapshot_as_of="2026-09-10T09:15:00Z",
+            current_snapshot_not_historical_eligibility=False,
+        )
+
+    exp_with_calib = replace(baseline_experiment, current_calibration_reference=calib)
+    exp_with_calib.validate_integrity()
+    assert exp_with_calib.current_calibration_reference is not None
+    assert (
+        exp_with_calib.current_calibration_reference.current_snapshot_not_historical_eligibility
+        is True
+    )
+
+
+def test_current_calibration_reference_cannot_become_pit_universe_evidence(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    leaked_universe_calib = CurrentCalibrationReference(
+        snapshot_fingerprint=baseline_experiment.universe_fingerprint,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+    )
+    with pytest.raises(
+        DataLeakageError,
+        match="current calibration snapshot cannot be used as universe_fingerprint",
+    ):
+        replace(baseline_experiment, current_calibration_reference=leaked_universe_calib)
+
+    diff_univ_exp = replace(baseline_experiment, universe_fingerprint="d" * 64)
+    leaked_prefilter_calib = CurrentCalibrationReference(
+        snapshot_fingerprint=diff_univ_exp.candidate_prefilter_artifact_fingerprint,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+    )
+    with pytest.raises(
+        DataLeakageError,
+        match="current calibration snapshot cannot be used as candidate_prefilter_artifact_fingerprint",
+    ):
+        replace(diff_univ_exp, current_calibration_reference=leaked_prefilter_calib)
+
+    hex_64_cov = "e" * 64
+    leak_nse_exp = replace(
+        baseline_experiment,
+        nse_membership_evidence=replace(
+            baseline_experiment.nse_membership_evidence, coverage_fingerprint=hex_64_cov
+        ),
+    )
+    leaked_nse_calib = CurrentCalibrationReference(
+        snapshot_fingerprint=hex_64_cov,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+    )
+    with pytest.raises(
+        DataLeakageError,
+        match="current calibration snapshot cannot substitute for historical nse_membership_evidence",
+    ):
+        replace(leak_nse_exp, current_calibration_reference=leaked_nse_calib)
