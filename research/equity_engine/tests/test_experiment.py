@@ -24,7 +24,13 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from equity_engine.cost_ledger import INCOMPLETE_LABEL, EffectiveDatedCostLedger, LedgerProduct
+from equity_engine.cost_ledger import (
+    INCOMPLETE_LABEL,
+    SCENARIO_LABEL,
+    EffectiveDatedCostLedger,
+    LedgerProduct,
+    UnsupportedResearchDate,
+)
 from equity_engine.experiment import (
     EXPERIMENT_SCHEMA_VERSION,
     ApprovedCapital,
@@ -34,6 +40,7 @@ from equity_engine.experiment import (
     CostEvidenceIdentity,
     CostModelIdentity,
     CostReconciliationEvidence,
+    CurrentCalibrationReference,
     DataLeakageError,
     DatasetFingerprintMismatchError,
     EmbargoSpec,
@@ -576,3 +583,180 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
 
     with pytest.raises(MissingEvidenceError, match="max drawdown 15.50% exceeds allowed 10.0%"):
         failing_exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+def test_historical_actual_identity_cannot_be_constructed_from_a_digest() -> None:
+    fields = {
+        "ledger_schema_version": "effective-dated-cost-ledger/v1",
+        "ledger_fingerprint": "a" * 64,
+        "evidence_classification": "HISTORICAL_ACTUAL_COSTS",
+        "historical_actual": True,
+        "product_scope": LedgerProduct.INTRADAY.value,
+        "evidence_mode": "historical_resolution",
+        "policy_identity": "test-policy",
+        "resolved_on_date": date(2026, 6, 30),
+        "selected_record_ids": (),
+        "unknown_components": (),
+    }
+    with pytest.raises(ValueError, match="concrete ledger"):
+        CostEvidenceIdentity(**fields)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        CostEvidenceIdentity(**fields, _verified_ledger_fingerprint="a" * 64)
+
+
+def test_cost_identity_uses_real_product_aware_ledger_assessment() -> None:
+    ledger = EffectiveDatedCostLedger()
+    identity = CostEvidenceIdentity.from_ledger(
+        ledger,
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.DELIVERY,
+    )
+    assessment = ledger.describe(date(2026, 6, 30), LedgerProduct.DELIVERY)
+    assert identity.ledger_fingerprint == ledger.fingerprint()
+    assert identity.product_scope == LedgerProduct.DELIVERY.value
+    assert identity.historical_actual is assessment.historical_actual is False
+    assert identity.unknown_components == tuple(sorted(assessment.unknowns))
+
+    with pytest.raises(TypeError, match="EffectiveDatedCostLedger"):
+        CostEvidenceIdentity.from_ledger(
+            object(), on_date=date(2026, 6, 30), product=LedgerProduct.INTRADAY
+        )
+    with pytest.raises(TypeError, match="LedgerProduct"):
+        CostEvidenceIdentity.from_ledger(
+            ledger,
+            on_date=date(2026, 6, 30),
+            product="INTRADAY",  # type: ignore[arg-type]
+        )
+    with pytest.raises(UnsupportedResearchDate):
+        CostEvidenceIdentity.from_ledger(
+            ledger, on_date=date(2024, 6, 30), product=LedgerProduct.INTRADAY
+        )
+
+
+def test_public_scenario_binds_ledger_fingerprint_and_cannot_promote() -> None:
+    ledger = EffectiveDatedCostLedger()
+    identity = CostEvidenceIdentity.from_public_scenario(
+        ledger,
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.INTRADAY,
+        scenario_identity="documented-public-terms",
+    )
+    assert identity.ledger_fingerprint == ledger.fingerprint()
+    assert identity.evidence_classification == SCENARIO_LABEL
+    assert identity.historical_actual is False
+    assert identity.scenario_identity == "documented-public-terms"
+
+
+def test_current_calibration_is_not_historical_eligibility(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    calibration = CurrentCalibrationReference(
+        snapshot_fingerprint="c" * 64,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+    )
+    with_calibration = replace(baseline_experiment, current_calibration_reference=calibration)
+    with_calibration.validate_integrity()
+    assert with_calibration.current_calibration_reference is not None
+    assert (
+        with_calibration.current_calibration_reference.current_snapshot_not_historical_eligibility
+        is True
+    )
+    assert (
+        with_calibration.deterministic_fingerprint()
+        != baseline_experiment.deterministic_fingerprint()
+    )
+
+    with pytest.raises(ValueError, match="current_snapshot_not_historical_eligibility=True"):
+        CurrentCalibrationReference(
+            snapshot_fingerprint="c" * 64,
+            snapshot_as_of="2026-09-10T09:15:00Z",
+            current_snapshot_not_historical_eligibility=False,
+        )
+
+    with pytest.raises(DataLeakageError, match="historical PIT"):
+        replace(
+            baseline_experiment,
+            current_calibration_reference=CurrentCalibrationReference(
+                snapshot_fingerprint=baseline_experiment.universe_fingerprint,
+                snapshot_as_of="2026-09-10T09:15:00Z",
+            ),
+        )
+
+
+def test_promotion_rejects_scenario_cost_evidence(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    ledger = EffectiveDatedCostLedger()
+    scenario_identity = CostEvidenceIdentity.from_public_scenario(
+        ledger,
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.INTRADAY,
+        scenario_identity="public-broker-model",
+    )
+    scenario_exp = replace(
+        baseline_experiment,
+        cost_evidence_identity=scenario_identity,
+        cost_evidence_class=SCENARIO_LABEL,
+    )
+    # Research integrity passes with scenario evidence
+    scenario_exp.validate_integrity()
+
+    # Promotion gate strictly rejects scenario evidence
+    thresholds = PromotionThresholds(
+        min_trades=10,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal("10.0"),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("1.0"),
+    )
+    passed, violations = scenario_exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("scenario/incomplete evidence cannot promote" in v for v in violations)
+
+    with pytest.raises(MissingEvidenceError, match="scenario/incomplete evidence cannot promote"):
+        scenario_exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+def test_promotion_rejects_incomplete_cost_evidence_with_unknowns(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    ledger = EffectiveDatedCostLedger()
+    delivery_identity = CostEvidenceIdentity.from_ledger(
+        ledger,
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.DELIVERY,
+    )
+    assert delivery_identity.unknown_components
+    delivery_exp = replace(
+        baseline_experiment,
+        cost_evidence_identity=delivery_identity,
+        cost_evidence_class=delivery_identity.evidence_classification,
+    )
+    # Research integrity passes
+    delivery_exp.validate_integrity()
+
+    # Promotion gate rejects unknown components
+    thresholds = PromotionThresholds(
+        min_trades=10,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal("10.0"),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("1.0"),
+    )
+    passed, violations = delivery_exp.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("contains unknown components" in v for v in violations)
+
+    with pytest.raises(MissingEvidenceError, match="contains unknown components"):
+        delivery_exp.validate_integrity(promotion_thresholds=thresholds)
+
+
+def test_current_calibration_cannot_substitute_for_historical_cost_evidence(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    calib = CurrentCalibrationReference(
+        snapshot_fingerprint=baseline_experiment.cost_evidence_identity.ledger_fingerprint,
+        snapshot_as_of="2026-09-10T09:15:00Z",
+    )
+    with pytest.raises(DataLeakageError, match="historical PIT or cost evidence"):
+        replace(baseline_experiment, current_calibration_reference=calib)
