@@ -1524,11 +1524,16 @@ class StageBInstrumentAcquisition:
             raise PITAcquisitionError("Stage-B raw range must cover every eligible date")
         if canonical_eligible_intervals(self.eligible_dates) != self.eligible_intervals:
             raise PITAcquisitionError("Stage-B eligible intervals are not canonical")
-        _require_content_fingerprint(
-            "Stage-B eligibility mask fingerprint", self.eligibility_mask_fingerprint
-        )
         if not self.membership_fingerprint.strip():
             raise PITAcquisitionError("Stage-B membership fingerprint is required")
+        expected_mask = stage_b_eligibility_mask_fingerprint(
+            self.instrument_key, self.eligible_dates, self.membership_fingerprint
+        )
+        if self.eligibility_mask_fingerprint != expected_mask:
+            raise PITAcquisitionError(
+                f"Stage-B eligibility mask fingerprint mismatch for {self.instrument_key}; "
+                "the mask must be recomputed canonically, never hand-supplied"
+            )
         if not self.authorizing_cutoffs or tuple(sorted(set(self.authorizing_cutoffs))) != tuple(
             self.authorizing_cutoffs
         ):
@@ -1545,6 +1550,11 @@ class StageBInstrumentAcquisition:
             raise PITAcquisitionError("Stage-B symbol ranges are not canonical")
         if not self.download_symbol.strip():
             raise PITAcquisitionError("Stage-B download symbol is required")
+        if self.download_symbol != dict(self.symbol_lineage)[max(self.eligible_dates)]:
+            raise PITAcquisitionError(
+                f"Stage-B download symbol for {self.instrument_key} must be the canonical "
+                "date-scoped lineage symbol at the latest eligible date, never a stale symbol"
+            )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -1595,15 +1605,98 @@ def filter_frame_to_eligible_bars(
     return frame.loc[[ts.date() in eligible_set for ts in frame.index]].copy()
 
 
-def consume_research_bars(frame: pd.DataFrame, detail: StageBInstrumentAcquisition) -> pd.DataFrame:
-    """Apply the mandatory eligibility mask before VectorBT/simulator consumption.
+def _filtered_bars_fingerprint(frame: pd.DataFrame) -> str:
+    """Fingerprint filtered research bars: columns, timestamps, and values."""
+    payload = {
+        "columns": [str(column) for column in frame.columns.tolist()],
+        "index": [ts.isoformat() for ts in frame.index.tolist()],
+        "values": [[str(value) for value in row] for row in frame.itertuples(index=False)],
+    }
+    return _fingerprint(payload)
 
-    ``detail`` has no default: a consumer without the mask fails closed with a
-    missing-argument error instead of silently consuming RAW_ACQUISITION_ONLY data.
+
+@dataclass(frozen=True)
+class VerifiedStageBResearchSlice:
+    """Research-ready result produced only by trusted Stage-B verification.
+
+    Distinct from :data:`RAW_ACQUISITION_ONLY` frames: an ordinary raw
+    DataFrame can never assume this type. ``research_bars_fingerprint`` covers
+    the FILTERED bars, never the raw broad-range frame. There is no
+    caller-controlled ``verified`` flag; instances only arise from
+    :func:`consume_research_bars` after trusted plan revalidation.
     """
-    if detail.data_class != RAW_ACQUISITION_ONLY:
-        raise PITAcquisitionError("research bars require RAW_ACQUISITION_ONLY source detail")
-    return filter_frame_to_eligible_bars(frame, detail.eligible_dates)
+
+    instrument_key: str
+    plan_fingerprint: str
+    eligibility_mask_fingerprint: str
+    eligible_dates: tuple[date, ...]
+    research_bars_fingerprint: str
+    data_class: str = "RESEARCH_READY"
+
+    def __post_init__(self) -> None:
+        if not self.instrument_key.strip():
+            raise PITAcquisitionError("verified slice instrument_key is required")
+        _require_content_fingerprint("verified slice plan fingerprint", self.plan_fingerprint)
+        _require_content_fingerprint(
+            "verified slice eligibility mask fingerprint", self.eligibility_mask_fingerprint
+        )
+        _require_content_fingerprint(
+            "verified slice research bars fingerprint", self.research_bars_fingerprint
+        )
+        if (
+            not self.eligible_dates
+            or tuple(sorted(set(self.eligible_dates))) != self.eligible_dates
+        ):
+            raise PITAcquisitionError("verified slice eligible dates must be sorted unique")
+        if self.data_class != "RESEARCH_READY":
+            raise PITAcquisitionError("verified slices must be labelled RESEARCH_READY")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "data_class": self.data_class,
+            "eligibility_mask_fingerprint": self.eligibility_mask_fingerprint,
+            "eligible_dates": [day.isoformat() for day in self.eligible_dates],
+            "instrument_key": self.instrument_key,
+            "plan_fingerprint": self.plan_fingerprint,
+            "research_bars_fingerprint": self.research_bars_fingerprint,
+        }
+
+
+def consume_research_bars(
+    frame: pd.DataFrame,
+    detail: StageBInstrumentAcquisition,
+    *,
+    plan: StageBPlan,
+    stage_a_plan: StageAPlan,
+    trusted_prefilters: tuple[StageAPrefilterResult, ...],
+) -> tuple[pd.DataFrame, VerifiedStageBResearchSlice]:
+    """Produce research-ready bars only after trusted Stage-B revalidation.
+
+    The caller-supplied ``detail`` is never trusted directly: the plan is
+    revalidated against the trusted prefilter artifacts and the caller detail
+    must canonically equal the verified plan detail for its instrument. A
+    self-consistent forgery therefore fails closed. Returns the FILTERED
+    research frame plus its verified slice; gap bars can never enter research.
+    """
+    verified_details = plan.validate_against_prefilter_timeline(
+        stage_a_plan=stage_a_plan, trusted_prefilters=trusted_prefilters
+    )
+    verified_by_key = {item.instrument_key: item for item in verified_details}
+    verified = verified_by_key.get(detail.instrument_key)
+    if verified is None or verified.as_dict() != detail.as_dict():
+        raise PITAcquisitionError(
+            f"unverified Stage-B detail for {detail.instrument_key}; "
+            "research consumption requires trusted plan revalidation"
+        )
+    research_frame = filter_frame_to_eligible_bars(frame, verified.eligible_dates)
+    research_fingerprint = _filtered_bars_fingerprint(research_frame)
+    return research_frame, VerifiedStageBResearchSlice(
+        instrument_key=verified.instrument_key,
+        plan_fingerprint=plan.fingerprint,
+        eligibility_mask_fingerprint=verified.eligibility_mask_fingerprint,
+        eligible_dates=verified.eligible_dates,
+        research_bars_fingerprint=research_fingerprint,
+    )
 
 
 @dataclass(frozen=True)
@@ -1639,6 +1732,62 @@ class StageBPlan:
             raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
         if self.expected_rows_per_trading_day < 1 or self.estimated_bytes_per_row < 1:
             raise ValueError("Stage B storage estimates must be positive and explicit")
+        candidate_keys = tuple(item.instrument_key for item in self.candidates)
+        detail_keys = tuple(item.instrument_key for item in self.details)
+        if tuple(sorted(candidate_keys)) != tuple(sorted(detail_keys)):
+            raise ValueError(
+                "Stage-B candidates and details must correspond exactly: "
+                "no candidate without detail, no detail without candidate"
+            )
+        if len(set(detail_keys)) != len(detail_keys):
+            raise ValueError("Stage-B details contain duplicate instruments")
+        if not self.timeline_cutoffs or tuple(sorted(set(self.timeline_cutoffs))) != tuple(
+            self.timeline_cutoffs
+        ):
+            raise ValueError("Stage-B timeline cutoffs must be sorted unique dates")
+        if len(self.timeline_cutoffs) != len(self.timeline_prefilter_fingerprints):
+            raise ValueError("Stage-B timeline cutoffs and prefilter fingerprints must align")
+        cutoff_to_fingerprint = dict(
+            zip(self.timeline_cutoffs, self.timeline_prefilter_fingerprints, strict=True)
+        )
+        authorized: set[date] = set()
+        by_key = {item.instrument_key: item for item in self.details}
+        for candidate in self.candidates:
+            detail = by_key[candidate.instrument_key]
+            if (
+                candidate.start != detail.raw_start
+                or candidate.end != detail.raw_end
+                or candidate.symbol != detail.download_symbol
+            ):
+                raise ValueError(
+                    f"Stage-B candidate for {candidate.instrument_key} diverges from its detail"
+                )
+            if len(detail.authorizing_cutoffs) != len(detail.authorizing_prefilter_fingerprints):
+                raise ValueError(
+                    f"Stage-B authorizing cutoffs and fingerprints must align for {detail.instrument_key}"
+                )
+            for cutoff, fingerprint in zip(
+                detail.authorizing_cutoffs,
+                detail.authorizing_prefilter_fingerprints,
+                strict=True,
+            ):
+                if cutoff_to_fingerprint.get(cutoff) != fingerprint:
+                    raise ValueError(
+                        f"Stage-B authorizing prefilter fingerprint mismatch for "
+                        f"{detail.instrument_key} at {cutoff.isoformat()}"
+                    )
+                authorized.add(cutoff)
+            if detail.membership_fingerprint != self.source_manifest_sha256:
+                raise ValueError(
+                    f"Stage-B membership fingerprint mismatch for {detail.instrument_key}"
+                )
+            for day in (detail.raw_start, detail.raw_end, *detail.eligible_dates):
+                if not self.boundary.start <= day <= self.boundary.end:
+                    raise ValueError(
+                        f"Stage-B range for {detail.instrument_key} escapes the plan boundary"
+                    )
+        if authorized != set(self.timeline_cutoffs):
+            raise ValueError("Stage-B timeline cutoffs must all authorize at least one detail")
 
     def deterministic_payload(self) -> dict[str, object]:
         return {
@@ -1676,6 +1825,85 @@ class StageBPlan:
     def fingerprint(self) -> str:
         return _fingerprint(self.deterministic_payload())
 
+    def validate_against_prefilter_timeline(
+        self,
+        *,
+        stage_a_plan: StageAPlan,
+        trusted_prefilters: tuple[StageAPrefilterResult, ...],
+    ) -> tuple[StageBInstrumentAcquisition, ...]:
+        """Revalidate this plan against trusted Stage-A prefilter artifacts.
+
+        Rebuilds the expected Stage-B authorization from the trusted prefilters
+        and compares canonical payloads covering instrument population, eligible
+        dates and intervals, membership fingerprint, authorizing cutoffs and
+        prefilter fingerprints, symbol lineage, raw ranges, mask fingerprints,
+        Stage-A plan fingerprint, capital, thresholds, and formation policy.
+        Any mismatch fails closed. Returns the verified expected details.
+        """
+        if not trusted_prefilters:
+            raise PITAcquisitionError("trusted Stage-B revalidation requires prefilters")
+        cutoffs = tuple(item.selection_cutoff for item in trusted_prefilters)
+        if tuple(sorted(set(cutoffs))) != cutoffs:
+            raise PITAcquisitionError("trusted prefilter cutoffs must be sorted unique dates")
+        for prefilter in trusted_prefilters:
+            if not prefilter.complete:
+                raise PITAcquisitionError("trusted prefilter is not complete")
+            if prefilter.stage_a_plan_fingerprint != stage_a_plan.fingerprint:
+                raise PITAcquisitionError("trusted prefilter is not bound to Stage-A plan")
+            if prefilter.source_manifest_sha256 != stage_a_plan.source.manifest_sha256:
+                raise PITAcquisitionError("trusted prefilter source fingerprint mismatch")
+            if prefilter.approved_capital_rupees != stage_a_plan.approved_capital_rupees:
+                raise PITAcquisitionError("trusted prefilter approved capital mismatch")
+        if cutoffs != self.timeline_cutoffs:
+            raise PITAcquisitionError(
+                "trusted Stage-B revalidation cutoff mismatch: "
+                f"plan covers {[day.isoformat() for day in self.timeline_cutoffs]}"
+            )
+        trusted_fingerprints = tuple(item.fingerprint for item in trusted_prefilters)
+        if trusted_fingerprints != self.timeline_prefilter_fingerprints:
+            raise PITAcquisitionError("trusted Stage-B revalidation prefilter fingerprint mismatch")
+        if self.boundary != stage_a_plan.boundary:
+            raise PITAcquisitionError("Stage-B boundary diverges from trusted Stage-A plan")
+        if self.source_manifest_sha256 != stage_a_plan.source.manifest_sha256:
+            raise PITAcquisitionError(
+                "Stage-B source fingerprint diverges from trusted Stage-A plan"
+            )
+        if self.stage_a_plan_fingerprint != stage_a_plan.fingerprint:
+            raise PITAcquisitionError("Stage-B Stage-A fingerprint diverges from trusted plan")
+        if self.approved_capital_rupees != stage_a_plan.approved_capital_rupees:
+            raise PITAcquisitionError("Stage-B capital diverges from trusted Stage-A plan")
+        if self.thresholds != stage_a_plan.thresholds:
+            raise PITAcquisitionError("Stage-B thresholds diverge from trusted Stage-A plan")
+        if self.formation_policy != stage_a_plan.formation_policy:
+            raise PITAcquisitionError("Stage-B formation policy diverges from trusted Stage-A plan")
+        if self.universe_rule_version != stage_a_plan.universe_rule_version:
+            raise PITAcquisitionError("Stage-B universe rule diverges from trusted Stage-A plan")
+        if self.adjustment_policy != stage_a_plan.adjustment_policy:
+            raise PITAcquisitionError(
+                "Stage-B adjustment policy diverges from trusted Stage-A plan"
+            )
+        expected = _stage_b_details_for_covering(
+            stage_a_plan, _covering_from_prefilters(trusted_prefilters)
+        )
+        if [item.as_dict() for item in expected] != [item.as_dict() for item in self.details]:
+            raise PITAcquisitionError(
+                "trusted Stage-B revalidation mismatch: plan details diverge from the "
+                "authorization rebuilt from trusted prefilter artifacts"
+            )
+        expected_combined = (
+            trusted_fingerprints[0]
+            if len(trusted_fingerprints) == 1
+            else _fingerprint({"timeline_prefilter_fingerprints": list(trusted_fingerprints)})
+        )
+        if expected_combined != self.prefilter_fingerprint:
+            raise PITAcquisitionError("Stage-B combined prefilter fingerprint mismatch")
+        expected_candidates = _stage_b_candidates_from_details(expected)
+        if [(c.instrument_key, c.symbol, c.start, c.end) for c in expected_candidates] != [
+            (c.instrument_key, c.symbol, c.start, c.end) for c in self.candidates
+        ]:
+            raise PITAcquisitionError("Stage-B candidates diverge from verified details")
+        return expected
+
     def as_dict(self) -> dict[str, object]:
         return {
             "deterministic_fingerprint": self.fingerprint,
@@ -1702,6 +1930,100 @@ class StageBPlan:
             },
             **self.deterministic_payload(),
         }
+
+
+def _covering_from_prefilters(
+    prefilters: tuple[StageAPrefilterResult, ...],
+) -> dict[str, list[StageAPrefilterResult]]:
+    """Map each eligible instrument to the prefilters authorizing it, in order."""
+    covering: dict[str, list[StageAPrefilterResult]] = {}
+    for prefilter in prefilters:
+        for decision in prefilter.decisions:
+            if decision.eligible:
+                if prefilter not in covering.setdefault(decision.instrument_key, []):
+                    covering[decision.instrument_key].append(prefilter)
+    for key in covering:
+        covering[key] = sorted(covering[key], key=lambda item: item.selection_cutoff)
+    return covering
+
+
+def _stage_b_details_for_covering(
+    stage_a_plan: StageAPlan,
+    covering: dict[str, list[StageAPrefilterResult]],
+) -> tuple[StageBInstrumentAcquisition, ...]:
+    """Build canonical per-instrument details; shared by builders and revalidation.
+
+    Only eligible decisions carrying date-bounded corporate-action evidence can
+    authorize Stage-B eligibility. Opaque unscoped assessments authorize
+    exploratory single-cutoff evaluation but never research acquisition.
+    """
+    date_by_key = {item.instrument_key: item for item in stage_a_plan.candidates}
+    details: list[StageBInstrumentAcquisition] = []
+    for key in sorted(covering):
+        for prefilter in covering[key]:
+            decision = next(
+                item for item in prefilter.decisions if item.instrument_key == key and item.eligible
+            )
+            if decision.ca_source_fingerprint is None:
+                raise IncompletePrefilterError(
+                    f"opaque corporate-action evidence cannot authorize Stage-B eligibility "
+                    f"for {key}; supply date-bounded CorporateActionEvidenceClaim"
+                )
+        source_candidate = date_by_key.get(key)
+        if source_candidate is None:
+            raise IncompletePrefilterError(
+                f"prefilter contains an instrument absent from Stage A: {key}"
+            )
+        max_covered_cutoff = max(item.selection_cutoff for item in covering[key])
+        union_dates = tuple(
+            day for day in source_candidate.eligible_dates if day <= max_covered_cutoff
+        )
+        if not union_dates:
+            raise IncompletePrefilterError(f"no eligible dates covered for {key}")
+        authorizing = covering[key]
+        lineage = tuple(
+            (day, symbol)
+            for day, symbol in source_candidate.symbol_by_date
+            if day <= max_covered_cutoff
+        )
+        # Download label uses the canonical lineage symbol at the latest eligible
+        # date, never a stale prior-session symbol from a cutoff-day rename.
+        symbol = dict(lineage)[max(union_dates)]
+        details.append(
+            StageBInstrumentAcquisition(
+                instrument_key=key,
+                data_class=RAW_ACQUISITION_ONLY,
+                raw_start=min(union_dates),
+                raw_end=max(union_dates),
+                eligible_dates=union_dates,
+                eligible_intervals=canonical_eligible_intervals(union_dates),
+                eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
+                    key, union_dates, stage_a_plan.source.manifest_sha256
+                ),
+                membership_fingerprint=stage_a_plan.source.manifest_sha256,
+                authorizing_cutoffs=tuple(item.selection_cutoff for item in authorizing),
+                authorizing_prefilter_fingerprints=tuple(item.fingerprint for item in authorizing),
+                symbol_lineage=lineage,
+                symbol_ranges=symbol_ranges_for(lineage),
+                download_symbol=symbol,
+            )
+        )
+    return tuple(details)
+
+
+def _stage_b_candidates_from_details(
+    details: tuple[StageBInstrumentAcquisition, ...],
+) -> tuple[HistoricalBatchCandidate, ...]:
+    """Derive downloader candidates from details so the two can never diverge."""
+    return tuple(
+        HistoricalBatchCandidate(
+            instrument_key=item.instrument_key,
+            symbol=item.download_symbol,
+            start=item.raw_start,
+            end=item.raw_end,
+        )
+        for item in sorted(details, key=lambda item: item.instrument_key)
+    )
 
 
 def build_stage_b_plan(
@@ -1755,56 +2077,9 @@ def build_stage_b_plan(
     if interval_minutes != 5:
         raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
 
-    date_by_key = {item.instrument_key: item for item in stage_a_plan.candidates}
-    candidates: list[HistoricalBatchCandidate] = []
-    details: list[StageBInstrumentAcquisition] = []
-    trading_day_counts: dict[str, int] = {}
-    for decision in prefilter.decisions:
-        if not decision.eligible:
-            continue
-        source_candidate = date_by_key.get(decision.instrument_key)
-        if source_candidate is None:
-            raise IncompletePrefilterError(
-                f"prefilter contains an instrument absent from Stage A: {decision.instrument_key}"
-            )
-        dates = tuple(
-            day for day in source_candidate.eligible_dates if day <= prefilter.selection_cutoff
-        )
-        lineage = tuple(
-            (day, symbol)
-            for day, symbol in source_candidate.symbol_by_date
-            if day <= prefilter.selection_cutoff
-        )
-        candidates.append(
-            HistoricalBatchCandidate(
-                instrument_key=decision.instrument_key,
-                symbol=decision.symbol,
-                start=min(dates),
-                end=max(dates),
-            )
-        )
-        trading_day_counts[decision.instrument_key] = len(dates)
-        details.append(
-            StageBInstrumentAcquisition(
-                instrument_key=decision.instrument_key,
-                data_class=RAW_ACQUISITION_ONLY,
-                raw_start=min(dates),
-                raw_end=max(dates),
-                eligible_dates=dates,
-                eligible_intervals=canonical_eligible_intervals(dates),
-                eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
-                    decision.instrument_key, dates, stage_a_plan.source.manifest_sha256
-                ),
-                membership_fingerprint=stage_a_plan.source.manifest_sha256,
-                authorizing_cutoffs=(prefilter.selection_cutoff,),
-                authorizing_prefilter_fingerprints=(prefilter.fingerprint,),
-                symbol_lineage=lineage,
-                symbol_ranges=symbol_ranges_for(lineage),
-                download_symbol=decision.symbol,
-            )
-        )
-    candidates.sort(key=lambda item: item.instrument_key)
-    details.sort(key=lambda item: item.instrument_key)
+    details = _stage_b_details_for_covering(stage_a_plan, _covering_from_prefilters((prefilter,)))
+    candidates = _stage_b_candidates_from_details(details)
+    trading_day_counts = {item.instrument_key: len(item.eligible_dates) for item in details}
     if not candidates:
         raise IncompletePrefilterError("complete Stage-A prefilter produced no Stage-B candidates")
     plan = plan_historical_batch(
@@ -1882,69 +2157,12 @@ def build_stage_b_plan_from_timeline(
     if interval_minutes != 5:
         raise ValueError("Stage B initially supports only the explicit 5-minute resolution")
 
-    date_by_key = {item.instrument_key: item for item in stage_a_plan.candidates}
-    covered: dict[str, list[StageAPrefilterResult]] = {}
-    for prefilter in prefilters:
-        for decision in prefilter.decisions:
-            if decision.eligible:
-                covered.setdefault(decision.instrument_key, []).append(prefilter)
-    if not covered:
+    covering = _covering_from_prefilters(prefilters)
+    if not covering:
         raise IncompletePrefilterError("timeline prefilters produced no eligible candidates")
-
-    candidates: list[HistoricalBatchCandidate] = []
-    details: list[StageBInstrumentAcquisition] = []
-    trading_day_counts: dict[str, int] = {}
-    for key in sorted(covered):
-        source_candidate = date_by_key.get(key)
-        if source_candidate is None:
-            raise IncompletePrefilterError(
-                f"timeline prefilter contains an instrument absent from Stage A: {key}"
-            )
-        max_covered_cutoff = max(item.selection_cutoff for item in covered[key])
-        union_dates = tuple(
-            day for day in source_candidate.eligible_dates if day <= max_covered_cutoff
-        )
-        if not union_dates:
-            raise IncompletePrefilterError(f"no eligible dates covered for {key}")
-        authorizing = sorted(covered[key], key=lambda item: item.selection_cutoff)
-        lineage = tuple(
-            (day, symbol)
-            for day, symbol in source_candidate.symbol_by_date
-            if day <= max_covered_cutoff
-        )
-        # Download label uses the latest sourced symbol in range; the full
-        # date-scoped lineage below remains the historical provenance.
-        symbol = dict(lineage)[max(union_dates)]
-        candidates.append(
-            HistoricalBatchCandidate(
-                instrument_key=key,
-                symbol=symbol,
-                start=min(union_dates),
-                end=max(union_dates),
-            )
-        )
-        trading_day_counts[key] = len(union_dates)
-        details.append(
-            StageBInstrumentAcquisition(
-                instrument_key=key,
-                data_class=RAW_ACQUISITION_ONLY,
-                raw_start=min(union_dates),
-                raw_end=max(union_dates),
-                eligible_dates=union_dates,
-                eligible_intervals=canonical_eligible_intervals(union_dates),
-                eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
-                    key, union_dates, stage_a_plan.source.manifest_sha256
-                ),
-                membership_fingerprint=stage_a_plan.source.manifest_sha256,
-                authorizing_cutoffs=tuple(item.selection_cutoff for item in authorizing),
-                authorizing_prefilter_fingerprints=tuple(item.fingerprint for item in authorizing),
-                symbol_lineage=lineage,
-                symbol_ranges=symbol_ranges_for(lineage),
-                download_symbol=symbol,
-            )
-        )
-    candidates.sort(key=lambda item: item.instrument_key)
-    details.sort(key=lambda item: item.instrument_key)
+    details = _stage_b_details_for_covering(stage_a_plan, covering)
+    candidates = _stage_b_candidates_from_details(details)
+    trading_day_counts = {item.instrument_key: len(item.eligible_dates) for item in details}
     plan = plan_historical_batch(
         candidates=candidates,
         interval_minutes=interval_minutes,

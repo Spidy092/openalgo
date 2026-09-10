@@ -17,6 +17,7 @@ import pytest
 from equity_engine.documented_costs import CurrentTermsNSEIntradayCostProvider
 from equity_engine.pit_historical_acquisition import (
     AcquisitionRateLimit,
+    CorporateActionEvidenceClaim,
     IncompleteUniverseManifestError,
     IncompletePrefilterError,
     PITFormationPolicy,
@@ -177,8 +178,26 @@ def _daily_frame() -> pd.DataFrame:
     )
 
 
-def _prefilter(plan, frame: pd.DataFrame | None = None) -> StageAPrefilterResult:
+def _claim(key: str, cutoff: date, start: date) -> CorporateActionEvidenceClaim:
+    return CorporateActionEvidenceClaim(
+        instrument_key=key,
+        assessment_as_of=cutoff,
+        coverage_start=start,
+        coverage_end=cutoff,
+        source_fingerprint="e" * 64,
+        policy_identity="ca-policy-v1",
+        blocking_events=(),
+        complete=True,
+    )
+
+
+def _prefilter(
+    plan, frame: pd.DataFrame | None = None, *, with_claims: bool = False
+) -> StageAPrefilterResult:
     key = "NSE_EQ|INE000000001"
+    kwargs: dict[str, object] = {}
+    if with_claims:
+        kwargs["corporate_action_claims"] = {key: _claim(key, plan.boundary.end, date(2026, 9, 7))}
     return build_stage_a_prefilter(
         stage_a_plan=plan,
         daily_frames={key: frame if frame is not None else _daily_frame()},
@@ -192,6 +211,7 @@ def _prefilter(plan, frame: pd.DataFrame | None = None) -> StageAPrefilterResult
         minimum_tradable_quantities={key: 1},
         cost_provider=CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7)),
         selection_cutoff=plan.boundary.end,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -287,7 +307,7 @@ def test_stage_a_prefilter_is_complete_only_when_all_daily_data_is_present(tmp_p
 
 def test_stage_b_is_bound_to_complete_prefilter_and_estimates_minute_storage(tmp_path: Path):
     plan = _plan(tmp_path)
-    prefilter = _prefilter(plan)
+    prefilter = _prefilter(plan, with_claims=True)
     stage_b = build_stage_b_plan(
         stage_a_plan=plan,
         prefilter=prefilter,

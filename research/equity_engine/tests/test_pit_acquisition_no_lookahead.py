@@ -32,6 +32,7 @@ from equity_engine.pit_historical_acquisition import (
     PITAcquisitionError,
     PITFormationPolicy,
     PITResearchBoundary,
+    _filtered_bars_fingerprint,
     build_stage_a_plan,
     build_stage_a_prefilter,
     build_stage_a_prefilter_timeline,
@@ -40,6 +41,7 @@ from equity_engine.pit_historical_acquisition import (
     canonical_eligible_intervals,
     consume_research_bars,
     prior_completed_trading_session,
+    stage_b_eligibility_mask_fingerprint,
     symbol_ranges_for,
 )
 from equity_engine.tick_size import FixedTickSizePolicy
@@ -526,7 +528,7 @@ def test_delisted_stock_remains_in_early_window_union(tmp_path: Path) -> None:
     # A final-day-only plan would drop the delisted name entirely.
     final_only = build_stage_b_plan(
         stage_a_plan=plan,
-        prefilter=final,
+        prefilter=timeline[1],
         interval_minutes=5,
         expected_rows_per_trading_day=75,
         estimated_bytes_per_row=80,
@@ -703,6 +705,9 @@ def test_eligibility_gap_raw_bars_removed_by_mandatory_mask(tmp_path: Path) -> N
     prefilter = build_stage_a_prefilter(
         **_single_kwargs(plan, frames, (KEY_A,)),
         selection_cutoff=thu,  # type: ignore[arg-type]
+        corporate_action_claims=_ca_claims(
+            (KEY_A,), as_of=thu, coverage_start=mon, coverage_end=thu
+        ),
     )
     assert prefilter.decisions[0].eligible is True
     stage_b = build_stage_b_plan(
@@ -728,9 +733,13 @@ def test_eligibility_gap_raw_bars_removed_by_mandatory_mask(tmp_path: Path) -> N
             thu: Decimal("103"),
         }
     )
-    research = consume_research_bars(raw, detail)
+    research, verified = consume_research_bars(
+        raw, detail, plan=stage_b, stage_a_plan=plan, trusted_prefilters=(prefilter,)
+    )
     assert tuple(research.index.date) == (mon, wed, thu)
     assert (research["close"] == 999999).sum() == 0
+    assert verified.data_class == "RESEARCH_READY"
+    assert verified.eligible_dates == (mon, wed, thu)
 
 
 def test_consumer_without_mask_fails_closed(tmp_path: Path) -> None:
@@ -745,6 +754,9 @@ def test_consumer_without_mask_fails_closed(tmp_path: Path) -> None:
     prefilter = build_stage_a_prefilter(
         **_single_kwargs(plan, frames, (KEY_A,)),
         selection_cutoff=tue,  # type: ignore[arg-type]
+        corporate_action_claims=_ca_claims(
+            (KEY_A,), as_of=tue, coverage_start=mon, coverage_end=tue
+        ),
     )
     stage_b = build_stage_b_plan(
         stage_a_plan=plan,
@@ -757,7 +769,13 @@ def test_consumer_without_mask_fails_closed(tmp_path: Path) -> None:
     )
     thin = _midnight_frame({mon: Decimal("100")})
     with pytest.raises(PITAcquisitionError, match="missing eligible observations"):
-        consume_research_bars(thin, stage_b.details[0])
+        consume_research_bars(
+            thin,
+            stage_b.details[0],
+            plan=stage_b,
+            stage_a_plan=plan,
+            trusted_prefilters=(prefilter,),
+        )
 
 
 def test_multi_window_cannot_use_single_final_cutoff(tmp_path: Path) -> None:
@@ -821,11 +839,11 @@ def test_delist_relist_union_and_intervals(tmp_path: Path) -> None:
         tmp_path,
         (d1, d2, d3, d4, d5),
         {
-            d1: [_row(d1, KEY_A, "OPEN")],
-            d2: [_row(d2, KEY_A, "OPEN", eligible=False)],
-            d3: [_row(d3, KEY_A, "OPEN", eligible=False)],
-            d4: [_row(d4, KEY_A, "OPEN", eligible=False)],
-            d5: [_row(d5, KEY_A, "OPEN")],
+            d1: [_row(d1, KEY_A, "OPEN"), _row(d1, KEY_B, "STEADY")],
+            d2: [_row(d2, KEY_A, "OPEN", eligible=False), _row(d2, KEY_B, "STEADY")],
+            d3: [_row(d3, KEY_A, "OPEN", eligible=False), _row(d3, KEY_B, "STEADY")],
+            d4: [_row(d4, KEY_A, "OPEN", eligible=False), _row(d4, KEY_B, "STEADY")],
+            d5: [_row(d5, KEY_A, "OPEN"), _row(d5, KEY_B, "STEADY")],
         },
     )
     frames = {
@@ -837,17 +855,29 @@ def test_delist_relist_union_and_intervals(tmp_path: Path) -> None:
                 d4: Decimal("103"),
                 d5: Decimal("104"),
             }
-        )
+        ),
+        KEY_B: _midnight_frame(
+            {
+                d1: Decimal("100"),
+                d2: Decimal("101"),
+                d3: Decimal("102"),
+                d4: Decimal("103"),
+                d5: Decimal("104"),
+            }
+        ),
     }
-    kwargs = _single_kwargs(plan, frames, (KEY_A,))
+    kwargs = _single_kwargs(plan, frames, (KEY_A, KEY_B))
     early = build_stage_a_prefilter(**kwargs, selection_cutoff=d2)  # type: ignore[arg-type]
-    assert {d.instrument_key: d.eligible for d in early.decisions} == {KEY_A: True}
+    assert {d.instrument_key: d.eligible for d in early.decisions} == {
+        KEY_A: True,
+        KEY_B: True,
+    }
     timeline = build_stage_a_prefilter_timeline(
         **kwargs,  # type: ignore[arg-type]
         selection_cutoffs=(d2, d5),
         corporate_action_claims_by_cutoff={
-            d2: _ca_claims((KEY_A,), as_of=d2, coverage_start=d1, coverage_end=d2),
-            d5: _ca_claims((KEY_A,), as_of=d5, coverage_start=d1, coverage_end=d5),
+            d2: _ca_claims((KEY_A, KEY_B), as_of=d2, coverage_start=d1, coverage_end=d2),
+            d5: _ca_claims((KEY_A, KEY_B), as_of=d5, coverage_start=d1, coverage_end=d5),
         },
     )
     union = build_stage_b_plan_from_timeline(
@@ -858,11 +888,12 @@ def test_delist_relist_union_and_intervals(tmp_path: Path) -> None:
         estimated_bytes_per_row=80,
         rate_limit=_rate_limit(),
     )
-    detail = union.details[0]
+    by_detail = {item.instrument_key: item for item in union.details}
     # Relisted names stay acquired for the early window that authorized them.
-    assert detail.eligible_dates == (d1,)
-    assert detail.eligible_intervals == ((d1, d1),)
-    assert detail.authorizing_cutoffs == (d2,)
+    assert by_detail[KEY_A].eligible_dates == (d1,)
+    assert by_detail[KEY_A].eligible_intervals == ((d1, d1),)
+    assert by_detail[KEY_A].authorizing_cutoffs == (d2,)
+    assert by_detail[KEY_B].eligible_dates == (d1, d2, d3, d4, d5)
 
 
 def test_symbol_lineage_preserved_in_stage_b(tmp_path: Path) -> None:
@@ -874,7 +905,10 @@ def test_symbol_lineage_preserved_in_stage_b(tmp_path: Path) -> None:
     )
     frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
     kwargs = _single_kwargs(plan, frames, (KEY_A,))
-    timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
+    claims = {d2: _ca_claims((KEY_A,), as_of=d2, coverage_start=d1, coverage_end=d2)}
+    timeline = build_stage_a_prefilter_timeline(  # type: ignore[arg-type]
+        **kwargs, selection_cutoffs=(d2,), corporate_action_claims_by_cutoff=claims
+    )
     union = build_stage_b_plan_from_timeline(
         stage_a_plan=plan,
         prefilters=timeline,
@@ -897,8 +931,13 @@ def test_stage_b_details_deterministic_fingerprint(tmp_path: Path) -> None:
     )
     frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
     kwargs = _single_kwargs(plan, frames, (KEY_A,))
-    first_timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
-    second_timeline = build_stage_a_prefilter_timeline(**kwargs, selection_cutoffs=(d2,))  # type: ignore[arg-type]
+    claims = {d2: _ca_claims((KEY_A,), as_of=d2, coverage_start=d1, coverage_end=d2)}
+    first_timeline = build_stage_a_prefilter_timeline(  # type: ignore[arg-type]
+        **kwargs, selection_cutoffs=(d2,), corporate_action_claims_by_cutoff=claims
+    )
+    second_timeline = build_stage_a_prefilter_timeline(  # type: ignore[arg-type]
+        **kwargs, selection_cutoffs=(d2,), corporate_action_claims_by_cutoff=claims
+    )
     first = build_stage_b_plan_from_timeline(
         stage_a_plan=plan,
         prefilters=first_timeline,
@@ -919,6 +958,251 @@ def test_stage_b_details_deterministic_fingerprint(tmp_path: Path) -> None:
     assert first.details[0].data_class == RAW_ACQUISITION_ONLY
     assert first.details[0].membership_fingerprint == plan.source.manifest_sha256
     assert first.details[0].authorizing_prefilter_fingerprints == (first_timeline[0].fingerprint,)
-    tampered = replace(first.details[0], download_symbol="TAMPERED")
-    forged = replace(first, details=(tampered,))
-    assert forged.fingerprint != first.fingerprint
+    # Canonical gates fail closed at construction: a stale download symbol cannot
+    # even be built, while a non-derived plan field still changes identity.
+    with pytest.raises(PITAcquisitionError, match="canonical date-scoped lineage"):
+        replace(first.details[0], download_symbol="TAMPERED")
+    assert replace(first, expected_rows_per_trading_day=76).fingerprint != first.fingerprint
+
+
+def _exploit_fixture(tmp_path: Path):  # type: ignore[no-untyped-def]
+    """Genuine trusted timeline with KEY_A eligible exactly on D1, D2, D5."""
+    d1, d2, d3, d4, d5, d6 = (
+        date(2026, 9, 7),
+        date(2026, 9, 8),
+        date(2026, 9, 9),
+        date(2026, 9, 10),
+        date(2026, 9, 11),
+        date(2026, 9, 14),
+    )
+    dates = (d1, d2, d3, d4, d5, d6)
+    plan = _stage_a_plan_for(
+        tmp_path,
+        dates,
+        {
+            d1: [_row(d1, KEY_A, "OPEN"), _row(d1, KEY_B, "STEADY")],
+            d2: [_row(d2, KEY_A, "OPEN"), _row(d2, KEY_B, "STEADY")],
+            d3: [_row(d3, KEY_A, "OPEN", eligible=False), _row(d3, KEY_B, "STEADY")],
+            d4: [_row(d4, KEY_A, "OPEN", eligible=False), _row(d4, KEY_B, "STEADY")],
+            d5: [_row(d5, KEY_A, "OPEN"), _row(d5, KEY_B, "STEADY")],
+            d6: [_row(d6, KEY_A, "OPEN", eligible=False), _row(d6, KEY_B, "STEADY")],
+        },
+    )
+    frames = {
+        KEY_A: _midnight_frame(
+            {d1: Decimal("100"), d2: Decimal("101"), d5: Decimal("102"), d6: Decimal("103")}
+        ),
+        KEY_B: _midnight_frame(
+            {
+                d1: Decimal("100"),
+                d2: Decimal("101"),
+                d3: Decimal("102"),
+                d4: Decimal("103"),
+                d5: Decimal("104"),
+                d6: Decimal("105"),
+            }
+        ),
+    }
+    kwargs = _single_kwargs(plan, frames, (KEY_A, KEY_B))
+    timeline = build_stage_a_prefilter_timeline(
+        **kwargs,  # type: ignore[arg-type]
+        selection_cutoffs=(d2, d6),
+        corporate_action_claims_by_cutoff={
+            d2: _ca_claims((KEY_A, KEY_B), as_of=d2, coverage_start=d1, coverage_end=d2),
+            d6: _ca_claims((KEY_A, KEY_B), as_of=d6, coverage_start=d1, coverage_end=d6),
+        },
+    )
+    union = build_stage_b_plan_from_timeline(
+        stage_a_plan=plan,
+        prefilters=timeline,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+    )
+    by_detail = {item.instrument_key: item for item in union.details}
+    assert by_detail[KEY_A].eligible_dates == (d1, d2, d5)
+    return plan, timeline, union, by_detail, (d1, d2, d3, d4, d5, d6)
+
+
+def _forged_a_detail(genuine, plan, d3):  # type: ignore[no-untyped-def]
+    """Self-consistent forgery injecting ineligible D3 with a recomputed mask."""
+    forged_dates = (
+        genuine.eligible_dates[0],
+        genuine.eligible_dates[1],
+        d3,
+        genuine.eligible_dates[2],
+    )
+    lineage = tuple(sorted(genuine.symbol_lineage + ((d3, "OPEN"),)))
+    return replace(
+        genuine,
+        eligible_dates=forged_dates,
+        eligible_intervals=canonical_eligible_intervals(forged_dates),
+        eligibility_mask_fingerprint=stage_b_eligibility_mask_fingerprint(
+            genuine.instrument_key, forged_dates, genuine.membership_fingerprint
+        ),
+        symbol_lineage=lineage,
+        symbol_ranges=symbol_ranges_for(lineage),
+    )
+
+
+def test_forged_self_consistent_detail_rejected_by_trusted_revalidation(
+    tmp_path: Path,
+) -> None:
+    plan, timeline, union, by_detail, dates = _exploit_fixture(tmp_path)
+    d1, d2, d3, _d4, _d5, _d6 = dates
+    forged_a = _forged_a_detail(by_detail[KEY_A], plan, d3)
+    # The forgery is internally self-consistent, so construction alone passes.
+    assert forged_a.eligible_dates == (d1, d2, d3, dates[4])
+    forged_plan = replace(
+        union,
+        details=(forged_a, by_detail[KEY_B]),
+    )
+    with pytest.raises(PITAcquisitionError, match="revalidation mismatch"):
+        forged_plan.validate_against_prefilter_timeline(
+            stage_a_plan=plan, trusted_prefilters=timeline
+        )
+    # And it can never enter a verified research result.
+    raw = _midnight_frame(
+        {d1: Decimal("100"), d2: Decimal("101"), d3: Decimal("999999"), dates[4]: Decimal("102")}
+    )
+    with pytest.raises(PITAcquisitionError, match="revalidation"):
+        consume_research_bars(
+            raw, forged_a, plan=forged_plan, stage_a_plan=plan, trusted_prefilters=timeline
+        )
+
+
+def test_verified_consumption_excludes_injected_gap_bar(tmp_path: Path) -> None:
+    plan, timeline, union, by_detail, dates = _exploit_fixture(tmp_path)
+    d1, d2, d3, _d4, d5, _d6 = dates
+    raw = _midnight_frame(
+        {d1: Decimal("100"), d2: Decimal("101"), d3: Decimal("999999"), d5: Decimal("102")}
+    )
+    research, verified = consume_research_bars(
+        raw,
+        by_detail[KEY_A],
+        plan=union,
+        stage_a_plan=plan,
+        trusted_prefilters=timeline,
+    )
+    assert tuple(research.index.date) == (d1, d2, d5)
+    assert (research["close"] == 999999).sum() == 0
+    assert verified.data_class == "RESEARCH_READY"
+    assert verified.research_bars_fingerprint == _filtered_bars_fingerprint(research)
+    assert verified.research_bars_fingerprint != _filtered_bars_fingerprint(raw)
+
+
+def test_fake_mask_hash_rejected_at_construction(tmp_path: Path) -> None:
+    _plan_obj, _timeline, union, by_detail, _dates = _exploit_fixture(tmp_path)
+    with pytest.raises(PITAcquisitionError, match="mask fingerprint mismatch"):
+        replace(by_detail[KEY_A], eligibility_mask_fingerprint="f" * 64)
+
+
+def test_changed_cutoff_rejected_by_revalidation(tmp_path: Path) -> None:
+    plan, timeline, union, _by_detail, _dates = _exploit_fixture(tmp_path)
+    with pytest.raises(PITAcquisitionError, match="cutoff mismatch"):
+        union.validate_against_prefilter_timeline(
+            stage_a_plan=plan, trusted_prefilters=(timeline[0],)
+        )
+
+
+def test_changed_prefilter_fingerprint_rejected(tmp_path: Path) -> None:
+    plan, timeline, union, _by_detail, _dates = _exploit_fixture(tmp_path)
+    tampered = replace(timeline[1], stage_a_plan_fingerprint="0" * 64)
+    with pytest.raises(PITAcquisitionError, match="not bound"):
+        union.validate_against_prefilter_timeline(
+            stage_a_plan=plan, trusted_prefilters=(timeline[0], tampered)
+        )
+    # A differently-valued but well-bound prefilter still fails fingerprint agreement.
+    d1, d2, d3, d4, d5, d6 = _dates
+    alt_frames = {
+        KEY_A: _midnight_frame(
+            {d1: Decimal("100"), d2: Decimal("101"), d5: Decimal("103"), d6: Decimal("104")}
+        ),
+        KEY_B: _midnight_frame(
+            {
+                d1: Decimal("100"),
+                d2: Decimal("101"),
+                d3: Decimal("102"),
+                d4: Decimal("103"),
+                d5: Decimal("104"),
+                d6: Decimal("105"),
+            }
+        ),
+    }
+    alt_d6 = build_stage_a_prefilter(
+        **_single_kwargs(plan, alt_frames, (KEY_A, KEY_B)),  # type: ignore[arg-type]
+        selection_cutoff=d6,
+        corporate_action_claims=_ca_claims(
+            (KEY_A, KEY_B), as_of=d6, coverage_start=d1, coverage_end=d6
+        ),
+    )
+    assert alt_d6.fingerprint != timeline[1].fingerprint
+    with pytest.raises(PITAcquisitionError, match="fingerprint mismatch"):
+        union.validate_against_prefilter_timeline(
+            stage_a_plan=plan, trusted_prefilters=(timeline[0], alt_d6)
+        )
+
+
+def test_changed_membership_fingerprint_rejected(tmp_path: Path) -> None:
+    plan, _timeline, union, by_detail, _dates = _exploit_fixture(tmp_path)
+    with pytest.raises(ValueError, match="membership fingerprint mismatch"):
+        replace(union, source_manifest_sha256="a" * 64)
+    assert by_detail[KEY_A].membership_fingerprint == plan.source.manifest_sha256
+
+
+def test_single_cutoff_rename_uses_lineage_symbol(tmp_path: Path) -> None:
+    d1, d2 = date(2026, 9, 7), date(2026, 9, 8)
+    plan = _stage_a_plan_for(
+        tmp_path,
+        (d1, d2),
+        {d1: [_row(d1, KEY_A, "OLDNAME")], d2: [_row(d2, KEY_A, "NEWNAME")]},
+    )
+    frames = {KEY_A: _midnight_frame({d1: Decimal("100"), d2: Decimal("101")})}
+    prefilter = build_stage_a_prefilter(
+        **_single_kwargs(plan, frames, (KEY_A,)),  # type: ignore[arg-type]
+        selection_cutoff=d2,
+        corporate_action_claims=_ca_claims((KEY_A,), as_of=d2, coverage_start=d1, coverage_end=d2),
+    )
+    # The decision itself still carries the prior-session symbol...
+    assert prefilter.decisions[0].symbol == "OLDNAME"
+    stage_b = build_stage_b_plan(
+        stage_a_plan=plan,
+        prefilter=prefilter,
+        interval_minutes=5,
+        expected_rows_per_trading_day=75,
+        estimated_bytes_per_row=80,
+        rate_limit=_rate_limit(),
+        window_cutoffs=(d2,),
+    )
+    # ...but the download label must follow the canonical lineage, not the stale one.
+    assert stage_b.candidates[0].symbol == "NEWNAME"
+    assert stage_b.details[0].download_symbol == "NEWNAME"
+    assert stage_b.details[0].symbol_lineage == ((d1, "OLDNAME"), (d2, "NEWNAME"))
+
+
+def test_raw_frame_never_research_ready_without_trusted_detail(tmp_path: Path) -> None:
+    plan, timeline, union, by_detail, dates = _exploit_fixture(tmp_path)
+    raw = _midnight_frame({day: Decimal("100") for day in dates})
+    with pytest.raises(TypeError):
+        consume_research_bars(raw)  # type: ignore[call-arg]
+    with pytest.raises(PITAcquisitionError, match="requires prefilters"):
+        consume_research_bars(
+            raw, by_detail[KEY_A], plan=union, stage_a_plan=plan, trusted_prefilters=()
+        )
+
+
+def test_no_live_or_order_capability(tmp_path: Path) -> None:
+    plan, timeline, union, _by_detail, _dates = _exploit_fixture(tmp_path)
+    assert union.as_dict()["summary"]["live_orders_called"] is False
+    assert plan.as_dict()["live_orders_called"] is False
+    assert timeline[0].as_dict()["live_orders_called"] is False
+    _research, verified = consume_research_bars(
+        _midnight_frame({day: Decimal("100") for day in _dates}),
+        union.details[0],
+        plan=union,
+        stage_a_plan=plan,
+        trusted_prefilters=timeline,
+    )
+    assert "live_orders_called" not in verified.as_dict()
+    assert "order" not in json.dumps(verified.as_dict()).lower()
