@@ -31,7 +31,9 @@ from .cost_ledger import (
     LedgerSide,
     UnsupportedResearchDate,
 )
+from .cost_ledger import SCHEMA_VERSION as COST_LEDGER_SCHEMA_VERSION
 from .gates import DrawdownBasis, PromotionThresholds
+from .historical_cost_scenario import HistoricalCostScenario
 from .provenance import MarketDataManifest, dataframe_fingerprint
 
 EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v3"
@@ -461,6 +463,48 @@ class CostEvidenceIdentity:
                 "public broker scenario is not account-specific historical evidence",
             ),
             scenario_identity=scenario_identity,
+        )
+
+    @classmethod
+    def from_historical_scenario(
+        cls,
+        scenario: HistoricalCostScenario,
+        *,
+        expected_product: LedgerProduct | None = None,
+        policy_identity: str = "historical-cost-scenario/experiment-binding/v1",
+    ) -> CostEvidenceIdentity:
+        """Bind the canonical OpenCode historical scenario into Experiment V3.
+
+        This is an identity bridge only. The scenario remains ``SCENARIO`` and
+        can never establish historical-actual cost evidence or pass promotion.
+        The scenario fingerprint binds all assumptions and resolved rates; the
+        underlying ledger fingerprint remains separately bound for provenance.
+        """
+        if not isinstance(scenario, HistoricalCostScenario):
+            raise TypeError("scenario must be a HistoricalCostScenario")
+        if scenario.classification != SCENARIO_LABEL or scenario.historical_actual:
+            raise ValueError(
+                "historical cost scenario must remain SCENARIO with historical_actual=False"
+            )
+        if expected_product is not None and scenario.product is not expected_product:
+            raise ValueError(
+                f"scenario product {scenario.product.value} does not match expected "
+                f"experiment product {expected_product.value}"
+            )
+        if not isinstance(policy_identity, str) or not policy_identity.strip():
+            raise ValueError("policy_identity is required")
+        return cls(
+            ledger_schema_version=COST_LEDGER_SCHEMA_VERSION,
+            ledger_fingerprint=scenario.ledger_fingerprint,
+            evidence_classification=SCENARIO_LABEL,
+            historical_actual=False,
+            product_scope=scenario.product.value,
+            evidence_mode="historical_cost_scenario",
+            policy_identity=policy_identity,
+            resolved_on_date=scenario.scenario_date,
+            selected_record_ids=scenario.known_record_ids,
+            unknown_components=tuple(sorted(set(scenario.unknowns))),
+            scenario_identity=scenario.fingerprint(),
         )
 
     def as_dict(self) -> dict[str, Any]:

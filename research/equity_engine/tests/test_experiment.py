@@ -28,6 +28,7 @@ from equity_engine.cost_ledger import (
     INCOMPLETE_LABEL,
     SCENARIO_LABEL,
     EffectiveDatedCostLedger,
+    LedgerComponent,
     LedgerProduct,
     UnsupportedResearchDate,
 )
@@ -64,6 +65,7 @@ from equity_engine.experiment import (
     compute_prefilter_artifact_fingerprint,
 )
 from equity_engine.gates import DrawdownBasis, PromotionThresholds
+from equity_engine.historical_cost_scenario import ScenarioAssumption, compile_historical_scenario
 from equity_engine.provenance import MarketDataManifest, dataframe_fingerprint
 
 
@@ -645,6 +647,144 @@ def test_public_scenario_binds_ledger_fingerprint_and_cannot_promote() -> None:
     assert identity.evidence_classification == SCENARIO_LABEL
     assert identity.historical_actual is False
     assert identity.scenario_identity == "documented-public-terms"
+
+
+def _canonical_historical_scenario(
+    *,
+    product: LedgerProduct = LedgerProduct.INTRADAY,
+    brokerage_rate: str = "0.0006",
+):
+    return compile_historical_scenario(
+        scenario_id="integration-scenario",
+        ledger=EffectiveDatedCostLedger(),
+        scenario_date=date(2026, 6, 30),
+        research_start=date(2026, 1, 1),
+        research_end=date(2026, 6, 30),
+        product=product,
+        assumptions=(
+            ScenarioAssumption(
+                assumption_id="integration-brokerage",
+                component=LedgerComponent.BROKERAGE,
+                product=product,
+                basis="integration-test",
+                rate=Decimal(brokerage_rate),
+                formula="turnover-rate",
+                source="integration-test",
+                reason="scenario-only assumption",
+            ),
+            ScenarioAssumption(
+                assumption_id="integration-gst",
+                component=LedgerComponent.GST,
+                product=product,
+                basis="integration-test",
+                rate=Decimal("0.18"),
+                formula="gst-on-known-charges",
+                source="integration-test",
+                reason="scenario-only assumption",
+            ),
+            ScenarioAssumption(
+                assumption_id="integration-clearing",
+                component=LedgerComponent.CLEARING,
+                product=product,
+                basis="integration-test",
+                rate=Decimal("0.000001"),
+                formula="turnover-rate",
+                source="integration-test",
+                reason="scenario-only assumption",
+            ),
+        ),
+    )
+
+
+def test_canonical_historical_scenario_binds_experiment_v3_identity(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    scenario = _canonical_historical_scenario()
+    identity = CostEvidenceIdentity.from_historical_scenario(
+        scenario,
+        expected_product=LedgerProduct.INTRADAY,
+    )
+    scenario_experiment = replace(
+        baseline_experiment,
+        cost_evidence_identity=identity,
+        cost_evidence_class=SCENARIO_LABEL,
+    )
+
+    assert identity.scenario_identity == scenario.fingerprint()
+    assert identity.ledger_fingerprint == scenario.ledger_fingerprint
+    assert identity.product_scope == scenario.product.value
+    assert identity.evidence_classification == SCENARIO_LABEL
+    assert identity.historical_actual is False
+    scenario_experiment.validate_integrity()
+
+    thresholds = PromotionThresholds(
+        min_trades=10,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal(1),
+    )
+    passed, violations = scenario_experiment.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("scenario/incomplete evidence cannot promote" in item for item in violations)
+
+
+def test_scenario_assumption_changes_bind_new_experiment_identity(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    first = _canonical_historical_scenario(brokerage_rate="0.0006")
+    second = _canonical_historical_scenario(brokerage_rate="0.0007")
+    first_identity = CostEvidenceIdentity.from_historical_scenario(first)
+    second_identity = CostEvidenceIdentity.from_historical_scenario(second)
+
+    first_experiment = replace(
+        baseline_experiment,
+        cost_evidence_identity=first_identity,
+        cost_evidence_class=SCENARIO_LABEL,
+    )
+    second_experiment = replace(
+        baseline_experiment,
+        cost_evidence_identity=second_identity,
+        cost_evidence_class=SCENARIO_LABEL,
+    )
+
+    assert first.fingerprint() != second.fingerprint()
+    assert (
+        first_experiment.deterministic_fingerprint()
+        != second_experiment.deterministic_fingerprint()
+    )
+    assert first_identity.ledger_fingerprint == second_identity.ledger_fingerprint
+
+
+def test_scenario_product_mismatch_fails_closed() -> None:
+    scenario = _canonical_historical_scenario(product=LedgerProduct.INTRADAY)
+
+    with pytest.raises(ValueError, match="does not match expected experiment product"):
+        CostEvidenceIdentity.from_historical_scenario(
+            scenario,
+            expected_product=LedgerProduct.DELIVERY,
+        )
+
+
+def test_current_calibration_cannot_collide_with_canonical_scenario_evidence(
+    baseline_experiment: ExperimentArtifact,
+) -> None:
+    scenario = _canonical_historical_scenario()
+    identity = CostEvidenceIdentity.from_historical_scenario(scenario)
+    scenario_experiment = replace(
+        baseline_experiment,
+        cost_evidence_identity=identity,
+        cost_evidence_class=SCENARIO_LABEL,
+    )
+
+    with pytest.raises(DataLeakageError, match="historical PIT or cost evidence"):
+        replace(
+            scenario_experiment,
+            current_calibration_reference=CurrentCalibrationReference(
+                snapshot_fingerprint=identity.ledger_fingerprint,
+                snapshot_as_of="2026-09-10T09:15:00Z",
+            ),
+        )
 
 
 def test_current_calibration_is_not_historical_eligibility(
