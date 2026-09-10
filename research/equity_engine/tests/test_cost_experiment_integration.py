@@ -124,6 +124,8 @@ def _experiment(
             coverage_start=date(2026, 1, 1),
             coverage_end=date(2026, 9, 8),
             covered_instruments=("NSE_EQ|INE002A01018",),
+            _verified_ledger_fingerprint="corporate-action-fingerprint",
+            _verified_covered_instruments=("NSE_EQ|INE002A01018",),
         ),
         cost_model_identity=CostModelIdentity(
             model_name="documented",

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 
-import httpx
+try:
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
 
 from .universe import CorporateActionAssessment
 
@@ -116,7 +119,7 @@ class CorporateActionRecord:
     old_isin: str | None = None
     new_isin: str | None = None
     details: tuple[tuple[str, str], ...] = ()
-    evidence_fingerprint: str = field(default="", compare=False)
+    evidence_fingerprint: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.instrument_key.strip():
@@ -138,14 +141,18 @@ class CorporateActionRecord:
         if aware_ts != self.retrieval_timestamp:
             object.__setattr__(self, "retrieval_timestamp", aware_ts)
 
-        if not self.evidence_fingerprint:
-            computed_fp = self._compute_fingerprint()
-            object.__setattr__(self, "evidence_fingerprint", computed_fp)
+        computed_fp = self._compute_fingerprint()
+        if self.evidence_fingerprint is not None and self.evidence_fingerprint != computed_fp:
+            raise ValueError(
+                f"invalid caller-supplied evidence_fingerprint: "
+                f"expected {computed_fp}, got {self.evidence_fingerprint}"
+            )
+        object.__setattr__(self, "evidence_fingerprint", computed_fp)
 
     @property
-    def knowledge_date(self) -> date:
-        """The earliest date on which this corporate action was known to the market."""
-        return self.announcement_date if self.announcement_date is not None else self.effective_date
+    def knowledge_date(self) -> date | None:
+        """The date on which this corporate action was announced/known, or None if unknown."""
+        return self.announcement_date
 
     def canonical_payload(self) -> dict[str, Any]:
         return {
@@ -186,6 +193,55 @@ class CorporateActionRecord:
         payload["evidence_fingerprint"] = self.fingerprint()
         return payload
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CorporateActionRecord:
+        """Construct record from serialized dictionary, verifying fingerprint integrity."""
+        raw_fp = data.get("evidence_fingerprint")
+        ann_date = (
+            date.fromisoformat(data["announcement_date"])
+            if data.get("announcement_date")
+            else None
+        )
+        ex_date = (
+            date.fromisoformat(data["ex_date"]) if data.get("ex_date") else None
+        )
+        eff_date = date.fromisoformat(data["effective_date"])
+        ret_ts = datetime.fromisoformat(data["retrieval_timestamp"])
+        amt = Decimal(str(data["amount"])) if data.get("amount") is not None else None
+        split_f = (
+            Decimal(str(data["split_factor"]))
+            if data.get("split_factor") is not None
+            else None
+        )
+        raw_details = data.get("details", ())
+        details = tuple(
+            tuple(item) if isinstance(item, (list, tuple)) else item
+            for item in raw_details
+        )
+        return cls(
+            instrument_key=data["instrument_key"],
+            isin=data["isin"],
+            event_type=CorporateActionEventType(data["event_type"]),
+            effective_date=eff_date,
+            source=data["source"],
+            retrieval_timestamp=ret_ts,
+            announcement_date=ann_date,
+            ex_date=ex_date,
+            confidence=CorporateActionConfidence(data.get("confidence", "CONFIRMED")),
+            raw_candles_comparable=bool(data.get("raw_candles_comparable", False)),
+            adjustment_required=bool(data.get("adjustment_required", True)),
+            blocking=bool(data.get("blocking", True)),
+            ratio=data.get("ratio"),
+            amount=amt,
+            split_factor=split_f,
+            from_symbol=data.get("from_symbol"),
+            to_symbol=data.get("to_symbol"),
+            old_isin=data.get("old_isin"),
+            new_isin=data.get("new_isin"),
+            details=details,
+            evidence_fingerprint=raw_fp,
+        )
+
 
 @dataclass(frozen=True)
 class CoverageScope:
@@ -199,7 +255,7 @@ class CoverageScope:
     retrieval_timestamp: datetime
     is_complete: bool = True
     notes: str = ""
-    coverage_fingerprint: str = field(default="", compare=False)
+    coverage_fingerprint: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.start_date > self.end_date:
@@ -219,9 +275,13 @@ class CoverageScope:
         if aware_ts != self.retrieval_timestamp:
             object.__setattr__(self, "retrieval_timestamp", aware_ts)
 
-        if not self.coverage_fingerprint:
-            computed_fp = self._compute_fingerprint()
-            object.__setattr__(self, "coverage_fingerprint", computed_fp)
+        computed_fp = self._compute_fingerprint()
+        if self.coverage_fingerprint is not None and self.coverage_fingerprint != computed_fp:
+            raise ValueError(
+                f"invalid caller-supplied coverage_fingerprint: "
+                f"expected {computed_fp}, got {self.coverage_fingerprint}"
+            )
+        object.__setattr__(self, "coverage_fingerprint", computed_fp)
 
     def canonical_payload(self) -> dict[str, Any]:
         return {
@@ -247,6 +307,22 @@ class CoverageScope:
         payload = self.canonical_payload()
         payload["coverage_fingerprint"] = self.fingerprint()
         return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CoverageScope:
+        """Construct scope from serialized dictionary, verifying fingerprint integrity."""
+        raw_fp = data.get("coverage_fingerprint")
+        return cls(
+            instrument_key=data["instrument_key"],
+            isin=data["isin"],
+            start_date=date.fromisoformat(data["start_date"]),
+            end_date=date.fromisoformat(data["end_date"]),
+            source=data["source"],
+            retrieval_timestamp=datetime.fromisoformat(data["retrieval_timestamp"]),
+            is_complete=bool(data.get("is_complete", True)),
+            notes=str(data.get("notes", "")),
+            coverage_fingerprint=raw_fp,
+        )
 
 
 @dataclass(frozen=True)
@@ -279,10 +355,35 @@ class CorporateActionPolicy:
     )
     allow_ex_post_adjusted_splits: bool = False
     allow_ex_post_adjusted_bonuses: bool = False
-    dividend_policy: DividendPolicy = DividendPolicy.IGNORE_BELOW_THRESHOLD
-    dividend_threshold_percent: Decimal = Decimal("2.0")
+    dividend_policy: DividendPolicy = DividendPolicy.BLOCK_ALL
+    dividend_threshold_percent: Decimal | None = None
     reference_price_for_dividend: Decimal | None = None
     policy_name: str = "DEFAULT_RESEARCH_POLICY"
+
+    def __post_init__(self) -> None:
+        if self.dividend_policy == DividendPolicy.IGNORE_BELOW_THRESHOLD:
+            if (
+                self.dividend_threshold_percent is None
+                or self.dividend_threshold_percent <= 0
+            ):
+                raise ValueError(
+                    "dividend policy IGNORE_BELOW_THRESHOLD requires an explicit positive dividend_threshold_percent; "
+                    "no implicit threshold is permitted"
+                )
+            if (
+                self.reference_price_for_dividend is None
+                or self.reference_price_for_dividend <= 0
+            ):
+                raise ValueError(
+                    "dividend policy IGNORE_BELOW_THRESHOLD requires an explicit positive reference_price_for_dividend; "
+                    "cannot evaluate threshold without a reference price"
+                )
+
+    @property
+    def policy_identity(self) -> str:
+        if self.dividend_policy == DividendPolicy.IGNORE_BELOW_THRESHOLD:
+            return f"{self.policy_name}:IGNORE_BELOW_THRESHOLD:{self.dividend_threshold_percent}%"
+        return f"{self.policy_name}:{self.dividend_policy.value}"
 
 
 @dataclass(frozen=True)
@@ -392,6 +493,8 @@ class UpstoxCorporateActionProvider:
             "Authorization": f"Bearer {self._access_token}",
         }
         if self._client is None:
+            if httpx is None:
+                raise RuntimeError("httpx is required to fetch Upstox corporate actions")
             response = httpx.get(url, headers=headers, timeout=self._timeout_seconds)
         else:
             response = self._client.get(url, headers=headers, timeout=self._timeout_seconds)
@@ -559,15 +662,28 @@ class PointInTimeCorporateActionLedger:
         )
 
     def get_tradable_events(
-        self, instrument_key: str, as_of_date: date
+        self,
+        instrument_key: str,
+        as_of_date: date,
+        *,
+        fail_on_unknown: bool = True,
     ) -> tuple[CorporateActionRecord, ...]:
         """Return events that were known to the market on or before as_of_date.
 
+        If fail_on_unknown is True and any record has an unknown announcement date,
+        raises CorporateActionCoverageError.
         Events announced after as_of_date are strictly filtered out to prevent data leakage.
         """
         known_events: list[CorporateActionRecord] = []
         for record in self.get_records(instrument_key):
-            if record.knowledge_date <= as_of_date:
+            if record.announcement_date is None:
+                if fail_on_unknown:
+                    raise CorporateActionCoverageError(
+                        f"corporate action {record.event_type.value}@{record.effective_date.isoformat()} "
+                        f"has unknown announcement date; cannot determine tradable knowledge as of {as_of_date.isoformat()}"
+                    )
+                continue
+            if record.announcement_date <= as_of_date:
                 known_events.append(record)
         return tuple(known_events)
 
@@ -576,10 +692,15 @@ class PointInTimeCorporateActionLedger:
     ) -> None:
         """Verify that no event in the collection has an announcement after as_of_date."""
         for record in events:
-            if record.knowledge_date > as_of_date:
+            if record.announcement_date is None:
+                raise CorporateActionCoverageError(
+                    f"corporate action {record.event_type.value}@{record.effective_date.isoformat()} "
+                    f"has unknown announcement date; cannot verify leakage against as_of_date {as_of_date.isoformat()}"
+                )
+            if record.announcement_date > as_of_date:
                 raise CorporateActionDataLeakageError(
                     f"corporate action {record.event_type.value}@{record.effective_date.isoformat()} "
-                    f"was announced on {record.knowledge_date.isoformat()}, which is after "
+                    f"was announced on {record.announcement_date.isoformat()}, which is after "
                     f"trading decision as_of_date {as_of_date.isoformat()}"
                 )
 
@@ -603,19 +724,28 @@ class PointInTimeCorporateActionLedger:
         *,
         policy: CorporateActionPolicy | None = None,
         as_of_date: date | None = None,
-        evaluation_mode: CorporateActionEvaluationMode = CorporateActionEvaluationMode.TRADABLE_INFORMATION,
+        evaluation_mode: CorporateActionEvaluationMode | None = None,
     ) -> CorporateActionAssessment:
         """Assess corporate actions for an instrument over an exact research window.
 
         Enforces:
         - UNKNOWN coverage != no-event (incomplete coverage returns complete=False).
-        - TRADABLE_INFORMATION filters out unannounced future events.
-        - EX_POST_NORMALIZATION evaluates mechanical adjustments.
+        - TRADABLE_INFORMATION filters out unannounced future events and fails closed on unknown announcement dates.
+        - EX_POST_NORMALIZATION evaluates mechanical adjustments and candle comparability.
         """
         if window_start > window_end:
             raise ValueError("window_start must be on or before window_end")
 
         effective_policy = policy if policy is not None else CorporateActionPolicy()
+        mode = (
+            evaluation_mode
+            if evaluation_mode is not None
+            else (
+                CorporateActionEvaluationMode.TRADABLE_INFORMATION
+                if as_of_date is not None
+                else CorporateActionEvaluationMode.EX_POST_NORMALIZATION
+            )
+        )
 
         # Step 1: Coverage verification (fail closed on unknown / missing coverage)
         if not self.is_covered(instrument_key, window_start, window_end):
@@ -631,14 +761,29 @@ class PointInTimeCorporateActionLedger:
         candidate_records = self.get_ex_post_events(instrument_key, window_start, window_end)
 
         # Step 3: Enforce mode-specific leakage checks
-        if evaluation_mode == CorporateActionEvaluationMode.TRADABLE_INFORMATION:
+        if mode == CorporateActionEvaluationMode.TRADABLE_INFORMATION:
+            unknown_announcement_records = [
+                r for r in candidate_records if r.announcement_date is None
+            ]
+            if unknown_announcement_records:
+                blocking_unknowns = [
+                    f"UNKNOWN_ANNOUNCEMENT_DATE: {r.event_type.value}@{r.effective_date.isoformat()} "
+                    f"lacks verified announcement_date; cannot establish tradable knowledge for {instrument_key}"
+                    for r in unknown_announcement_records
+                ]
+                return CorporateActionAssessment(
+                    complete=False,
+                    blocking_events=tuple(blocking_unknowns),
+                )
             eval_date = as_of_date if as_of_date is not None else window_end
             if as_of_date is not None:
                 # If caller explicitly asks what was tradable as of as_of_date,
                 # any event taking effect in the window but announced after as_of_date
                 # was NOT known yet.
                 candidate_records = tuple(
-                    r for r in candidate_records if r.knowledge_date <= eval_date
+                    r
+                    for r in candidate_records
+                    if r.announcement_date is not None and r.announcement_date <= eval_date
                 )
 
         # Step 4: Policy-driven blocking evaluation
@@ -807,6 +952,10 @@ class PointInTimeCorporateActionLedger:
 
         effective_policy = policy if policy is not None else CorporateActionPolicy()
         instrument_list = tuple(sorted(instruments))
+        if not instrument_list:
+            raise CorporateActionCoverageError(
+                "cannot derive corporate-action evidence identity: requested instrument population is empty"
+            )
 
         # Check coverage across all instruments
         all_complete = True
@@ -823,9 +972,10 @@ class PointInTimeCorporateActionLedger:
                 all_blocking.append(f"{key}:{b}")
             events_count += len(self.get_ex_post_events(key, research_start, research_end))
 
-        if not instrument_list:
-            # When no instruments specified, verify if ledger has any coverage
-            all_complete = True
+        if not all_complete:
+            raise CorporateActionCoverageError(
+                f"corporate-action evidence is incomplete for requested instruments: {', '.join(all_blocking)}"
+            )
 
         return CorporateActionEvidenceIdentity(
             source=source,
@@ -836,5 +986,7 @@ class PointInTimeCorporateActionLedger:
             coverage_end=research_end,
             covered_instruments=instrument_list,
             events_count=events_count,
-            policy_identity=effective_policy.policy_name,
+            policy_identity=effective_policy.policy_identity,
+            _verified_ledger_fingerprint=self.fingerprint(),
+            _verified_covered_instruments=instrument_list,
         )

@@ -262,6 +262,8 @@ def baseline_experiment() -> ExperimentArtifact:
             coverage_start=date(2026, 1, 1),
             coverage_end=date(2026, 6, 30),
             covered_instruments=("NSE_EQ|INE002A01018",),
+            _verified_ledger_fingerprint="sha256_ca_evidence_001",
+            _verified_covered_instruments=("NSE_EQ|INE002A01018",),
         ),
         cost_model_identity=CostModelIdentity(
             model_name="documented",

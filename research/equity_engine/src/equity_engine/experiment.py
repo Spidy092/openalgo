@@ -247,15 +247,29 @@ class CorporateActionEvidenceIdentity:
     covered_instruments: tuple[str, ...] = ()
     events_count: int = 0
     policy_identity: str = "DEFAULT"
+    _verified_ledger_fingerprint: str | None = field(default=None, repr=False, compare=False)
+    _verified_covered_instruments: tuple[str, ...] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.complete:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
+        if not self.covered_instruments:
+            raise ValueError("covered_instruments cannot be empty for corporate-action evidence")
         if self.coverage_start is not None and self.coverage_end is not None:
             if self.coverage_start > self.coverage_end:
                 raise ValueError("coverage_start must be on or before coverage_end")
+
+    @property
+    def is_authoritative(self) -> bool:
+        """Return True only if this identity was derived from trusted ledger evidence."""
+        return (
+            self._verified_ledger_fingerprint is not None
+            and self._verified_ledger_fingerprint == self.evidence_fingerprint
+            and self._verified_covered_instruments is not None
+            and tuple(sorted(self._verified_covered_instruments)) == tuple(sorted(self.covered_instruments))
+        )
 
     def covers_window(self, start: date, end: date) -> bool:
         if self.coverage_start is None or self.coverage_end is None:
@@ -268,7 +282,7 @@ class CorporateActionEvidenceIdentity:
         ledger: Any,
         *,
         research_window: ResearchWindowConfig | Any,
-        instruments: Iterable[str] = (),
+        instruments: Iterable[str],
         policy: Any = None,
         source: str = "CANONICAL_PIT_CORPORATE_ACTION_LEDGER",
     ) -> CorporateActionEvidenceIdentity:
@@ -987,19 +1001,37 @@ class ExperimentArtifact:
     def evaluate_promotion_gate(
         self, thresholds: PromotionThresholds
     ) -> tuple[bool, tuple[str, ...]]:
-        """Evaluate concrete promotion evidence plus the cost-evidence boundary."""
+        """Evaluate concrete promotion evidence plus cost and corporate-action boundaries."""
 
         passed, violations = self.promotion_evidence.evaluate_gate(thresholds)
-        cost_violations = list(violations)
+        gate_violations = list(violations)
         if (
             self.cost_evidence_identity.evidence_classification != HISTORICAL_ACTUAL_LABEL
             or not self.cost_evidence_identity.historical_actual
         ):
-            cost_violations.append(
+            gate_violations.append(
                 "cost evidence is not verified HISTORICAL_ACTUAL_COSTS; "
                 "scenario/incomplete evidence cannot promote"
             )
-        return (passed and not cost_violations, tuple(cost_violations))
+
+        # Corporate-action promotion gate evaluation
+        if not self.corporate_action_evidence.complete:
+            gate_violations.append("corporate-action evidence is incomplete; cannot promote")
+        if self.corporate_action_evidence.blocking_events:
+            gate_violations.append(
+                "corporate-action evidence has unresolved blocking events: "
+                + ", ".join(self.corporate_action_evidence.blocking_events)
+            )
+        if not self.corporate_action_evidence.is_authoritative:
+            gate_violations.append(
+                "corporate-action evidence is not verified authoritative against trusted ledger"
+            )
+        if set(self.corporate_action_evidence.covered_instruments) != set(self.instrument_dataset_fingerprints.keys()):
+            gate_violations.append(
+                "corporate-action evidence does not cover exact experiment instrument population"
+            )
+
+        return (passed and not gate_violations, tuple(gate_violations))
 
     def validate_integrity(
         self,
@@ -1008,6 +1040,8 @@ class ExperimentArtifact:
         dataset_manifests: Mapping[str, MarketDataManifest] | None = None,
         prefilter_artifact: Mapping[str, Any] | None = None,
         promotion_thresholds: PromotionThresholds | None = None,
+        corporate_action_ledger: Any = None,
+        corporate_action_policy: Any = None,
     ) -> None:
         """Enforce strict fail-closed validation of all fingerprints and evidence.
 
@@ -1117,6 +1151,72 @@ class ExperimentArtifact:
                 "experiment has unresolved blocking corporate actions: "
                 + ", ".join(self.corporate_action_evidence.blocking_events)
             )
+
+        # FIX 4: Exact instrument coverage
+        canonical_experiment_instruments = set(self.instrument_dataset_fingerprints.keys())
+        ca_covered_instruments = set(self.corporate_action_evidence.covered_instruments)
+        if ca_covered_instruments != canonical_experiment_instruments:
+            missing_ca = canonical_experiment_instruments - ca_covered_instruments
+            extra_ca = ca_covered_instruments - canonical_experiment_instruments
+            raise MissingEvidenceError(
+                f"corporate-action evidence population does not exactly match canonical experiment "
+                f"instrument population: missing={sorted(missing_ca)}, extra={sorted(extra_ca)}"
+            )
+
+        # FIX 3: Revalidate against trusted PointInTimeCorporateActionLedger
+        if corporate_action_ledger is not None:
+            recomputed = corporate_action_ledger.to_evidence_identity(
+                research_start=self.research_window.start,
+                research_end=self.research_window.end,
+                instruments=sorted(canonical_experiment_instruments),
+                policy=corporate_action_policy,
+            )
+            # Recompute and compare all 7 dimensions
+            if recomputed.evidence_fingerprint != self.corporate_action_evidence.evidence_fingerprint:
+                raise MissingEvidenceError(
+                    f"corporate-action ledger fingerprint mismatch: expected "
+                    f"{recomputed.evidence_fingerprint}, got {self.corporate_action_evidence.evidence_fingerprint}"
+                )
+            if (
+                recomputed.coverage_start != self.corporate_action_evidence.coverage_start
+                or recomputed.coverage_end != self.corporate_action_evidence.coverage_end
+            ):
+                raise MissingEvidenceError(
+                    f"corporate-action coverage window mismatch: expected "
+                    f"[{recomputed.coverage_start}, {recomputed.coverage_end}], got "
+                    f"[{self.corporate_action_evidence.coverage_start}, {self.corporate_action_evidence.coverage_end}]"
+                )
+            if tuple(sorted(recomputed.covered_instruments)) != tuple(sorted(self.corporate_action_evidence.covered_instruments)):
+                raise MissingEvidenceError(
+                    f"corporate-action covered instruments mismatch: expected "
+                    f"{recomputed.covered_instruments}, got {self.corporate_action_evidence.covered_instruments}"
+                )
+            if recomputed.policy_identity != self.corporate_action_evidence.policy_identity:
+                raise MissingEvidenceError(
+                    f"corporate-action policy identity mismatch: expected "
+                    f"{recomputed.policy_identity}, got {self.corporate_action_evidence.policy_identity}"
+                )
+            if recomputed.blocking_events != self.corporate_action_evidence.blocking_events:
+                raise MissingEvidenceError(
+                    f"corporate-action blocking events mismatch: expected "
+                    f"{recomputed.blocking_events}, got {self.corporate_action_evidence.blocking_events}"
+                )
+            if recomputed.events_count != self.corporate_action_evidence.events_count:
+                raise MissingEvidenceError(
+                    f"corporate-action event count mismatch: expected "
+                    f"{recomputed.events_count}, got {self.corporate_action_evidence.events_count}"
+                )
+            if recomputed.complete != self.corporate_action_evidence.complete:
+                raise MissingEvidenceError(
+                    f"corporate-action completeness mismatch: expected "
+                    f"{recomputed.complete}, got {self.corporate_action_evidence.complete}"
+                )
+        else:
+            if not self.corporate_action_evidence.is_authoritative:
+                raise MissingEvidenceError(
+                    "corporate-action evidence was manually constructed and is not authoritative; "
+                    "must be derived from or validated against trusted PointInTimeCorporateActionLedger"
+                )
 
         # 6. Threshold evaluation if requested
         if promotion_thresholds is not None:

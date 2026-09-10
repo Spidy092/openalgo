@@ -7,6 +7,7 @@ import pytest
 from equity_engine.corporate_actions import (
     AdjustmentFactorRecord,
     CorporateActionConfidence,
+    CorporateActionCoverageError,
     CorporateActionDataLeakageError,
     CorporateActionEvaluationMode,
     CorporateActionEvent,
@@ -44,6 +45,7 @@ from equity_engine.experiment import (
     TickEvidenceIdentity,
     WindowSpec,
 )
+from equity_engine.gates import PromotionThresholds
 
 
 def _sample_experiment(
@@ -51,6 +53,7 @@ def _sample_experiment(
     corporate_action_evidence: CorporateActionEvidenceIdentity,
     research_start: date = date(2026, 1, 1),
     research_end: date = date(2026, 6, 30),
+    instrument_dataset_fingerprints: dict[str, str] | None = None,
 ) -> ExperimentArtifact:
     orchestrator = ExperimentOrchestrator(
         code_commit_sha="c4322d43956de1b43a764a7849b7437b38a1c932",
@@ -69,7 +72,11 @@ def _sample_experiment(
         approved_capital=ApprovedCapital(amount_rupees=Decimal(100000)),
         universe_fingerprint="fp_univ_001",
         candidate_prefilter_artifact_fingerprint="fp_univ_001",
-        instrument_dataset_fingerprints={"NSE_EQ|INE002A01018": "fp_ds_001"},
+        instrument_dataset_fingerprints=(
+            instrument_dataset_fingerprints
+            if instrument_dataset_fingerprints is not None
+            else {"NSE_EQ|INE002A01018": "fp_ds_001"}
+        ),
         nse_membership_evidence=NSEMembershipEvidenceIdentity(
             source_refs=("https://nsearchives.nseindia.com/members.csv",),
             complete=True,
@@ -800,6 +807,9 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
         evidence_fingerprint="fp_ca_001",
         coverage_start=date(2026, 1, 1),
         coverage_end=date(2026, 5, 31),  # Ends early; research window is until 2026-06-30
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        _verified_ledger_fingerprint="fp_ca_001",
+        _verified_covered_instruments=("NSE_EQ|INE002A01018",),
     )
     exp = _sample_experiment(corporate_action_evidence=uncovered_evidence)
     with pytest.raises(MissingEvidenceError, match="cannot claim corporate-action-complete unless evidence covers"):
@@ -812,6 +822,7 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
             complete=False,
             blocking_events=(),
             evidence_fingerprint="fp_ca_001",
+            covered_instruments=("NSE_EQ|INE002A01018",),
         )
 
     # 3. Missing date-scoped coverage fails closed
@@ -822,6 +833,9 @@ def test_experiment_cannot_claim_corporate_action_complete_without_exact_window_
         evidence_fingerprint="fp_ca_001",
         coverage_start=None,
         coverage_end=None,
+        covered_instruments=("NSE_EQ|INE002A01018",),
+        _verified_ledger_fingerprint="fp_ca_001",
+        _verified_covered_instruments=("NSE_EQ|INE002A01018",),
     )
     exp_no_dates = _sample_experiment(corporate_action_evidence=no_dates_evidence)
     with pytest.raises(MissingEvidenceError, match=r"got coverage \[None, None\]"):
@@ -860,3 +874,405 @@ def test_corporate_action_evidence_identity_from_ledger_integration() -> None:
     exp = _sample_experiment(corporate_action_evidence=ca_identity)
     exp.validate_integrity()
     assert exp.deterministic_fingerprint() is not None
+
+
+def test_fix1_caller_supplied_fingerprints_rejected_when_spoofed() -> None:
+    # 1. CorporateActionRecord rejects spoofed fingerprint
+    with pytest.raises(ValueError, match="invalid caller-supplied evidence_fingerprint"):
+        CorporateActionRecord(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            event_type=CorporateActionEventType.SPLIT,
+            effective_date=date(2026, 3, 1),
+            source="NSE_FEED",
+            retrieval_timestamp=datetime(2026, 2, 1, tzinfo=UTC),
+            evidence_fingerprint="spoofed_record_fp",
+        )
+
+    # Valid record derives canonical fingerprint automatically
+    rec = CorporateActionRecord(
+        instrument_key="NSE_EQ|INE002A01018",
+        isin="INE002A01018",
+        event_type=CorporateActionEventType.SPLIT,
+        effective_date=date(2026, 3, 1),
+        source="NSE_FEED",
+        retrieval_timestamp=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+    assert rec.evidence_fingerprint == rec.fingerprint()
+
+    # Re-supplying the exact canonical fingerprint is allowed
+    rec_exact = CorporateActionRecord(
+        instrument_key="NSE_EQ|INE002A01018",
+        isin="INE002A01018",
+        event_type=CorporateActionEventType.SPLIT,
+        effective_date=date(2026, 3, 1),
+        source="NSE_FEED",
+        retrieval_timestamp=datetime(2026, 2, 1, tzinfo=UTC),
+        evidence_fingerprint=rec.fingerprint(),
+    )
+    assert rec_exact.evidence_fingerprint == rec.evidence_fingerprint
+
+    # Deserializing tampered payload via from_dict fails closed
+    record_dict = rec.as_dict()
+    record_dict["evidence_fingerprint"] = "tampered_dict_fp"
+    with pytest.raises(ValueError, match="invalid caller-supplied evidence_fingerprint"):
+        CorporateActionRecord.from_dict(record_dict)
+
+    # 2. CoverageScope rejects spoofed fingerprint
+    with pytest.raises(ValueError, match="invalid caller-supplied coverage_fingerprint"):
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            coverage_fingerprint="spoofed_coverage_fp",
+        )
+
+    cov = CoverageScope(
+        instrument_key="NSE_EQ|INE002A01018",
+        isin="INE002A01018",
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 6, 30),
+        source="NSE_FEED",
+        retrieval_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert cov.coverage_fingerprint == cov.fingerprint()
+
+    cov_dict = cov.as_dict()
+    cov_dict["coverage_fingerprint"] = "tampered_cov_dict_fp"
+    with pytest.raises(ValueError, match="invalid caller-supplied coverage_fingerprint"):
+        CoverageScope.from_dict(cov_dict)
+
+
+def test_fix2_empty_instrument_population_fails_closed() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+
+    # Empty instruments requested on ledger must fail closed with CorporateActionCoverageError
+    with pytest.raises(CorporateActionCoverageError, match="requested instrument population is empty"):
+        ledger.to_evidence_identity(
+            research_start=date(2026, 1, 1),
+            research_end=date(2026, 6, 30),
+            instruments=(),
+        )
+
+    # Empty instruments in CorporateActionEvidenceIdentity must fail closed
+    with pytest.raises(ValueError, match="covered_instruments cannot be empty"):
+        CorporateActionEvidenceIdentity(
+            source="NSE",
+            complete=True,
+            blocking_events=(),
+            evidence_fingerprint="fp_ca_empty",
+            coverage_start=date(2026, 1, 1),
+            coverage_end=date(2026, 6, 30),
+            covered_instruments=(),
+        )
+
+
+def test_fix3_identity_trust_and_ledger_revalidation() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+
+    # Legitimate ledger-derived identity
+    legit_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    assert legit_identity.is_authoritative is True
+
+    # Manually constructed identity is not authoritative
+    spoofed_identity = CorporateActionEvidenceIdentity(
+        source="NSE",
+        complete=True,
+        blocking_events=(),
+        evidence_fingerprint=legit_identity.evidence_fingerprint,
+        coverage_start=date(2026, 1, 1),
+        coverage_end=date(2026, 6, 30),
+        covered_instruments=("NSE_EQ|INE002A01018",),
+    )
+    assert spoofed_identity.is_authoritative is False
+
+    # Experiment with spoofed identity and no ledger fails closed
+    exp_spoofed = _sample_experiment(corporate_action_evidence=spoofed_identity)
+    with pytest.raises(MissingEvidenceError, match="not authoritative"):
+        exp_spoofed.validate_integrity()
+
+    # Revalidation against trusted ledger passes for legitimate identity
+    exp_legit = _sample_experiment(corporate_action_evidence=legit_identity)
+    exp_legit.validate_integrity(corporate_action_ledger=ledger)
+
+    # Tampering with 7 dimensions in evidence identity when checked against trusted ledger:
+    # 1. Tampered fingerprint
+    tampered_fp_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    object.__setattr__(tampered_fp_identity, "evidence_fingerprint", "fp_tampered")
+    exp_tampered_fp = _sample_experiment(corporate_action_evidence=tampered_fp_identity)
+    with pytest.raises(MissingEvidenceError, match="corporate-action ledger fingerprint mismatch"):
+        exp_tampered_fp.validate_integrity(corporate_action_ledger=ledger)
+
+    # 2. Tampered event count
+    tampered_count_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    object.__setattr__(tampered_count_identity, "events_count", 999)
+    exp_tampered_count = _sample_experiment(corporate_action_evidence=tampered_count_identity)
+    with pytest.raises(MissingEvidenceError, match="corporate-action event count mismatch"):
+        exp_tampered_count.validate_integrity(corporate_action_ledger=ledger)
+
+    # 3. Tampered policy
+    tampered_policy_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+    object.__setattr__(tampered_policy_identity, "policy_identity", "tampered_policy")
+    exp_tampered_policy = _sample_experiment(corporate_action_evidence=tampered_policy_identity)
+    with pytest.raises(MissingEvidenceError, match="corporate-action policy identity mismatch"):
+        exp_tampered_policy.validate_integrity(corporate_action_ledger=ledger)
+
+    # Promotion gate fails closed on unauthoritative identity
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+    passed, violations = exp_spoofed.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("not verified authoritative" in v for v in violations)
+
+
+def test_fix4_exact_instrument_coverage_enforcement() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    for inst, isin in [("NSE_EQ|INE001A01010", "INE001A01010"), ("NSE_EQ|INE002A01018", "INE002A01018")]:
+        ledger.add_coverage(
+            CoverageScope(
+                instrument_key=inst,
+                isin=isin,
+                start_date=date(2026, 1, 1),
+                end_date=date(2026, 6, 30),
+                source="NSE_FEED",
+                retrieval_timestamp=ts,
+                is_complete=True,
+            )
+        )
+
+    # Partial coverage: only covers INE002
+    partial_identity = CorporateActionEvidenceIdentity.from_ledger(
+        ledger,
+        research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
+        instruments=("NSE_EQ|INE002A01018",),
+    )
+
+    exp_partial = _sample_experiment(
+        corporate_action_evidence=partial_identity,
+        instrument_dataset_fingerprints={
+            "NSE_EQ|INE001A01010": "fp_ds_001",
+            "NSE_EQ|INE002A01018": "fp_ds_002",
+        },
+    )
+
+    # Validate integrity fails closed on partial instrument coverage
+    with pytest.raises(MissingEvidenceError, match="does not exactly match canonical experiment instrument population"):
+        exp_partial.validate_integrity()
+
+    # Promotion gate also fails closed
+    thresholds = PromotionThresholds(
+        min_trades=100,
+        min_profit_factor=Decimal("1.2"),
+        max_drawdown_pct=Decimal(10),
+        min_walk_forward_windows=1,
+        max_cost_reconciliation_error_inr=Decimal("0.01"),
+    )
+    passed, violations = exp_partial.evaluate_promotion_gate(thresholds)
+    assert passed is False
+    assert any("does not cover exact experiment instrument population" in v for v in violations)
+
+
+def test_fix5_remove_hidden_2_percent_dividend_threshold() -> None:
+    # Default policy has BLOCK_ALL and None threshold (no implicit 2%!)
+    default_policy = CorporateActionPolicy()
+    assert default_policy.dividend_policy == DividendPolicy.BLOCK_ALL
+    assert default_policy.dividend_threshold_percent is None
+    assert default_policy.reference_price_for_dividend is None
+    assert default_policy.policy_identity == "DEFAULT_RESEARCH_POLICY:BLOCK_ALL"
+
+    # IGNORE_BELOW_THRESHOLD requires explicit positive threshold and positive reference price
+    with pytest.raises(ValueError, match="requires an explicit positive dividend_threshold_percent"):
+        CorporateActionPolicy(
+            dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+            dividend_threshold_percent=None,
+            reference_price_for_dividend=Decimal(100),
+        )
+
+    with pytest.raises(ValueError, match="requires an explicit positive dividend_threshold_percent"):
+        CorporateActionPolicy(
+            dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+            dividend_threshold_percent=Decimal(0),
+            reference_price_for_dividend=Decimal(100),
+        )
+
+    with pytest.raises(ValueError, match="requires an explicit positive reference_price_for_dividend"):
+        CorporateActionPolicy(
+            dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+            dividend_threshold_percent=Decimal("2.0"),
+            reference_price_for_dividend=None,
+        )
+
+    with pytest.raises(ValueError, match="requires an explicit positive reference_price_for_dividend"):
+        CorporateActionPolicy(
+            dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+            dividend_threshold_percent=Decimal("2.0"),
+            reference_price_for_dividend=Decimal(0),
+        )
+
+    # Valid IGNORE_BELOW_THRESHOLD policy binds threshold to identity
+    valid_threshold_policy = CorporateActionPolicy(
+        dividend_policy=DividendPolicy.IGNORE_BELOW_THRESHOLD,
+        dividend_threshold_percent=Decimal("2.5"),
+        reference_price_for_dividend=Decimal(1000),
+        policy_name="default",
+    )
+    assert valid_threshold_policy.policy_identity == "default:IGNORE_BELOW_THRESHOLD:2.5%"
+
+    # Under default BLOCK_ALL, even a small dividend (e.g. 0.5%) produces a blocking event in window assessment
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+    ledger.add_record(
+        CorporateActionRecord(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            event_type=CorporateActionEventType.DIVIDEND,
+            effective_date=date(2026, 3, 1),
+            announcement_date=date(2026, 2, 1),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            amount=Decimal("5.0"),
+        )
+    )
+
+    # Default policy blocks window
+    assess_default = ledger.assess_window(
+        instrument_key="NSE_EQ|INE002A01018",
+        window_start=date(2026, 1, 1),
+        window_end=date(2026, 6, 30),
+        policy=default_policy,
+    )
+    assert assess_default.complete is True
+    assert len(assess_default.blocking_events) >= 1
+    assert any("DIVIDEND@2026-03-01" in b for b in assess_default.blocking_events)
+
+    # Valid IGNORE_BELOW_THRESHOLD (2.5%) ignores 0.5% dividend (5 rupees / 1000)
+    assess_threshold = ledger.assess_window(
+        instrument_key="NSE_EQ|INE002A01018",
+        window_start=date(2026, 1, 1),
+        window_end=date(2026, 6, 30),
+        policy=valid_threshold_policy,
+    )
+    assert assess_threshold.complete is True
+    assert len(assess_threshold.blocking_events) == 0
+
+
+def test_fix6_unknown_announcement_date_fails_closed_in_tradable_information() -> None:
+    ledger = PointInTimeCorporateActionLedger()
+    ts = datetime(2026, 2, 1, tzinfo=UTC)
+    ledger.add_coverage(
+        CoverageScope(
+            instrument_key="NSE_EQ|INE002A01018",
+            isin="INE002A01018",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 6, 30),
+            source="NSE_FEED",
+            retrieval_timestamp=ts,
+            is_complete=True,
+        )
+    )
+
+    # Add a record with missing announcement_date
+    rec = CorporateActionRecord(
+        instrument_key="NSE_EQ|INE002A01018",
+        isin="INE002A01018",
+        event_type=CorporateActionEventType.SPLIT,
+        effective_date=date(2026, 3, 1),
+        announcement_date=None,  # Missing!
+        source="NSE_FEED",
+        retrieval_timestamp=ts,
+    )
+    ledger.add_record(rec)
+
+    # 1. get_tradable_events with fail_on_unknown=True raises CorporateActionCoverageError
+    with pytest.raises(CorporateActionCoverageError, match="has unknown announcement date"):
+        ledger.get_tradable_events("NSE_EQ|INE002A01018", as_of_date=date(2026, 3, 15))
+
+    # 2. verify_no_future_leakage raises CorporateActionCoverageError
+    with pytest.raises(CorporateActionCoverageError, match="has unknown announcement date"):
+        ledger.verify_no_future_leakage([rec], as_of_date=date(2026, 3, 15))
+
+    # 3. assess_window in TRADABLE_INFORMATION mode fails closed with UNKNOWN_ANNOUNCEMENT_DATE blocking event
+    assessment = ledger.assess_window(
+        instrument_key="NSE_EQ|INE002A01018",
+        window_start=date(2026, 1, 1),
+        window_end=date(2026, 6, 30),
+        evaluation_mode=CorporateActionEvaluationMode.TRADABLE_INFORMATION,
+        as_of_date=date(2026, 6, 30),
+    )
+    assert assessment.complete is False
+    assert len(assessment.blocking_events) >= 1
+    assert any("UNKNOWN_ANNOUNCEMENT_DATE" in b for b in assessment.blocking_events)
+
+    # 4. EX_POST_NORMALIZATION mode uses effective_date and does not fail for unknown announcement date
+    ex_post_assessment = ledger.assess_window(
+        instrument_key="NSE_EQ|INE002A01018",
+        window_start=date(2026, 1, 1),
+        window_end=date(2026, 6, 30),
+        evaluation_mode=CorporateActionEvaluationMode.EX_POST_NORMALIZATION,
+    )
+    # The split itself is an unhandled corporate action blocking event under default policy,
+    # but NOT UNKNOWN_ANNOUNCEMENT_DATE
+    assert not any("UNKNOWN_ANNOUNCEMENT_DATE" in b for b in ex_post_assessment.blocking_events)
+
+
+
