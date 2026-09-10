@@ -353,7 +353,7 @@ def build_default_records() -> tuple[CostEvidenceRecord, ...]:
             gst_taxable=False,
             source_refs=(UPSTOX_PRICING_SOURCE, NSE_STT_SOURCE),
         ),
-        # SEBI turnover fee and GST rate apply across the supported boundary.
+        # SEBI turnover fee applies across the supported boundary.
         _statutory(
             component=LedgerComponent.SEBI_TURNOVER,
             product=LedgerProduct.ALL,
@@ -364,15 +364,63 @@ def build_default_records() -> tuple[CostEvidenceRecord, ...]:
             gst_taxable=False,
             source_refs=(NSE_STT_SOURCE,),
         ),
-        _statutory(
+        # Historical account-specific GST is UNKNOWN. The exact historical
+        # taxable base and broker rounding for this account are not
+        # sufficiently evidenced across products/dates. UNKNOWN != ZERO.
+        CostEvidenceRecord(
+            effective_from=SUPPORTED_RESEARCH_START,
+            effective_to=None,
             component=LedgerComponent.GST,
             product=LedgerProduct.ALL,
+            side=LedgerSide.BOTH,
+            basis="unknown",
+            rate=None,
+            formula=None,
+            rounding=None,
+            minimum=None,
+            cap=None,
+            gst_taxable=None,
+            evidence_class=EvidenceClass.UNKNOWN,
+            historical_actual=False,
+            confidence="none",
+            source_refs=(),
+            source_publication_date=None,
+            source_effective_date=None,
+            observed_at=None,
+            unknowns=(
+                "historical account-specific GST taxable base and broker rounding are "
+                "not sufficiently evidenced; do not infer from current public pricing",
+            ),
+        ),
+        # Current public GST scenario (intraday-only, isolated). This is a
+        # BROKER_PUBLIC_SCENARIO for reference only: it never enters the
+        # default historical resolution path and is never historical actual.
+        # Delivery composition is not separately evidenced, so no delivery
+        # scenario is provided; delivery GST remains UNKNOWN.
+        CostEvidenceRecord(
+            effective_from=MII_B_START,
+            effective_to=None,
+            component=LedgerComponent.GST,
+            product=LedgerProduct.INTRADAY,
             side=LedgerSide.BOTH,
             basis="taxable_base:brokerage+transaction+ipft",
             rate=GST_RATE,
             formula="(brokerage + transaction + ipft) * 0.18",
+            rounding="none_preserve_decimal",
+            minimum=None,
+            cap=None,
             gst_taxable=False,
-            source_refs=(UPSTOX_PRICING_SOURCE, NSE_STT_SOURCE),
+            evidence_class=EvidenceClass.BROKER_PUBLIC_SCENARIO,
+            historical_actual=False,
+            confidence="low",
+            source_refs=(UPSTOX_PRICING_SOURCE,),
+            source_publication_date=None,
+            source_effective_date=MII_B_START,
+            observed_at=None,
+            unknowns=(
+                "current public pricing scenario; not account-specific historical "
+                "evidence; do not use for historical actuals",
+            ),
         ),
         # NSE MII period A: 2024-10-01 through 2026-02-28.
         CostEvidenceRecord(
@@ -515,17 +563,21 @@ def build_default_records() -> tuple[CostEvidenceRecord, ...]:
                 " through 2024-09-30; do not use the 2024-10-01 rate",
             ),
         ),
-        # Account snapshot: 0.06% observed 2026-09-09 only. Never projected back.
+        # Account snapshot: 0.06% observed 2026-09-09 only. Applicable only to
+        # the observed date; never projected backward or forward. The paisa
+        # HALF_UP handling is account-observed reconciliation implementation
+        # behavior, not historical statutory proof, and is never historical
+        # actual.
         CostEvidenceRecord(
             effective_from=ACCOUNT_SNAPSHOT_DATE,
-            effective_to=None,
+            effective_to=ACCOUNT_SNAPSHOT_DATE,
             component=LedgerComponent.BROKERAGE,
             product=LedgerProduct.INTRADAY,
             side=LedgerSide.BOTH,
             basis="turnover",
             rate=BROKERAGE_SNAPSHOT_RATE,
             formula="min(turnover * 0.0006, 20)",
-            rounding="paisa_half_up",
+            rounding="paisa_half_up_account_observed_reconciliation_only_not_statutory",
             minimum=None,
             cap=BROKERAGE_CAP,
             gst_taxable=True,
@@ -538,7 +590,36 @@ def build_default_records() -> tuple[CostEvidenceRecord, ...]:
             observed_at=ACCOUNT_SNAPSHOT_DATE,
             unknowns=(
                 "single-account snapshot observed 2026-09-09; "
-                "historical applicability unknown; do not project backward",
+                "applicable only to 2026-09-09; do not project backward or forward; "
+                "paisa HALF_UP is account-observed reconciliation implementation "
+                "behavior, not historical statutory proof",
+            ),
+        ),
+        # Post-snapshot intraday brokerage unknown: the single-day observation
+        # must not be projected forward.
+        CostEvidenceRecord(
+            effective_from=date(2026, 9, 10),
+            effective_to=None,
+            component=LedgerComponent.BROKERAGE,
+            product=LedgerProduct.INTRADAY,
+            side=LedgerSide.BOTH,
+            basis="unknown",
+            rate=None,
+            formula=None,
+            rounding=None,
+            minimum=None,
+            cap=None,
+            gst_taxable=None,
+            evidence_class=EvidenceClass.UNKNOWN,
+            historical_actual=False,
+            confidence="none",
+            source_refs=(),
+            source_publication_date=None,
+            source_effective_date=None,
+            observed_at=None,
+            unknowns=(
+                "no account brokerage evidence after 2026-09-09; do not project "
+                "the single-day 2026-09-09 observed 0.06% snapshot forward",
             ),
         ),
         # Historical brokerage unknown: explicit gap before the snapshot.
