@@ -1,7 +1,8 @@
 """Tests for the v2 repeated-WFO research-window plan compiler.
 
 PLAN only: no strategy execution, no profitability assertions, no invented
-thresholds or window lengths. Proves Kiro reproductions impossible, boundary
+thresholds or window lengths. Proves Kiro reproductions impossible, PIT
+date-scoped membership (no late snapshot attesting early dates), boundary
 leakage closed, and deterministic identity across every bound input.
 """
 
@@ -24,7 +25,7 @@ from equity_engine.research_window_compiler import (
     EvidenceClaimError,
     FrozenTrainUniverse,
     FrozenUniverseViolationError,
-    PITMembershipAttestation,
+    PITMembershipSegment,
     ResearchWindowError,
     ResearchWindowPlan,
     SelectionAttestation,
@@ -35,6 +36,7 @@ from equity_engine.research_window_compiler import (
     WindowTooShortError,
     compile_repeated_wfo,
     derive_population_fingerprint,
+    resolve_pit_segment,
 )
 from equity_engine.wfo_schedule import plan_wfo_date_windows
 
@@ -92,10 +94,36 @@ def _strategy_defs():  # type: ignore[no-untyped-def]
     )
 
 
+def _segment(
+    key: str,
+    valid_from: date,
+    valid_to: date,
+    evidence_as_of: date,
+    *,
+    eligible: bool = True,
+    fingerprint: str = "c" * 64,
+) -> PITMembershipSegment:
+    return PITMembershipSegment(
+        instrument_key=key,
+        valid_from=valid_from,
+        valid_to=valid_to,
+        evidence_as_of=evidence_as_of,
+        source_fingerprint=fingerprint,
+        eligible=eligible,
+    )
+
+
+def _static_segments(
+    trading: tuple[date, ...], *, fingerprint: str = "c" * 64
+) -> tuple[PITMembershipSegment, ...]:
+    return tuple(
+        _segment(key, trading[0], trading[-1], trading[0], fingerprint=fingerprint)
+        for key in (KEY_A, KEY_B)
+    )
+
+
 def _inputs(**overrides):  # type: ignore[no-untyped-def]
     trading = _trading_dates(date(2026, 1, 5), 26)
-    selection_union_hint = trading  # replaced below after fold layout known
-    del selection_union_hint
     params: dict[str, object] = {
         "research_start": trading[0],
         "research_end": trading[-1],
@@ -120,48 +148,10 @@ def _inputs(**overrides):  # type: ignore[no-untyped-def]
         "created_at": "2026-09-10T10:00:00+05:30",
     }
     params.update(overrides)
-    if "pit_attestations" not in params:
-        # Default attestations cover the compiled selection union exactly.
-        probe = compile_repeated_wfo(
-            **{
-                **params,
-                "pit_attestations": _attestations_for(params),  # type: ignore[arg-type]
-            }
-        )
-        return _inputs_with_attestations(probe, params)
-    return params
-
-
-def _attestations_for(params: dict[str, object]) -> tuple[PITMembershipAttestation, ...]:
-    trading = params["trading_dates"]  # type: ignore[assignment]
-    assert isinstance(trading, tuple)
-    final_test_days = params["final_test_days"]  # type: ignore[assignment]
-    final_embargo_days = params["final_embargo_days"]  # type: ignore[assignment]
-    assert isinstance(final_test_days, int) and isinstance(final_embargo_days, int)
-    fold_region = trading[: len(trading) - final_test_days - final_embargo_days]
-    folds = plan_wfo_date_windows(
-        fold_region,
-        train_trading_days=params["fold_train_days"],  # type: ignore[arg-type]
-        test_trading_days=params["fold_validation_days"],  # type: ignore[arg-type]
-        step_trading_days=params["fold_step_days"],  # type: ignore[arg-type]
-        embargo_trading_days=params["fold_embargo_days"],  # type: ignore[arg-type]
-    )
-    union = tuple(sorted({d for fold in folds for d in (*fold.train_dates, *fold.test_dates)}))
-    evidence_as_of = max(union)
-    return tuple(
-        PITMembershipAttestation(
-            instrument_key=key,
-            trade_dates=union,
-            evidence_as_of=evidence_as_of,
-            source_fingerprint="c" * 64,
-        )
-        for key in (KEY_A, KEY_B)
-    )
-
-
-def _inputs_with_attestations(probe: ResearchWindowPlan, params: dict[str, object]):  # type: ignore[no-untyped-def]
-    params = dict(params)
-    params["pit_attestations"] = probe.pit_attestations
+    if "pit_segments" not in params:
+        segment_trading = params["trading_dates"]  # type: ignore[assignment]
+        assert isinstance(segment_trading, tuple)
+        params["pit_segments"] = _static_segments(segment_trading)
     return params
 
 
@@ -192,8 +182,6 @@ def _attestation_for(plan: ResearchWindowPlan, **overrides):  # type: ignore[no-
 def test_repeated_folds_share_single_scheduler() -> None:
     plan = _plan()
     assert len(plan.folds) >= 2
-    fold_region = plan.selection_union_dates()
-    assert fold_region
     direct = plan_wfo_date_windows(
         tuple(
             sorted(
@@ -221,18 +209,12 @@ def test_repeated_folds_share_single_scheduler() -> None:
 
 def test_final_test_disjoint_and_never_in_selection() -> None:
     plan = _plan()
-    final_dates = set(plan.final_test.trading_dates) | set(plan.final_embargo.trading_dates)
-    for fold in plan.folds:
-        fold_dates = set(fold.train.trading_dates) | set(fold.validation.trading_dates)
-        assert fold_dates & set(plan.final_test.trading_dates) == set()
-        assert (
-            fold_dates & final_dates == set()
-            or fold_dates.isdisjoint(final_dates - set(fold.embargo.trading_dates))
-            or True
-        )
+    final_dates = set(plan.final_embargo.trading_dates) | set(plan.final_test.trading_dates)
+    assert final_dates.isdisjoint(set(plan.selection_union_dates()))
     assert plan.final_test.role is WindowRole.UNTOUCHED_TEST
     for fold in plan.folds:
         assert fold.validation.role is WindowRole.VALIDATION
+    assert plan.frozen_train_universe.frozen_as_of == plan.research_start
     attestation = _attestation_for(plan)
     updated, _ = plan.select_train_winner(attestation=attestation)
     assert updated.selection_attestation is not None
@@ -240,21 +222,8 @@ def test_final_test_disjoint_and_never_in_selection() -> None:
 
 def test_single_split_cannot_masquerade_as_repeated() -> None:
     trading = _trading_dates(date(2026, 1, 5), 12)
-    attestations = (
-        PITMembershipAttestation(
-            instrument_key=KEY_A,
-            trade_dates=(trading[0],),
-            evidence_as_of=trading[0],
-            source_fingerprint="c" * 64,
-        ),
-        PITMembershipAttestation(
-            instrument_key=KEY_B,
-            trade_dates=(trading[0],),
-            evidence_as_of=trading[0],
-            source_fingerprint="c" * 64,
-        ),
-    )
-    base = _inputs(trading_dates=trading, research_end=trading[-1], pit_attestations=attestations)
+    segments = _static_segments(trading)
+    base = _inputs(trading_dates=trading, research_end=trading[-1], pit_segments=segments)
     # 12 days with fold 6/4/embargo1/final 4+1 cannot yield two folds.
     with pytest.raises(WindowTooShortError, match="masquerade|min_folds|too short"):
         compile_repeated_wfo(**base)  # type: ignore[arg-type]
@@ -351,32 +320,180 @@ def test_test_dates_in_selection_impossible() -> None:
         )
 
 
-def test_pit_attestation_binds_four_fields() -> None:
+def test_late_snapshot_cannot_attest_early_date() -> None:
+    with pytest.raises(WindowLeakageError, match="cannot attest"):
+        _segment(
+            KEY_A,
+            date(2024, 1, 2),
+            date(2024, 1, 31),
+            date(2025, 12, 31),
+        )
     plan = _plan()
-    for attestation in plan.pit_attestations:
-        payload = attestation.as_dict()
-        assert payload["instrument_key"]
-        assert payload["trade_dates"]
-        assert payload["evidence_as_of"]
-        assert payload["source_fingerprint"]
-    with pytest.raises(WindowLeakageError, match="evidence_as_of"):
-        PITMembershipAttestation(
-            instrument_key=KEY_A,
-            trade_dates=(date(2026, 1, 5),),
-            evidence_as_of=date(2026, 2, 1),
-            source_fingerprint="c" * 64,
+    early = plan.selection_union_dates()[0]
+    late_evidence = plan.final_test.trading_dates[-1]
+    assert late_evidence > early
+    with pytest.raises(WindowLeakageError, match="cannot use evidence"):
+        plan.check_pit_membership(
+            instrument_key=KEY_A, trade_date=early, evidence_as_of=late_evidence
         )
 
 
-def test_population_fingerprint_derived_internally() -> None:
+def test_static_snapshot_before_earliest_passes() -> None:
     plan = _plan()
-    expected = derive_population_fingerprint(
-        instruments=plan.frozen_train_universe.instruments,
-        universe_policy_id=plan.universe_policy_id,
-        pit_attestations=plan.pit_attestations,
+    early = plan.selection_union_dates()[0]
+    record = plan.check_pit_membership(instrument_key=KEY_A, trade_date=early, evidence_as_of=early)
+    assert record.instrument_key == KEY_A
+    assert record.eligible is True
+    assert record.evidence_as_of <= early
+
+
+def test_query_validation_enforces_record_evidence_date() -> None:
+    plan = _plan()
+    early = plan.selection_union_dates()[0]
+    record = plan.check_pit_membership(instrument_key=KEY_A, trade_date=early, evidence_as_of=early)
+    assert record.evidence_as_of <= early
+    late = plan.final_test.trading_dates[-1]
+    with pytest.raises(WindowLeakageError, match="cannot use evidence"):
+        plan.check_pit_membership(instrument_key=KEY_A, trade_date=early, evidence_as_of=late)
+
+
+def test_dated_membership_changes_across_folds() -> None:
+    trading = _trading_dates(date(2026, 1, 5), 26)
+    params = _inputs(trading_dates=trading, research_end=trading[-1])
+    union = _selection_union_of(params)
+    mid_index = len(union) // 2
+    mid, following = union[mid_index - 1], union[mid_index]
+    segments: list[PITMembershipSegment] = []
+    for key in (KEY_A, KEY_B):
+        segments.append(_segment(key, trading[0], mid, trading[0], eligible=True))
+        segments.append(_segment(key, following, trading[-1], following, eligible=False))
+    plan = compile_repeated_wfo(**{**params, "pit_segments": tuple(segments)})  # type: ignore[arg-type]
+    early_record = plan.check_pit_membership(
+        instrument_key=KEY_A, trade_date=union[0], evidence_as_of=union[0]
     )
-    assert plan.frozen_train_universe.population_fingerprint == expected
-    assert isinstance(plan.frozen_train_universe, FrozenTrainUniverse)
+    late_record = plan.check_pit_membership(
+        instrument_key=KEY_A, trade_date=union[-1], evidence_as_of=union[-1]
+    )
+    assert early_record.eligible is True
+    assert late_record.eligible is False
+
+
+def _selection_union_of(params: dict[str, object]) -> tuple[date, ...]:
+    from equity_engine.wfo_schedule import plan_wfo_date_windows as _schedule
+
+    trading = params["trading_dates"]
+    assert isinstance(trading, tuple)
+    final_test_days = params["final_test_days"]
+    final_embargo_days = params["final_embargo_days"]
+    assert isinstance(final_test_days, int) and isinstance(final_embargo_days, int)
+    fold_region = trading[: len(trading) - final_test_days - final_embargo_days]
+    folds = _schedule(
+        fold_region,
+        train_trading_days=params["fold_train_days"],  # type: ignore[arg-type]
+        test_trading_days=params["fold_validation_days"],  # type: ignore[arg-type]
+        step_trading_days=params["fold_step_days"],  # type: ignore[arg-type]
+        embargo_trading_days=params["fold_embargo_days"],  # type: ignore[arg-type]
+    )
+    return tuple(sorted({d for fold in folds for d in (*fold.train_dates, *fold.test_dates)}))
+
+
+def test_delisted_early_disappears_later_but_stays_in_superset() -> None:
+    trading = _trading_dates(date(2026, 1, 5), 26)
+    params = _inputs(trading_dates=trading, research_end=trading[-1])
+    union = _selection_union_of(params)
+    final_dates = trading[len(trading) - 4 :]
+    mid_index = len(union) // 2
+    mid, following = union[mid_index - 1], union[mid_index]
+    segments = [
+        _segment(KEY_A, trading[0], trading[-1], trading[0], eligible=True),
+        _segment(KEY_B, trading[0], mid, trading[0], eligible=True),
+        _segment(KEY_B, following, trading[-1], following, eligible=False),
+    ]
+    plan = compile_repeated_wfo(**{**params, "pit_segments": tuple(segments)})  # type: ignore[arg-type]
+    assert KEY_B in plan.frozen_train_universe.instruments
+    assert (
+        plan.check_pit_membership(
+            instrument_key=KEY_B, trade_date=union[0], evidence_as_of=union[0]
+        ).eligible
+        is True
+    )
+    assert (
+        plan.check_pit_membership(
+            instrument_key=KEY_B, trade_date=union[-1], evidence_as_of=union[-1]
+        ).eligible
+        is False
+    )
+    assert (
+        plan.check_pit_membership(
+            instrument_key=KEY_B, trade_date=final_dates[0], evidence_as_of=final_dates[0]
+        ).eligible
+        is False
+    )
+
+
+def test_later_added_instrument_rejected_at_formation() -> None:
+    trading = _trading_dates(date(2026, 1, 5), 26)
+    params = _inputs(trading_dates=trading, research_end=trading[-1])
+    union = _selection_union_of(params)
+    late_start = union[len(union) // 2]
+    segments = list(_static_segments(trading))
+    segments = [item for item in segments if item.instrument_key == KEY_A] + [
+        _segment(KEY_B, late_start, trading[-1], late_start, eligible=True)
+    ]
+    with pytest.raises(FrozenUniverseViolationError, match="formation-boundary"):
+        compile_repeated_wfo(**{**params, "pit_segments": tuple(segments)})  # type: ignore[arg-type]
+
+
+def test_final_test_membership_excluded_from_selection() -> None:
+    plan = _plan()
+    final_day = plan.final_test.trading_dates[0]
+    record = plan.check_pit_membership(
+        instrument_key=KEY_A, trade_date=final_day, evidence_as_of=final_day
+    )
+    assert record.eligible is True
+    with pytest.raises(AttestationError, match="exactly equal"):
+        plan.select_train_winner(
+            attestation=_attestation_for(
+                plan, observed_selection_dates=(*plan.selection_union_dates(), final_day)
+            )
+        )
+    good = _attestation_for(plan)
+    updated, _ = plan.select_train_winner(attestation=good)
+    assert updated.selection_attestation is not None
+
+
+def test_population_fingerprint_changes_on_historical_change() -> None:
+    plan = _plan()
+    early = plan.selection_union_dates()[0]
+    changed = tuple(
+        _segment(
+            item.instrument_key,
+            item.valid_from,
+            item.valid_to,
+            item.evidence_as_of,
+            eligible=False if item.instrument_key == KEY_A else item.eligible,
+            fingerprint=item.source_fingerprint,
+        )
+        if item.valid_from == early and item.instrument_key == KEY_A
+        else item
+        for item in plan.pit_segments
+    )
+    rebuilt = compile_repeated_wfo(**{**_inputs(), "pit_segments": changed})  # type: ignore[arg-type]
+    assert rebuilt.fingerprint() != plan.fingerprint()
+    assert rebuilt.frozen_train_universe.population_fingerprint != (
+        plan.frozen_train_universe.population_fingerprint
+    )
+
+
+def test_pit_segments_bind_four_fields_plus_state() -> None:
+    plan = _plan()
+    for segment in plan.pit_segments:
+        payload = segment.as_dict()
+        assert payload["instrument_key"]
+        assert payload["valid_from"] <= payload["valid_to"]
+        assert payload["evidence_as_of"] <= payload["valid_from"]
+        assert payload["source_fingerprint"]
+        assert isinstance(payload["eligible"], bool)
 
 
 def test_no_hidden_defaults_for_research_inputs() -> None:
@@ -416,8 +533,6 @@ def test_changing_any_binding_changes_identity() -> None:
         ),
     ]
     for changed_inputs in cases:
-        changed_inputs = dict(changed_inputs)
-        changed_inputs["pit_attestations"] = _attestations_for(changed_inputs)
         changed = compile_repeated_wfo(**changed_inputs)  # type: ignore[arg-type]
         assert changed.fingerprint() != plan.fingerprint()
 

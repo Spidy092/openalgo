@@ -25,9 +25,17 @@ Trust model (explicit):
   an unverified claim; it can never be treated as verified.
 - ``CorporateActionClaim`` requires a 64-character hex fingerprint, so an
   arbitrary label such as ``"claimed-ca"`` fails closed at construction.
-- PIT membership is bound per instrument via :class:`PITMembershipAttestation`
-  (instrument, trade dates, evidence_as_of, source fingerprint), never via one
-  opaque string.
+- PIT membership is bound per instrument via date-scoped
+  :class:`PITMembershipSegment` records (instrument, valid range, evidence
+  snapshot date, source fingerprint, membership state), never via one opaque
+  string and never via one late snapshot attesting early dates. A static
+  snapshot may attest multiple dates only when taken at or before the earliest
+  (``evidence_as_of <= valid_from``); every research trade date resolves to
+  exactly one segment with ``evidence_as_of <= trade_date``.
+- The frozen population is the candidate *superset* formed at the research
+  start boundary from evidence available then; per-date *eligibility* within
+  folds comes from the PIT segments. A dynamic universe across folds is never
+  relabelled as one end-of-selection frozen population.
 - Selection requires a full :class:`SelectionAttestation`. Arbitrary winner
   assertions are rejected. Authorizing the FINAL test requires a valid
   attestation bound into the plan.
@@ -337,32 +345,74 @@ class CorporateActionClaim:
 
 
 @dataclass(frozen=True)
-class PITMembershipAttestation:
-    """Per-instrument PIT membership attestation (never one opaque string)."""
+class PITMembershipSegment:
+    """One immutable date-scoped PIT membership record.
+
+    A static source snapshot may attest several dates only when taken at or
+    before the earliest (``evidence_as_of <= valid_from``). A later snapshot
+    (for example 2025-12-31) can never attest an earlier trade date (for
+    example 2024-01-02): construction fails closed.
+    """
 
     instrument_key: str
-    trade_dates: tuple[date, ...]
+    valid_from: date
+    valid_to: date
     evidence_as_of: date
     source_fingerprint: str
+    eligible: bool
 
     def __post_init__(self) -> None:
         if not self.instrument_key.strip():
-            raise ResearchWindowError("PIT attestation instrument_key is required")
-        if not self.trade_dates or tuple(sorted(set(self.trade_dates))) != self.trade_dates:
-            raise ResearchWindowError("PIT attestation trade_dates must be sorted unique")
-        _require_hex_digest("PIT attestation source_fingerprint", self.source_fingerprint)
-        if self.evidence_as_of > max(self.trade_dates):
+            raise ResearchWindowError("PIT segment instrument_key is required")
+        if self.valid_from > self.valid_to:
+            raise ResearchWindowError("PIT segment valid_from must be on or before valid_to")
+        _require_hex_digest("PIT segment source_fingerprint", self.source_fingerprint)
+        if not isinstance(self.eligible, bool):
+            raise ResearchWindowError("PIT segment membership state must be boolean")
+        if self.evidence_as_of > self.valid_from:
             raise WindowLeakageError(
-                "PIT evidence_as_of must not be after the attested trade dates"
+                f"PIT evidence snapshot {self.evidence_as_of.isoformat()} is after segment start "
+                f"{self.valid_from.isoformat()} for {self.instrument_key!r}; "
+                "a later snapshot cannot attest earlier membership"
             )
+
+    def covers(self, trade_date: date) -> bool:
+        """Return True when this segment's validity range contains the date."""
+        return self.valid_from <= trade_date <= self.valid_to
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "instrument_key": self.instrument_key,
-            "trade_dates": [d.isoformat() for d in self.trade_dates],
+            "valid_from": self.valid_from.isoformat(),
+            "valid_to": self.valid_to.isoformat(),
             "evidence_as_of": self.evidence_as_of.isoformat(),
             "source_fingerprint": self.source_fingerprint,
+            "eligible": self.eligible,
         }
+
+
+def resolve_pit_segment(
+    segments: tuple[PITMembershipSegment, ...], trade_date: date
+) -> PITMembershipSegment:
+    """Resolve exactly one PIT segment for a trade date, failing closed otherwise.
+
+    Enforces ``segment.evidence_as_of <= trade_date`` on the resolved record so
+    no future snapshot can validate earlier membership, even if a caller passes
+    a stale or mismatched collection.
+    """
+    covering = [item for item in segments if item.covers(trade_date)]
+    if len(covering) != 1:
+        raise WindowLeakageError(
+            f"trade date {trade_date.isoformat()} must resolve to exactly one PIT "
+            f"membership record, found {len(covering)}"
+        )
+    resolved = covering[0]
+    if resolved.evidence_as_of > trade_date:
+        raise WindowLeakageError(
+            f"PIT record for {trade_date.isoformat()} relies on evidence as of "
+            f"{resolved.evidence_as_of.isoformat()}"
+        )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -390,7 +440,15 @@ class StrategyDefinitionClaim:
 
 @dataclass(frozen=True)
 class FrozenTrainUniverse:
-    """Frozen population with internally derived population fingerprint."""
+    """Candidate superset formed at the research-start boundary.
+
+    This is the population that *may* appear in selection, fixed from evidence
+    available at formation. Per-date *eligibility* within folds comes from the
+    date-scoped PIT segments, never from this list alone. A dynamic universe
+    across folds is not relabelled as one end-of-selection population:
+    ``frozen_as_of`` is the formation boundary (research start), not the end of
+    selection.
+    """
 
     instruments: tuple[str, ...]
     universe_policy_id: str
@@ -512,16 +570,37 @@ def derive_population_fingerprint(
     *,
     instruments: tuple[str, ...],
     universe_policy_id: str,
-    pit_attestations: tuple[PITMembershipAttestation, ...],
+    pit_segments: tuple[PITMembershipSegment, ...],
 ) -> str:
-    """Derive the canonical population fingerprint internally (never caller-supplied)."""
+    """Derive the canonical population fingerprint internally (never caller-supplied).
+
+    Binds the complete date-scoped PIT evidence: changing any segment (including
+    an early date's membership state) changes the fingerprint.
+    """
     return canonical_sha256(
         {
             "instruments": list(instruments),
             "universe_policy_id": universe_policy_id,
-            "pit_attestations": [item.as_dict() for item in pit_attestations],
+            "pit_segments": [item.as_dict() for item in pit_segments],
         }
     )
+
+
+def require_pit_coverage(
+    segments_by_instrument: dict[str, tuple[PITMembershipSegment, ...]],
+    required_dates: tuple[date, ...],
+) -> None:
+    """Require exactly-one PIT record per instrument for every required date."""
+    for instrument_key in sorted(segments_by_instrument):
+        segments = tuple(sorted(segments_by_instrument[instrument_key], key=lambda s: s.valid_from))
+        for first, second in zip(segments, segments[1:], strict=False):
+            if first.valid_to >= second.valid_from:
+                raise WindowLeakageError(
+                    f"PIT segments overlap for {instrument_key!r}; "
+                    "every trade date must resolve to exactly one record"
+                )
+        for trade_date in required_dates:
+            resolve_pit_segment(segments, trade_date)
 
 
 @dataclass(frozen=True)
@@ -549,7 +628,7 @@ class ResearchWindowPlan:
     ca_claim: CorporateActionClaim
     dataset_fingerprints: tuple[tuple[str, str], ...]
     universe_policy_id: str
-    pit_attestations: tuple[PITMembershipAttestation, ...]
+    pit_segments: tuple[PITMembershipSegment, ...]
     frozen_train_universe: FrozenTrainUniverse
     strategy_definitions: tuple[StrategyDefinitionClaim, ...]
     selection_attestation: SelectionAttestation | None = None
@@ -626,18 +705,46 @@ class ResearchWindowPlan:
             raise FrozenUniverseViolationError(
                 "dataset instrument keys must exactly equal frozen train universe instruments"
             )
-        attestation_keys = tuple(item.instrument_key for item in self.pit_attestations)
-        if attestation_keys != self.frozen_train_universe.instruments:
+        segment_keys = tuple(sorted({item.instrument_key for item in self.pit_segments}))
+        if segment_keys != self.frozen_train_universe.instruments:
             raise FrozenUniverseViolationError(
-                "PIT attestations must cover exactly the frozen population"
+                "PIT segments must cover exactly the frozen population"
             )
         expected_population = derive_population_fingerprint(
             instruments=self.frozen_train_universe.instruments,
             universe_policy_id=self.universe_policy_id,
-            pit_attestations=self.pit_attestations,
+            pit_segments=self.pit_segments,
         )
         if expected_population != self.frozen_train_universe.population_fingerprint:
             raise FrozenUniverseViolationError("population fingerprint mismatch")
+        if self.frozen_train_universe.frozen_as_of != self.research_start:
+            raise FrozenUniverseViolationError(
+                "frozen population must be formed at the research-start boundary"
+            )
+        segments_by_instrument: dict[str, tuple[PITMembershipSegment, ...]] = {}
+        for instrument_key in self.frozen_train_universe.instruments:
+            segments_by_instrument[instrument_key] = tuple(
+                item for item in self.pit_segments if item.instrument_key == instrument_key
+            )
+        formation = [
+            item
+            for item in self.pit_segments
+            if item.valid_from <= self.research_start <= item.valid_to
+        ]
+        if tuple(sorted({item.instrument_key for item in formation})) != tuple(
+            self.frozen_train_universe.instruments
+        ):
+            raise FrozenUniverseViolationError(
+                "every frozen instrument requires formation-boundary PIT coverage; "
+                "later-listed instruments require a new plan"
+            )
+        try:
+            require_pit_coverage(
+                segments_by_instrument,
+                (*self.selection_union_dates(), *self.final_test.trading_dates),
+            )
+        except WindowLeakageError as exc:
+            raise FrozenUniverseViolationError(str(exc)) from exc
         if self.selection_attestation is not None:
             self._validate_attestation(self.selection_attestation)
 
@@ -701,7 +808,7 @@ class ResearchWindowPlan:
             "ca_claim": self.ca_claim.as_dict(),
             "dataset_fingerprints": [[k, v] for k, v in self.dataset_fingerprints],
             "universe_policy_id": self.universe_policy_id,
-            "pit_attestations": [item.as_dict() for item in self.pit_attestations],
+            "pit_segments": [item.as_dict() for item in self.pit_segments],
             "frozen_train_universe": self.frozen_train_universe.as_dict(),
             "strategy_definitions": [item.as_dict() for item in self.strategy_definitions],
             "selection_attestation": (
@@ -805,7 +912,7 @@ class ResearchWindowPlan:
             ca_claim=self.ca_claim,
             dataset_fingerprints=self.dataset_fingerprints,
             universe_policy_id=self.universe_policy_id,
-            pit_attestations=self.pit_attestations,
+            pit_segments=self.pit_segments,
             frozen_train_universe=self.frozen_train_universe,
             strategy_definitions=self.strategy_definitions,
             selection_attestation=attestation,
@@ -850,24 +957,25 @@ class ResearchWindowPlan:
 
     def check_pit_membership(
         self, *, instrument_key: str, trade_date: date, evidence_as_of: date
-    ) -> None:
-        """Enforce per-instrument per-date PIT membership against attestations."""
-        matches = [item for item in self.pit_attestations if item.instrument_key == instrument_key]
-        if not matches:
-            raise FrozenUniverseViolationError(f"no PIT attestation for {instrument_key!r}")
-        attestation = matches[0]
-        if trade_date not in set(attestation.trade_dates):
-            raise ResearchWindowError(f"{trade_date.isoformat()} is outside attested PIT dates")
+    ) -> PITMembershipSegment:
+        """Resolve and validate per-date PIT membership, returning the record.
+
+        Enforces the attested record's own ``evidence_as_of <= trade_date`` for
+        every queried date (not just the caller's query date), plus the
+        caller's ``evidence_as_of <= trade_date``.
+        """
+        segments = tuple(
+            item for item in self.pit_segments if item.instrument_key == instrument_key
+        )
+        if not segments:
+            raise FrozenUniverseViolationError(f"no PIT segments for {instrument_key!r}")
+        resolved = resolve_pit_segment(segments, trade_date)
         if evidence_as_of > trade_date:
             raise WindowLeakageError(
                 f"PIT membership for {trade_date.isoformat()} cannot use evidence "
                 f"as of {evidence_as_of.isoformat()}"
             )
-        if (
-            evidence_as_of != attestation.evidence_as_of
-            and evidence_as_of > attestation.evidence_as_of
-        ):
-            raise WindowLeakageError("PIT evidence_as_of is newer than attested snapshot")
+        return resolved
 
 
 def compile_repeated_wfo(
@@ -890,7 +998,7 @@ def compile_repeated_wfo(
     ca_claim: CorporateActionClaim,
     dataset_fingerprints: Mapping[str, str],
     universe_policy_id: str,
-    pit_attestations: tuple[PITMembershipAttestation, ...],
+    pit_segments: tuple[PITMembershipSegment, ...],
     train_universe_instruments: tuple[str, ...],
     strategy_definitions: tuple[StrategyDefinitionClaim, ...],
     created_at: str | None = None,
@@ -900,7 +1008,9 @@ def compile_repeated_wfo(
     Fold arithmetic delegates to :mod:`wfo_schedule` (shared with
     ``walk_forward``). The FINAL test region is reserved first; folds are
     generated over the remaining prefix. Every size, step, and minimum is an
-    explicit caller input.
+    explicit caller input. PIT membership must be supplied as date-scoped
+    segments covering selection dates and FINAL test dates; the frozen
+    candidate superset is formed at the research-start boundary.
     """
     if research_start > research_end:
         raise ResearchWindowError("research_start must be on or before research_end")
@@ -963,11 +1073,11 @@ def compile_repeated_wfo(
             raise ResearchWindowError(
                 "strategy_definitions must be StrategyDefinitionClaim records"
             )
-    if not pit_attestations:
-        raise ResearchWindowError("pit_attestations must not be empty")
-    for item in pit_attestations:
-        if not isinstance(item, PITMembershipAttestation):
-            raise ResearchWindowError("pit_attestations must be PITMembershipAttestation records")
+    if not pit_segments:
+        raise ResearchWindowError("pit_segments must not be empty")
+    for item in pit_segments:
+        if not isinstance(item, PITMembershipSegment):
+            raise ResearchWindowError("pit_segments must be PITMembershipSegment records")
 
     dataset_pairs = _canonical_pairs("dataset_fingerprints", dataset_fingerprints)
     frozen_instruments = tuple(sorted(set(train_universe_instruments)))
@@ -979,13 +1089,9 @@ def compile_repeated_wfo(
         raise FrozenUniverseViolationError(
             "dataset instrument keys must exactly equal frozen train universe instruments"
         )
-    attestation_keys = tuple(
-        item.instrument_key for item in sorted(pit_attestations, key=lambda a: a.instrument_key)
-    )
-    if attestation_keys != frozen_instruments:
-        raise FrozenUniverseViolationError(
-            "PIT attestations must cover exactly the frozen population"
-        )
+    segment_keys = tuple(sorted({item.instrument_key for item in pit_segments}))
+    if segment_keys != frozen_instruments:
+        raise FrozenUniverseViolationError("PIT segments must cover exactly the frozen population")
     ca_population = tuple(sorted(set(ca_claim.population)))
     if ca_population != frozen_instruments:
         raise FrozenUniverseViolationError(
@@ -1057,28 +1163,40 @@ def compile_repeated_wfo(
             }
         )
     )
-    for attestation in pit_attestations:
-        if tuple(attestation.trade_dates) != selection_union:
-            raise FrozenUniverseViolationError(
-                f"PIT attestation for {attestation.instrument_key!r} must cover exactly "
-                "the fold train+validation union"
-            )
+    required_pit_dates = tuple(sorted(set(selection_union) | set(final_test_dates)))
+    segments_by_instrument: dict[str, tuple[PITMembershipSegment, ...]] = {}
+    for instrument_key in frozen_instruments:
+        instrument_segments = tuple(
+            item for item in pit_segments if item.instrument_key == instrument_key
+        )
+        segments_by_instrument[instrument_key] = tuple(
+            sorted(instrument_segments, key=lambda s: s.valid_from)
+        )
+    formation = [
+        item for item in pit_segments if item.valid_from <= research_start <= item.valid_to
+    ]
+    if tuple(sorted({item.instrument_key for item in formation})) != frozen_instruments:
+        raise FrozenUniverseViolationError(
+            "every frozen instrument requires formation-boundary PIT coverage at "
+            "research start; later-listed instruments require a new plan"
+        )
+    try:
+        require_pit_coverage(segments_by_instrument, required_pit_dates)
+    except WindowLeakageError as exc:
+        raise FrozenUniverseViolationError(str(exc)) from exc
 
-    ordered_attestations = tuple(sorted(pit_attestations, key=lambda a: a.instrument_key))
+    ordered_segments = tuple(sorted(pit_segments, key=lambda s: (s.instrument_key, s.valid_from)))
     population_fingerprint = derive_population_fingerprint(
         instruments=frozen_instruments,
         universe_policy_id=universe_policy_id,
-        pit_attestations=ordered_attestations,
+        pit_segments=ordered_segments,
     )
-    frozen_as_of = max(selection_union)
     frozen_universe = FrozenTrainUniverse(
         instruments=frozen_instruments,
         universe_policy_id=universe_policy_id,
         population_fingerprint=population_fingerprint,
-        frozen_as_of=frozen_as_of,
+        frozen_as_of=research_start,
     )
-    if frozen_as_of >= (final_embargo.start or final_test.start):  # type: ignore[operator]
-        raise WindowLeakageError("frozen population must predate FINAL regions")
 
     return ResearchWindowPlan(
         schema_version=SCHEMA_VERSION,
@@ -1102,7 +1220,7 @@ def compile_repeated_wfo(
         ca_claim=ca_claim,
         dataset_fingerprints=dataset_pairs,
         universe_policy_id=universe_policy_id,
-        pit_attestations=ordered_attestations,
+        pit_segments=ordered_segments,
         frozen_train_universe=frozen_universe,
         strategy_definitions=tuple(strategy_definitions),
         selection_attestation=None,
