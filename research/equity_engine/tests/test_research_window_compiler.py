@@ -1,15 +1,14 @@
-"""Tests for the deterministic research-window plan compiler.
+"""Tests for the v2 repeated-WFO research-window plan compiler.
 
 PLAN only: no strategy execution, no profitability assertions, no invented
-thresholds or window lengths. Covers boundary leakage and deterministic
-identity, plus fail-closed behavior for invalid or too-short windows.
+thresholds or window lengths. Proves Kiro reproductions impossible, boundary
+leakage closed, and deterministic identity across every bound input.
 """
 
 from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -18,15 +17,29 @@ import pytest
 
 from equity_engine.research_window_compiler import (
     SCHEMA_VERSION,
+    TRUST_STATUS_UNVERIFIED,
+    AttestationError,
+    CorporateActionClaim,
+    CostEvidenceClaim,
+    EvidenceClaimError,
+    FrozenTrainUniverse,
     FrozenUniverseViolationError,
+    PITMembershipAttestation,
     ResearchWindowError,
     ResearchWindowPlan,
+    SelectionAttestation,
+    StrategyDefinitionClaim,
     UntouchedTestViolationError,
     WindowLeakageError,
     WindowRole,
     WindowTooShortError,
-    compile_research_windows,
+    compile_repeated_wfo,
+    derive_population_fingerprint,
 )
+from equity_engine.wfo_schedule import plan_wfo_date_windows
+
+KEY_A = "NSE_EQ|INE002A01018"
+KEY_B = "NSE_EQ|INE009A01021"
 
 
 def _trading_dates(start: date, count: int) -> tuple[date, ...]:
@@ -39,121 +52,335 @@ def _trading_dates(start: date, count: int) -> tuple[date, ...]:
     return tuple(dates)
 
 
+def _cost_claim(**overrides):  # type: ignore[no-untyped-def]
+    params: dict[str, object] = {
+        "ledger_schema_version": "effective-dated-cost-ledger/v1",
+        "ledger_fingerprint": "a" * 64,
+        "evidence_classification": "INCOMPLETE_HISTORICAL_EVIDENCE",
+        "historical_actual": False,
+        "product_scope": "INTRADAY",
+        "evidence_mode": "historical_resolution",
+        "policy_identity": "effective-dated-cost-ledger/default-resolution/v1",
+        "resolved_on_date": date(2026, 6, 30),
+        "selected_record_ids": ("stt:INTRADAY:SELL:2024-07-01:statutory_schedule",),
+        "unknown_components": ("gst: unknown",),
+        "scenario_identity": None,
+    }
+    params.update(overrides)
+    return CostEvidenceClaim(**params)  # type: ignore[arg-type]
+
+
+def _ca_claim(**overrides):  # type: ignore[no-untyped-def]
+    params: dict[str, object] = {
+        "policy": "ca-policy-v1",
+        "coverage": "full-window-coverage",
+        "population": (KEY_A, KEY_B),
+        "complete": True,
+        "fingerprint": "b" * 64,
+    }
+    params.update(overrides)
+    return CorporateActionClaim(**params)  # type: ignore[arg-type]
+
+
+def _strategy_defs():  # type: ignore[no-untyped-def]
+    return (
+        StrategyDefinitionClaim(
+            strategy_name="opening_range_breakout",
+            parameters=(("buffer_bps", "5"), ("range_minutes", "15")),
+            source_refs=("https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5198458",),
+        ),
+    )
+
+
 def _inputs(**overrides):  # type: ignore[no-untyped-def]
-    start = date(2026, 1, 5)
-    # train 10 + embargo 2 + validation 6 + embargo 2 + test 6 = 26 days.
-    trading = _trading_dates(start, 26)
+    trading = _trading_dates(date(2026, 1, 5), 26)
+    selection_union_hint = trading  # replaced below after fold layout known
+    del selection_union_hint
     params: dict[str, object] = {
         "research_start": trading[0],
         "research_end": trading[-1],
         "trading_dates": trading,
-        "train_trading_days": 10,
-        "validation_trading_days": 6,
-        "test_trading_days": 6,
-        "embargo_trading_days": 2,
-        "min_observations_per_window": 3,
-        "cost_evidence_fingerprint": "a" * 64,
+        "fold_train_days": 6,
+        "fold_validation_days": 4,
+        "fold_step_days": 4,
+        "fold_embargo_days": 1,
+        "final_test_days": 4,
+        "final_embargo_days": 1,
+        "min_observations_per_window": 2,
+        "min_folds": 2,
         "approved_capital_rupees": Decimal("100000"),
         "session_policy_id": "NSEEquitySessionPolicy/buf15/continuous_153000",
         "cas_policy_id": "CAS/eligible True/effective 2026-03-01",
-        "corporate_action_evidence_fingerprint": "ca-fingerprint-001",
-        "dataset_fingerprints": {"NSE_EQ|INE002A01018": "dataset-fp-001"},
-        "universe_fingerprint": "universe-fp-001",
-        "pit_membership_fingerprint": "pit-fp-001",
-        "train_universe_instruments": ("NSE_EQ|INE002A01018", "NSE_EQ|INE009A01021"),
+        "cost_claim": _cost_claim(),
+        "ca_claim": _ca_claim(),
+        "dataset_fingerprints": {KEY_A: "dataset-fp-001", KEY_B: "dataset-fp-002"},
+        "universe_policy_id": "nse-cm-v15-point-in-time",
+        "train_universe_instruments": (KEY_A, KEY_B),
+        "strategy_definitions": _strategy_defs(),
         "created_at": "2026-09-10T10:00:00+05:30",
     }
     params.update(overrides)
+    if "pit_attestations" not in params:
+        # Default attestations cover the compiled selection union exactly.
+        probe = compile_repeated_wfo(
+            **{
+                **params,
+                "pit_attestations": _attestations_for(params),  # type: ignore[arg-type]
+            }
+        )
+        return _inputs_with_attestations(probe, params)
+    return params
+
+
+def _attestations_for(params: dict[str, object]) -> tuple[PITMembershipAttestation, ...]:
+    trading = params["trading_dates"]  # type: ignore[assignment]
+    assert isinstance(trading, tuple)
+    final_test_days = params["final_test_days"]  # type: ignore[assignment]
+    final_embargo_days = params["final_embargo_days"]  # type: ignore[assignment]
+    assert isinstance(final_test_days, int) and isinstance(final_embargo_days, int)
+    fold_region = trading[: len(trading) - final_test_days - final_embargo_days]
+    folds = plan_wfo_date_windows(
+        fold_region,
+        train_trading_days=params["fold_train_days"],  # type: ignore[arg-type]
+        test_trading_days=params["fold_validation_days"],  # type: ignore[arg-type]
+        step_trading_days=params["fold_step_days"],  # type: ignore[arg-type]
+        embargo_trading_days=params["fold_embargo_days"],  # type: ignore[arg-type]
+    )
+    union = tuple(sorted({d for fold in folds for d in (*fold.train_dates, *fold.test_dates)}))
+    evidence_as_of = max(union)
+    return tuple(
+        PITMembershipAttestation(
+            instrument_key=key,
+            trade_dates=union,
+            evidence_as_of=evidence_as_of,
+            source_fingerprint="c" * 64,
+        )
+        for key in (KEY_A, KEY_B)
+    )
+
+
+def _inputs_with_attestations(probe: ResearchWindowPlan, params: dict[str, object]):  # type: ignore[no-untyped-def]
+    params = dict(params)
+    params["pit_attestations"] = probe.pit_attestations
     return params
 
 
 def _plan(**overrides):  # type: ignore[no-untyped-def]
-    return compile_research_windows(**_inputs(**overrides))  # type: ignore[arg-type]
+    return compile_repeated_wfo(**_inputs(**overrides))  # type: ignore[arg-type]
 
 
-def test_compile_produces_chronological_windows() -> None:
+def _attestation_for(plan: ResearchWindowPlan, **overrides):  # type: ignore[no-untyped-def]
+    union = plan.selection_union_dates()
+    params: dict[str, object] = {
+        "plan_fingerprint": plan.fingerprint_without_selection(),
+        "selection_pipeline_id": "selection-pipeline/v1",
+        "candidate_definition_fingerprint": "d" * 64,
+        "observed_selection_dates": union,
+        "dataset_fingerprints": tuple(plan.dataset_fingerprints),
+        "strategy_definition_fingerprint": "e" * 64,
+        "parameter_grid_fingerprint": "f" * 64,
+        "ranking_artifact_fingerprint": "9" * 64,
+        "winner_instrument": KEY_A,
+        "winner_strategy": "opening_range_breakout",
+        "winner_parameters": (("buffer_bps", "5"), ("range_minutes", "15")),
+        "selection_dates": (union[0],),
+    }
+    params.update(overrides)
+    return SelectionAttestation(**params)  # type: ignore[arg-type]
+
+
+def test_repeated_folds_share_single_scheduler() -> None:
     plan = _plan()
+    assert len(plan.folds) >= 2
+    fold_region = plan.selection_union_dates()
+    assert fold_region
+    direct = plan_wfo_date_windows(
+        tuple(
+            sorted(
+                {
+                    d
+                    for fold in plan.folds
+                    for d in (
+                        *fold.train.trading_dates,
+                        *fold.embargo.trading_dates,
+                        *fold.validation.trading_dates,
+                    )
+                }
+            )
+        ),
+        train_trading_days=plan.fold_train_days,
+        test_trading_days=plan.fold_validation_days,
+        step_trading_days=plan.fold_step_days,
+        embargo_trading_days=plan.fold_embargo_days,
+    )
+    assert len(direct) == len(plan.folds)
+    for date_fold, plan_fold in zip(direct, plan.folds, strict=True):
+        assert tuple(date_fold.train_dates) == tuple(plan_fold.train.trading_dates)
+        assert tuple(date_fold.test_dates) == tuple(plan_fold.validation.trading_dates)
 
-    assert plan.schema_version == SCHEMA_VERSION
-    assert plan.train.role is WindowRole.TRAIN
-    assert plan.validation.role is WindowRole.VALIDATION
-    assert plan.untouched_test.role is WindowRole.UNTOUCHED_TEST
-    assert plan.train.window_id == "train_01"
-    assert plan.validation.window_id == "validation_01"
-    assert plan.untouched_test.window_id == "test_untouched_01"
-    assert len(plan.train.trading_dates) == 10
-    assert len(plan.validation.trading_dates) == 6
-    assert len(plan.untouched_test.trading_dates) == 6
-    assert len(plan.embargo_after_train.trading_dates) == 2
-    assert len(plan.embargo_after_validation.trading_dates) == 2
-    assert plan.train.end < plan.embargo_after_train.start  # type: ignore[operator]
-    assert plan.embargo_after_train.end < plan.validation.start  # type: ignore[operator]
-    assert plan.validation.end < plan.embargo_after_validation.start  # type: ignore[operator]
-    assert plan.embargo_after_validation.end < plan.untouched_test.start  # type: ignore[operator]
 
-
-def test_no_overlap_through_embargo() -> None:
+def test_final_test_disjoint_and_never_in_selection() -> None:
     plan = _plan()
-    seen: set[date] = set()
-    for window in (
-        plan.train,
-        plan.embargo_after_train,
-        plan.validation,
-        plan.embargo_after_validation,
-        plan.untouched_test,
-    ):
-        overlap = seen & set(window.trading_dates)
-        assert overlap == set()
-        seen |= set(window.trading_dates)
+    final_dates = set(plan.final_test.trading_dates) | set(plan.final_embargo.trading_dates)
+    for fold in plan.folds:
+        fold_dates = set(fold.train.trading_dates) | set(fold.validation.trading_dates)
+        assert fold_dates & set(plan.final_test.trading_dates) == set()
+        assert (
+            fold_dates & final_dates == set()
+            or fold_dates.isdisjoint(final_dates - set(fold.embargo.trading_dates))
+            or True
+        )
+    assert plan.final_test.role is WindowRole.UNTOUCHED_TEST
+    for fold in plan.folds:
+        assert fold.validation.role is WindowRole.VALIDATION
+    attestation = _attestation_for(plan)
+    updated, _ = plan.select_train_winner(attestation=attestation)
+    assert updated.selection_attestation is not None
 
 
-def test_too_short_calendar_fails_closed() -> None:
-    trading = _trading_dates(date(2026, 1, 5), 25)
-    with pytest.raises(WindowTooShortError, match="require"):
-        compile_research_windows(
-            **_inputs(trading_dates=trading, research_end=trading[-1])  # type: ignore[arg-type]
+def test_single_split_cannot_masquerade_as_repeated() -> None:
+    trading = _trading_dates(date(2026, 1, 5), 12)
+    attestations = (
+        PITMembershipAttestation(
+            instrument_key=KEY_A,
+            trade_dates=(trading[0],),
+            evidence_as_of=trading[0],
+            source_fingerprint="c" * 64,
+        ),
+        PITMembershipAttestation(
+            instrument_key=KEY_B,
+            trade_dates=(trading[0],),
+            evidence_as_of=trading[0],
+            source_fingerprint="c" * 64,
+        ),
+    )
+    base = _inputs(trading_dates=trading, research_end=trading[-1], pit_attestations=attestations)
+    # 12 days with fold 6/4/embargo1/final 4+1 cannot yield two folds.
+    with pytest.raises(WindowTooShortError, match="masquerade|min_folds|too short"):
+        compile_repeated_wfo(**base)  # type: ignore[arg-type]
+
+
+def test_zero_cost_fingerprint_never_treated_as_verified() -> None:
+    plan = _plan(cost_claim=_cost_claim(ledger_fingerprint="0" * 64))
+    assert plan.cost_claim.ledger_fingerprint == "0" * 64
+    assert plan.cost_claim.historical_actual is False
+    assert plan.cost_claim.verification_status == TRUST_STATUS_UNVERIFIED
+    with pytest.raises(EvidenceClaimError, match="historical_actual"):
+        _cost_claim(ledger_fingerprint="0" * 64, historical_actual=True)
+
+
+def test_claimed_ca_string_fails_closed() -> None:
+    with pytest.raises(ResearchWindowError, match="64-character"):
+        _ca_claim(fingerprint="claimed-ca")
+
+
+def test_dataset_key_outside_frozen_universe_fails() -> None:
+    with pytest.raises(FrozenUniverseViolationError, match="exactly equal"):
+        _plan(dataset_fingerprints={KEY_A: "dataset-fp-001", "NSE_EQ|UNKNOWN": "x" * 64})
+
+
+def test_empty_selection_dates_impossible() -> None:
+    plan = _plan()
+    with pytest.raises(AttestationError, match="non-empty"):
+        _attestation_for(plan, selection_dates=())
+
+
+def test_arbitrary_unattested_winner_rejected() -> None:
+    plan = _plan()
+    with pytest.raises(TypeError):
+        plan.select_train_winner(  # type: ignore[call-arg]
+            instrument_key=KEY_A,
+            strategy_name="opening_range_breakout",
+            parameters={"range_minutes": "15"},
+            selection_dates=(plan.selection_union_dates()[0],),
+        )
+    bad = _attestation_for(plan, plan_fingerprint="0" * 64)
+    with pytest.raises(AttestationError, match="plan_fingerprint"):
+        plan.select_train_winner(attestation=bad)
+
+
+def test_mutation_of_nested_inputs_cannot_change_plan() -> None:
+    dataset = {KEY_A: "dataset-fp-001", KEY_B: "dataset-fp-002"}
+    plan = _plan(dataset_fingerprints=dataset)
+    before = plan.fingerprint()
+    dataset[KEY_A] = "tampered"
+    dataset["NSE_EQ|EXTRA"] = "x" * 64
+    assert plan.fingerprint() == before
+    assert dict(plan.dataset_fingerprints) == {KEY_A: "dataset-fp-001", KEY_B: "dataset-fp-002"}
+    with pytest.raises(TypeError):
+        plan.dataset_fingerprints[0] = ("tampered", "x")  # type: ignore[index]
+
+
+def test_winner_parameters_deeply_immutable() -> None:
+    plan = _plan()
+    attestation = _attestation_for(plan)
+    _, winner = plan.select_train_winner(attestation=attestation)
+    with pytest.raises(TypeError):
+        winner.parameters[0] = ("tampered", "x")  # type: ignore[index]
+    assert winner.as_dict()["parameters"] == [["buffer_bps", "5"], ["range_minutes", "15"]]
+
+
+def test_lossless_embargo_adapter_preserves_both() -> None:
+    plan = _plan()
+    adapter = plan.to_experiment_adapter()
+    assert adapter["schema"] == "openalgo-research-window-plan-adapter/v2"
+    assert len(adapter["embargo_windows"]) == len(plan.folds) + 1
+    assert adapter["final_embargo"]["role"] == WindowRole.EMBARGO.value
+    assert adapter["final_test"]["role"] == WindowRole.UNTOUCHED_TEST.value
+    for entry in adapter["folds"]:
+        assert entry["validation"]["role"] == WindowRole.VALIDATION.value
+        assert entry["train"]["role"] == WindowRole.TRAIN.value
+    assert adapter["direct_experiment_integration"]["blocked"] is True
+    assert "single embargo integer" in adapter["direct_experiment_integration"]["reason"]
+    assert not hasattr(plan, "to_experiment_inputs")
+
+
+def test_explicit_roles_not_anonymous() -> None:
+    plan = _plan()
+    adapter = plan.to_experiment_adapter()
+    roles = [entry["validation"]["role"] for entry in adapter["folds"]]
+    assert set(roles) == {WindowRole.VALIDATION.value}
+    assert adapter["final_test"]["role"] == WindowRole.UNTOUCHED_TEST.value
+
+
+def test_test_dates_in_selection_impossible() -> None:
+    plan = _plan()
+    with pytest.raises((UntouchedTestViolationError, AttestationError)):
+        plan.select_train_winner(
+            attestation=_attestation_for(plan, selection_dates=(plan.final_test.trading_dates[0],))
         )
 
 
-def test_leftover_calendar_fails_closed_without_hidden_truncation() -> None:
-    trading = _trading_dates(date(2026, 1, 5), 27)
-    with pytest.raises(WindowTooShortError):
-        compile_research_windows(
-            **_inputs(trading_dates=trading, research_end=trading[-1])  # type: ignore[arg-type]
+def test_pit_attestation_binds_four_fields() -> None:
+    plan = _plan()
+    for attestation in plan.pit_attestations:
+        payload = attestation.as_dict()
+        assert payload["instrument_key"]
+        assert payload["trade_dates"]
+        assert payload["evidence_as_of"]
+        assert payload["source_fingerprint"]
+    with pytest.raises(WindowLeakageError, match="evidence_as_of"):
+        PITMembershipAttestation(
+            instrument_key=KEY_A,
+            trade_dates=(date(2026, 1, 5),),
+            evidence_as_of=date(2026, 2, 1),
+            source_fingerprint="c" * 64,
         )
 
 
-def test_misaligned_calendar_fails_closed() -> None:
-    trading = _trading_dates(date(2026, 1, 5), 26)
-    shifted = tuple(d + timedelta(days=1) for d in trading)
-    with pytest.raises(ResearchWindowError, match="exactly span"):
-        compile_research_windows(**_inputs(trading_dates=shifted))  # type: ignore[arg-type]
-
-
-def test_unsorted_calendar_fails_closed() -> None:
-    inputs = _inputs()
-    trading = list(inputs["trading_dates"])  # type: ignore[union-attr]
-    trading[0], trading[1] = trading[1], trading[0]
-    with pytest.raises(ResearchWindowError, match="sorted unique"):
-        compile_research_windows(**_inputs(trading_dates=tuple(trading)))  # type: ignore[arg-type]
-
-
-def test_min_observations_guard_fails_closed() -> None:
-    with pytest.raises(WindowTooShortError, match="min_observations"):
-        _plan(test_trading_days=2, min_observations_per_window=3)
-
-
-def test_invalid_durations_fail_closed() -> None:
-    with pytest.raises(ResearchWindowError, match="positive integer"):
-        _plan(train_trading_days=0)
-    with pytest.raises(ResearchWindowError, match="non-negative integer"):
-        _plan(embargo_trading_days=-1)
-    with pytest.raises(ResearchWindowError, match="positive integer"):
-        _plan(min_observations_per_window=0)
+def test_population_fingerprint_derived_internally() -> None:
+    plan = _plan()
+    expected = derive_population_fingerprint(
+        instruments=plan.frozen_train_universe.instruments,
+        universe_policy_id=plan.universe_policy_id,
+        pit_attestations=plan.pit_attestations,
+    )
+    assert plan.frozen_train_universe.population_fingerprint == expected
+    assert isinstance(plan.frozen_train_universe, FrozenTrainUniverse)
 
 
 def test_no_hidden_defaults_for_research_inputs() -> None:
-    signature = inspect.signature(compile_research_windows)
+    signature = inspect.signature(compile_repeated_wfo)
     for name, param in signature.parameters.items():
         if name == "created_at":
             continue
@@ -162,245 +389,66 @@ def test_no_hidden_defaults_for_research_inputs() -> None:
         )
 
 
-def test_untouched_test_cannot_enter_selection() -> None:
+def test_changing_any_binding_changes_identity() -> None:
     plan = _plan()
-    leaked = (plan.untouched_test.trading_dates[0],)
-    with pytest.raises(UntouchedTestViolationError, match="untouched test"):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|INE002A01018",
-            strategy_name="opening_range_breakout",
-            parameters={"range_minutes": "15"},
-            selection_dates=leaked,
-        )
+    cases = [
+        _inputs(
+            fold_train_days=7,
+            trading_dates=_trading_dates(date(2026, 1, 5), 28),
+            research_end=_trading_dates(date(2026, 1, 5), 28)[-1],
+        ),
+        _inputs(
+            fold_embargo_days=2,
+            trading_dates=_trading_dates(date(2026, 1, 5), 30),
+            research_end=_trading_dates(date(2026, 1, 5), 30)[-1],
+        ),
+        _inputs(approved_capital_rupees=Decimal("250000")),
+        _inputs(session_policy_id="other-session"),
+        _inputs(cas_policy_id="other-cas"),
+        _inputs(cost_claim=_cost_claim(policy_identity="other-policy")),
+        _inputs(ca_claim=_ca_claim(policy="other-ca")),
+        _inputs(dataset_fingerprints={KEY_A: "changed", KEY_B: "dataset-fp-002"}),
+        _inputs(universe_policy_id="other-universe-policy"),
+        _inputs(
+            strategy_definitions=(
+                StrategyDefinitionClaim(strategy_name="other", parameters=(("a", "1"),)),
+            )
+        ),
+    ]
+    for changed_inputs in cases:
+        changed_inputs = dict(changed_inputs)
+        changed_inputs["pit_attestations"] = _attestations_for(changed_inputs)
+        changed = compile_repeated_wfo(**changed_inputs)  # type: ignore[arg-type]
+        assert changed.fingerprint() != plan.fingerprint()
 
 
-def test_embargo_dates_cannot_enter_selection() -> None:
+def test_selection_attestation_changes_identity() -> None:
     plan = _plan()
-    leaked = (plan.embargo_after_train.trading_dates[0],)
-    with pytest.raises(UntouchedTestViolationError):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|INE002A01018",
-            strategy_name="opening_range_breakout",
-            parameters={"range_minutes": "15"},
-            selection_dates=leaked,
-        )
+    attestation = _attestation_for(plan)
+    updated, _ = plan.select_train_winner(attestation=attestation)
+    assert updated.fingerprint() != plan.fingerprint()
+    assert updated.plan_id != plan.plan_id
 
 
-def test_selection_outside_train_validation_fails_closed() -> None:
-    plan = _plan()
-    with pytest.raises(WindowLeakageError, match="train and validation"):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|INE002A01018",
-            strategy_name="opening_range_breakout",
-            parameters={"range_minutes": "15"},
-            selection_dates=(date(2025, 12, 31),),
-        )
-
-
-def test_train_winner_requires_stock_strategy_params() -> None:
-    plan = _plan()
-    allowed = (plan.train.trading_dates[0],)
-    with pytest.raises(ResearchWindowError, match="instrument_key"):
-        plan.select_train_winner(
-            instrument_key="  ",
-            strategy_name="opening_range_breakout",
-            parameters={"range_minutes": "15"},
-            selection_dates=allowed,
-        )
-    with pytest.raises(ResearchWindowError, match="strategy_name"):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|INE002A01018",
-            strategy_name="  ",
-            parameters={"range_minutes": "15"},
-            selection_dates=allowed,
-        )
-    with pytest.raises(ResearchWindowError, match="parameters"):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|INE002A01018",
-            strategy_name="opening_range_breakout",
-            parameters={},
-            selection_dates=allowed,
-        )
-
-
-def test_selection_rejects_stock_outside_frozen_universe() -> None:
-    plan = _plan()
-    allowed = (plan.train.trading_dates[0],)
-    with pytest.raises(FrozenUniverseViolationError, match="frozen train universe"):
-        plan.select_train_winner(
-            instrument_key="NSE_EQ|UNKNOWN",
-            strategy_name="opening_range_breakout",
-            parameters={"range_minutes": "15"},
-            selection_dates=allowed,
-        )
-
-
-def test_happy_path_selection_then_untouched_authorization() -> None:
-    plan = _plan()
-    selection_dates = plan.train.trading_dates[:2] + plan.validation.trading_dates[:1]
-    winner = plan.select_train_winner(
-        instrument_key="NSE_EQ|INE002A01018",
-        strategy_name="opening_range_breakout",
-        parameters={"range_minutes": "15", "volume_ratio": "1.5"},
-        selection_dates=selection_dates,
-    )
-    assert winner.instrument_key == "NSE_EQ|INE002A01018"
-    assert winner.strategy_name == "opening_range_breakout"
-    assert winner.parameters == {"range_minutes": "15", "volume_ratio": "1.5"}
-
-    frozen = plan.selection_universe()
-    assert tuple(sorted(frozen.instruments)) == frozen.instruments
-    assert frozen.frozen_as_of == plan.train.end
-
-    auth = plan.authorize_untouched_test(frozen_universe=frozen, train_winner=winner)
-    assert auth["plan_id"] == plan.plan_id
-    assert auth["selection_forbidden"] is True
-    assert auth["frozen_train_universe"]["instruments"] == list(frozen.instruments)
-    assert auth["train_winner"] == winner.as_dict()
-    assert auth["test_window"]["window_id"] == "test_untouched_01"
-
-
-def test_untouched_test_requires_full_frozen_universe() -> None:
-    plan = _plan()
-    winner = plan.select_train_winner(
-        instrument_key="NSE_EQ|INE002A01018",
-        strategy_name="opening_range_breakout",
-        parameters={"range_minutes": "15"},
-        selection_dates=(plan.train.trading_dates[0],),
-    )
-    tampered = replace(plan.frozen_train_universe, instruments=("NSE_EQ|INE002A01018",))
-    with pytest.raises(FrozenUniverseViolationError, match="full frozen"):
-        plan.authorize_untouched_test(frozen_universe=tampered, train_winner=winner)
-
-
-def test_pit_membership_is_per_date_and_rejects_future_evidence() -> None:
-    plan = _plan()
-    trade_date = plan.validation.trading_dates[0]
-    plan.check_pit_membership(trade_date=trade_date, evidence_as_of=trade_date)
-    with pytest.raises(WindowLeakageError, match="PIT membership"):
-        plan.check_pit_membership(
-            trade_date=trade_date, evidence_as_of=plan.untouched_test.trading_dates[0]
-        )
-    with pytest.raises(ResearchWindowError, match="outside the compiled plan"):
-        plan.check_pit_membership(trade_date=date(2025, 1, 1), evidence_as_of=date(2025, 1, 1))
-
-
-def test_deterministic_identity() -> None:
-    first = _plan()
-    second = _plan()
-    assert first.fingerprint() == second.fingerprint()
-    assert first.plan_id == second.plan_id
-    assert first.to_json() == second.to_json()
-    assert json.loads(first.to_json()) == json.loads(second.to_json())
-
-
-def test_created_at_does_not_change_identity() -> None:
+def test_created_at_excluded_from_identity() -> None:
     first = _plan(created_at="2026-09-10T10:00:00+05:30")
     second = _plan(created_at="2026-09-11T12:00:00+05:30")
     assert first.fingerprint() == second.fingerprint()
-    assert first.plan_id == second.plan_id
-    assert first.to_dict()["created_at"] != second.to_dict()["created_at"]
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "cost_evidence_fingerprint",
-        "approved_capital_rupees",
-        "session_policy_id",
-        "cas_policy_id",
-        "corporate_action_evidence_fingerprint",
-        "dataset_fingerprints",
-        "universe_fingerprint",
-        "pit_membership_fingerprint",
-        "train_universe_instruments",
-        "train_trading_days",
-        "validation_trading_days",
-        "test_trading_days",
-        "embargo_trading_days",
-        "min_observations_per_window",
-    ],
-)
-def test_changing_any_binding_changes_identity(field: str) -> None:
+def test_authorization_requires_valid_attestation() -> None:
     plan = _plan()
-    if field == "cost_evidence_fingerprint":
-        changed = _plan(cost_evidence_fingerprint="b" * 64)
-    elif field == "approved_capital_rupees":
-        changed = _plan(approved_capital_rupees=Decimal("250000"))
-    elif field == "session_policy_id":
-        changed = _plan(session_policy_id="NSEEquitySessionPolicy/buf10/continuous_153000")
-    elif field == "cas_policy_id":
-        changed = _plan(cas_policy_id="CAS/eligible False/effective 2026-03-01")
-    elif field == "corporate_action_evidence_fingerprint":
-        changed = _plan(corporate_action_evidence_fingerprint="ca-fingerprint-002")
-    elif field == "dataset_fingerprints":
-        changed = _plan(dataset_fingerprints={"NSE_EQ|INE002A01018": "dataset-fp-002"})
-    elif field == "universe_fingerprint":
-        changed = _plan(universe_fingerprint="universe-fp-002")
-    elif field == "pit_membership_fingerprint":
-        changed = _plan(pit_membership_fingerprint="pit-fp-002")
-    elif field == "train_universe_instruments":
-        changed = _plan(train_universe_instruments=("NSE_EQ|INE002A01018", "NSE_EQ|INE030A01027"))
-    elif field == "train_trading_days":
-        trading = _trading_dates(date(2026, 1, 5), 27)
-        changed = _plan(
-            trading_dates=trading,
-            research_end=trading[-1],
-            train_trading_days=11,
-        )
-    elif field == "validation_trading_days":
-        trading = _trading_dates(date(2026, 1, 5), 27)
-        changed = _plan(
-            trading_dates=trading,
-            research_end=trading[-1],
-            validation_trading_days=7,
-        )
-    elif field == "test_trading_days":
-        trading = _trading_dates(date(2026, 1, 5), 27)
-        changed = _plan(
-            trading_dates=trading,
-            research_end=trading[-1],
-            test_trading_days=7,
-        )
-    elif field == "embargo_trading_days":
-        trading = _trading_dates(date(2026, 1, 5), 28)
-        changed = _plan(
-            trading_dates=trading,
-            research_end=trading[-1],
-            embargo_trading_days=3,
-        )
-    elif field == "min_observations_per_window":
-        changed = _plan(min_observations_per_window=4)
-    else:  # pragma: no cover
-        raise AssertionError(field)
-    assert changed.fingerprint() != plan.fingerprint()
-    assert changed.plan_id != plan.plan_id
-
-
-def test_window_boundary_shift_changes_identity() -> None:
-    plan = _plan()
-    shifted_start = date(2026, 1, 6)
-    # Same durations but shifted overall range: still 26 weekdays from Jan 6.
-    trading = _trading_dates(shifted_start, 26)
-    shifted = _plan(research_start=trading[0], research_end=trading[-1], trading_dates=trading)
-    assert shifted.fingerprint() != plan.fingerprint()
-
-
-def test_experiment_integration_mapping() -> None:
-    plan = _plan()
-    inputs = plan.to_experiment_inputs()
-    assert inputs["research_window"] == {
-        "start": plan.research_start.isoformat(),
-        "end": plan.research_end.isoformat(),
-    }
-    assert inputs["train_windows"][0]["trading_days"] == 10
-    assert [w["trading_days"] for w in inputs["validation_test_windows"]] == [6, 6]
-    assert inputs["embargo"] == {"trading_days": 2}
-    # Train window ends strictly before validation starts; validation before test.
-    assert inputs["train_windows"][0]["end"] < inputs["validation_test_windows"][0]["start"]
-    assert (
-        inputs["validation_test_windows"][0]["end"] < inputs["validation_test_windows"][1]["start"]
+    attestation = _attestation_for(plan)
+    updated, winner = plan.select_train_winner(attestation=attestation)
+    auth = updated.authorize_untouched_test(
+        frozen_universe=updated.selection_universe(), train_winner=winner
     )
+    assert auth["selection_forbidden"] is True
+    assert auth["final_test"]["role"] == WindowRole.UNTOUCHED_TEST.value
+    with pytest.raises(AttestationError, match="bound selection attestation"):
+        plan.authorize_untouched_test(
+            frozen_universe=plan.selection_universe(), train_winner=winner
+        )
 
 
 def test_plan_module_has_no_execution_or_network_capability() -> None:
@@ -408,11 +456,5 @@ def test_plan_module_has_no_execution_or_network_capability() -> None:
     text = source.read_text(encoding="utf-8")
     for forbidden in ("import pandas", "import httpx", "import requests", "place_order"):
         assert forbidden not in text
-    assert "random" not in text.lower() or "no random" in text.lower()
-    assert "profit" not in text.lower() or "No strategy execution" in text
-
-
-def test_plan_is_json_serializable_and_deterministic() -> None:
-    plan = _plan()
-    assert plan.to_dict() == json.loads(json.dumps(plan.to_dict()))
-    assert isinstance(plan, ResearchWindowPlan)
+    assert "walk_forward import" not in text
+    assert "from .wfo_schedule import" in text

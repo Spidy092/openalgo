@@ -23,6 +23,7 @@ from .tournament import (
     evaluate_candidate_exact,
     rank_candidates,
 )
+from .wfo_schedule import plan_wfo_date_windows
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,11 @@ def make_walk_forward_windows(
     step_trading_days: int,
     embargo_trading_days: int,
 ) -> list[WalkForwardWindow]:
-    """Create chronological train/test windows from actual trading dates in the dataset."""
+    """Create chronological train/test windows from actual trading dates in the dataset.
+
+    Delegates fold arithmetic to :mod:`wfo_schedule` so plan-only compilation and
+    frame-based execution share one scheduler.
+    """
 
     for name, value in (
         ("train_trading_days", train_trading_days),
@@ -65,28 +70,24 @@ def make_walk_forward_windows(
         raise ValueError("walk-forward frame requires timezone-aware timestamps")
 
     trading_dates = tuple(sorted(set(frame.index.date)))
-    windows: list[WalkForwardWindow] = []
-    start = 0
-    window_id = 1
-    while True:
-        train_end = start + train_trading_days
-        test_start = train_end + embargo_trading_days
-        test_end = test_start + test_trading_days
-        if test_end > len(trading_dates):
-            break
-        windows.append(
-            WalkForwardWindow(
-                window_id=window_id,
-                train_dates=trading_dates[start:train_end],
-                test_dates=trading_dates[test_start:test_end],
-            )
+    try:
+        folds = plan_wfo_date_windows(
+            trading_dates,
+            train_trading_days=train_trading_days,
+            test_trading_days=test_trading_days,
+            step_trading_days=step_trading_days,
+            embargo_trading_days=embargo_trading_days,
         )
-        start += step_trading_days
-        window_id += 1
-
-    if not windows:
-        raise ValueError("dataset is too short for requested walk-forward schedule")
-    return windows
+    except ValueError as exc:
+        raise ValueError("dataset is too short for requested walk-forward schedule") from exc
+    return [
+        WalkForwardWindow(
+            window_id=fold.window_id,
+            train_dates=fold.train_dates,
+            test_dates=fold.test_dates,
+        )
+        for fold in folds
+    ]
 
 
 def _slice_dates(frame: pd.DataFrame, dates: tuple[date, ...]) -> pd.DataFrame:
