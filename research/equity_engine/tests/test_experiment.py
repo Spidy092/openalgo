@@ -24,12 +24,14 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from equity_engine.cost_ledger import INCOMPLETE_LABEL, EffectiveDatedCostLedger, LedgerProduct
 from equity_engine.experiment import (
     EXPERIMENT_SCHEMA_VERSION,
     ApprovedCapital,
     BaselineComparisonEvidence,
     ConcretePromotionEvidence,
     CorporateActionEvidenceIdentity,
+    CostEvidenceIdentity,
     CostModelIdentity,
     CostReconciliationEvidence,
     DataLeakageError,
@@ -215,6 +217,11 @@ def baseline_experiment() -> ExperimentArtifact:
         vectorbt_version="1.1.0",
         simulator_version="openalgo-event-simulator-v1",
     )
+    cost_evidence_identity = CostEvidenceIdentity.from_ledger(
+        EffectiveDatedCostLedger(),
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.INTRADAY,
+    )
 
     return orchestrator.build_experiment(
         research_window=ResearchWindowConfig(start=date(2026, 1, 1), end=date(2026, 6, 30)),
@@ -260,7 +267,8 @@ def baseline_experiment() -> ExperimentArtifact:
             rates={"brokerage": "0.001", "brokerage_cap": "20", "gst": "0.18"},
             source_refs=("https://upstox.com/brokerage-charges/",),
         ),
-        cost_evidence_class="documented_snapshot",
+        cost_evidence_identity=cost_evidence_identity,
+        cost_evidence_class=INCOMPLETE_LABEL,
         strategy_definitions=(
             StrategySpec(
                 candidate_id="orb:15m:vol1.5:buf5bps",
@@ -510,6 +518,7 @@ def test_future_test_leakage_rejected(baseline_experiment: ExperimentArtifact) -
             session_policy_identity=baseline_experiment.session_policy_identity,
             corporate_action_evidence=baseline_experiment.corporate_action_evidence,
             cost_model_identity=baseline_experiment.cost_model_identity,
+            cost_evidence_identity=baseline_experiment.cost_evidence_identity,
             cost_evidence_class=baseline_experiment.cost_evidence_class,
             strategy_definitions=baseline_experiment.strategy_definitions,
             parameter_grid=baseline_experiment.parameter_grid,
@@ -551,8 +560,9 @@ def test_promotion_gate_threshold_evaluation(baseline_experiment: ExperimentArti
         max_cost_reconciliation_error_inr=Decimal("0.01"),
     )
 
-    # Baseline promotion evidence satisfies thresholds
-    baseline_experiment.validate_integrity(promotion_thresholds=thresholds)
+    # Strong numerical evidence cannot promote an experiment whose ledger is incomplete.
+    with pytest.raises(MissingEvidenceError, match="not verified HISTORICAL_ACTUAL_COSTS"):
+        baseline_experiment.validate_integrity(promotion_thresholds=thresholds)
 
     # High drawdown fails gate
     bad_drawdown = replace(

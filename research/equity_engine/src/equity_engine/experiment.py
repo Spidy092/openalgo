@@ -12,19 +12,31 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 
+from .cost_ledger import (
+    HISTORICAL_ACTUAL_LABEL,
+    SCENARIO_LABEL,
+    SUPPORTED_RESEARCH_START,
+    EffectiveDatedCostLedger,
+    EvidenceClass,
+    LedgerComponent,
+    LedgerProduct,
+    LedgerSide,
+    UnsupportedResearchDate,
+)
 from .gates import DrawdownBasis, PromotionThresholds
 from .provenance import MarketDataManifest, dataframe_fingerprint
 
-EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v1"
+EXPERIMENT_SCHEMA_VERSION = "openalgo-equity-experiment-v2"
 VECTORBT_RESEARCH_VERSION = "1.1.0"
 SIMULATOR_RESEARCH_VERSION = "openalgo-event-simulator-v1"
+DEFAULT_COST_EVIDENCE_POLICY = "effective-dated-cost-ledger/default-resolution/v1"
 
 
 class ExperimentValidationError(ValueError):
@@ -248,6 +260,13 @@ class CorporateActionEvidenceIdentity:
 
 @dataclass(frozen=True)
 class CostModelIdentity:
+    """Scenario/configuration metadata, never authoritative cost evidence.
+
+    ``rates`` is retained for compatibility with the original experiment
+    schema. It cannot establish historical cost evidence; that role belongs
+    exclusively to :class:`CostEvidenceIdentity`.
+    """
+
     model_name: str
     effective_date: str
     rates: dict[str, str]
@@ -257,8 +276,173 @@ class CostModelIdentity:
         return {
             "model_name": self.model_name,
             "effective_date": self.effective_date,
+            "role": "scenario_configuration_only",
             "rates": dict(sorted(self.rates.items())),
             "source_refs": list(self.source_refs),
+        }
+
+
+def _record_identity(record: Any) -> str:
+    """Return a stable identity for one ledger record selected by a policy."""
+
+    return ":".join(
+        (
+            record.component.value,
+            record.product.value,
+            record.side.value,
+            record.effective_from.isoformat(),
+            record.effective_to.isoformat() if record.effective_to else "",
+            record.evidence_class.value,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class CostEvidenceIdentity:
+    """Cryptographic identity of the exact ledger and policy used by research.
+
+    This is deliberately separate from ``CostModelIdentity``. A free-form
+    rates mapping can describe a scenario, but it cannot claim verified
+    historical-account costs. Use ``from_ledger`` so the ledger digest and
+    selected effective-dated records are created from the canonical ledger.
+    """
+
+    ledger_schema_version: str
+    ledger_fingerprint: str
+    evidence_classification: str
+    historical_actual: bool
+    product_scope: str
+    evidence_mode: str
+    policy_identity: str
+    resolved_on_date: date
+    selected_record_ids: tuple[str, ...]
+    unknown_components: tuple[str, ...]
+    scenario_identity: str | None = None
+    _verified_ledger_fingerprint: str | None = field(default=None, repr=False, compare=False)
+    _verified_historical_actual: bool | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("ledger_schema_version", self.ledger_schema_version),
+            ("ledger_fingerprint", self.ledger_fingerprint),
+            ("evidence_classification", self.evidence_classification),
+            ("product_scope", self.product_scope),
+            ("evidence_mode", self.evidence_mode),
+            ("policy_identity", self.policy_identity),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} is required")
+        if len(self.ledger_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.ledger_fingerprint
+        ):
+            raise ValueError("ledger_fingerprint must be a hexadecimal digest")
+        if self.evidence_classification == HISTORICAL_ACTUAL_LABEL:
+            if not self.historical_actual:
+                raise ValueError("historical actual classification requires historical_actual=True")
+            if (
+                self._verified_ledger_fingerprint != self.ledger_fingerprint
+                or self._verified_historical_actual is not True
+            ):
+                raise ValueError(
+                    "historical actual cost evidence must be created from verified ledger evidence"
+                )
+        elif self.historical_actual:
+            raise ValueError(
+                "historical_actual=True requires HISTORICAL_ACTUAL_COSTS classification"
+            )
+        if self.evidence_classification == SCENARIO_LABEL and self.historical_actual:
+            raise ValueError("scenario cost evidence cannot be historical actual")
+        if self.resolved_on_date < SUPPORTED_RESEARCH_START:
+            raise UnsupportedResearchDate(
+                "cost evidence identity cannot precede the supported research boundary"
+            )
+
+    @classmethod
+    def from_ledger(
+        cls,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        on_date: date,
+        product: LedgerProduct,
+        evidence_mode: str = "historical_resolution",
+        policy_identity: str = DEFAULT_COST_EVIDENCE_POLICY,
+        scenario_identity: str | None = None,
+    ) -> CostEvidenceIdentity:
+        """Derive identity from the ledger's date-scoped assessment."""
+
+        assessment = ledger.describe(on_date, product)
+        fingerprint = ledger.fingerprint()
+        return cls(
+            ledger_schema_version=str(ledger.to_dict()["schema_version"]),
+            ledger_fingerprint=fingerprint,
+            evidence_classification=assessment.classification,
+            historical_actual=assessment.historical_actual,
+            product_scope=product.value,
+            evidence_mode=evidence_mode,
+            policy_identity=policy_identity,
+            resolved_on_date=on_date,
+            selected_record_ids=tuple(
+                sorted({_record_identity(record) for record in assessment.records})
+            ),
+            unknown_components=tuple(sorted(set(assessment.unknowns))),
+            scenario_identity=scenario_identity,
+            _verified_ledger_fingerprint=fingerprint,
+            _verified_historical_actual=assessment.historical_actual,
+        )
+
+    @classmethod
+    def from_public_scenario(
+        cls,
+        ledger: EffectiveDatedCostLedger,
+        *,
+        on_date: date,
+        product: LedgerProduct,
+        scenario_identity: str,
+        policy_identity: str = "effective-dated-cost-ledger/public-scenario/v1",
+    ) -> CostEvidenceIdentity:
+        """Derive an explicitly labelled public broker scenario identity."""
+
+        if not scenario_identity.strip():
+            raise ValueError("scenario_identity is required")
+        record = ledger.resolve(
+            LedgerComponent.BROKERAGE,
+            on_date,
+            product,
+            LedgerSide.BOTH,
+            evidence_classes=(EvidenceClass.BROKER_PUBLIC_SCENARIO,),
+        )
+        fingerprint = ledger.fingerprint()
+        return cls(
+            ledger_schema_version=str(ledger.to_dict()["schema_version"]),
+            ledger_fingerprint=fingerprint,
+            evidence_classification=SCENARIO_LABEL,
+            historical_actual=False,
+            product_scope=product.value,
+            evidence_mode="public_scenario",
+            policy_identity=policy_identity,
+            resolved_on_date=on_date,
+            selected_record_ids=(_record_identity(record),),
+            unknown_components=(
+                "public broker scenario is not account-specific historical evidence",
+            ),
+            scenario_identity=scenario_identity,
+            _verified_ledger_fingerprint=fingerprint,
+            _verified_historical_actual=False,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_classification": self.evidence_classification,
+            "evidence_mode": self.evidence_mode,
+            "historical_actual": self.historical_actual,
+            "ledger_fingerprint": self.ledger_fingerprint,
+            "ledger_schema_version": self.ledger_schema_version,
+            "policy_identity": self.policy_identity,
+            "product_scope": self.product_scope,
+            "resolved_on_date": self.resolved_on_date.isoformat(),
+            "scenario_identity": self.scenario_identity,
+            "selected_record_ids": list(self.selected_record_ids),
+            "unknown_components": list(self.unknown_components),
         }
 
 
@@ -637,6 +821,7 @@ class ExperimentArtifact:
     session_policy_identity: SessionPolicyIdentity
     corporate_action_evidence: CorporateActionEvidenceIdentity
     cost_model_identity: CostModelIdentity
+    cost_evidence_identity: CostEvidenceIdentity
     cost_evidence_class: str
     strategy_definitions: tuple[StrategySpec, ...]
     parameter_grid: dict[str, tuple[str, ...]]
@@ -668,6 +853,16 @@ class ExperimentArtifact:
             raise ValueError("train_windows cannot be empty")
         if not self.validation_test_windows:
             raise ValueError("validation_test_windows cannot be empty")
+        if self.cost_evidence_class != self.cost_evidence_identity.evidence_classification:
+            raise ValueError(
+                "cost_evidence_class must match the ledger-derived cost evidence classification"
+            )
+        if self.cost_evidence_identity.resolved_on_date > self.research_window.end:
+            raise DataLeakageError(
+                "cost evidence date "
+                f"{self.cost_evidence_identity.resolved_on_date} is after research window end "
+                f"{self.research_window.end}"
+            )
 
     def deterministic_payload(self) -> dict[str, Any]:
         """Return canonical dictionary of all deterministic research identity fields.
@@ -694,6 +889,7 @@ class ExperimentArtifact:
             "session_policy_identity": self.session_policy_identity.as_dict(),
             "corporate_action_evidence": self.corporate_action_evidence.as_dict(),
             "cost_model_identity": self.cost_model_identity.as_dict(),
+            "cost_evidence_identity": self.cost_evidence_identity.as_dict(),
             "cost_evidence_class": self.cost_evidence_class,
             "strategy_definitions": [s.as_dict() for s in self.strategy_definitions],
             "parameter_grid": {
@@ -735,6 +931,23 @@ class ExperimentArtifact:
     def as_json(self, *, indent: int = 2) -> str:
         """JSON-serialized experiment artifact."""
         return json.dumps(self.as_dict(), indent=indent, sort_keys=True) + "\n"
+
+    def evaluate_promotion_gate(
+        self, thresholds: PromotionThresholds
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Evaluate concrete promotion evidence plus the cost-evidence boundary."""
+
+        passed, violations = self.promotion_evidence.evaluate_gate(thresholds)
+        cost_violations = list(violations)
+        if (
+            self.cost_evidence_identity.evidence_classification != HISTORICAL_ACTUAL_LABEL
+            or not self.cost_evidence_identity.historical_actual
+        ):
+            cost_violations.append(
+                "cost evidence is not verified HISTORICAL_ACTUAL_COSTS; "
+                "scenario/incomplete evidence cannot promote"
+            )
+        return (passed and not cost_violations, tuple(cost_violations))
 
     def validate_integrity(
         self,
@@ -824,7 +1037,7 @@ class ExperimentArtifact:
 
         # 5. Threshold evaluation if requested
         if promotion_thresholds is not None:
-            passed, violations = self.promotion_evidence.evaluate_gate(promotion_thresholds)
+            passed, violations = self.evaluate_promotion_gate(promotion_thresholds)
             if not passed:
                 raise MissingEvidenceError(
                     "experiment failed promotion gate criteria: " + "; ".join(violations)
@@ -877,6 +1090,7 @@ class ExperimentOrchestrator:
         session_policy_identity: SessionPolicyIdentity,
         corporate_action_evidence: CorporateActionEvidenceIdentity,
         cost_model_identity: CostModelIdentity,
+        cost_evidence_identity: CostEvidenceIdentity,
         cost_evidence_class: str,
         strategy_definitions: tuple[StrategySpec, ...],
         parameter_grid: dict[str, tuple[str, ...]],
@@ -911,6 +1125,7 @@ class ExperimentOrchestrator:
             session_policy_identity=session_policy_identity,
             corporate_action_evidence=corporate_action_evidence,
             cost_model_identity=cost_model_identity,
+            cost_evidence_identity=cost_evidence_identity,
             cost_evidence_class=cost_evidence_class,
             strategy_definitions=strategy_definitions,
             parameter_grid=parameter_grid,
