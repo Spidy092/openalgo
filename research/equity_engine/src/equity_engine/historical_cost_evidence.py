@@ -20,13 +20,16 @@ Evidence grades (market-realism taxonomy):
   applicable only to that date.
 - ``UNKNOWN``: no sufficient evidence. ``UNKNOWN != ZERO`` everywhere.
 
-Where history cannot be proven, backtesting uses explicit deterministic
-:data:`ScenarioAssumption` sets (one per product, never shared) compiled
-through the single canonical :class:`HistoricalCostScenario` implementation.
-Assumption values are illustrative, named, sourced, reasoned, and
-fingerprinted; they are never tuned for profitability and never relabelled as
-actuals. Spread/slippage have no observations at all, so friction evidence is
-named stress levels only.
+Where history cannot be proven, backtesting uses explicit caller-supplied
+:data:`ScenarioAssumption` records (one product scope each, never shared)
+compiled through the single canonical :class:`HistoricalCostScenario`
+implementation. No numeric profile is selected silently: UNKNOWN clearing or
+DP without a caller assumption fails closed, and delivery all-in scenarios
+are unsupported because flat per-debit DP costs sit outside the
+turnover-rate model. Assumption values are illustrative, named, sourced,
+reasoned, and fingerprinted; they are never tuned for profitability and never
+relabeled as actuals. Spread/slippage have no observations at all, so friction
+evidence is named stress levels only.
 
 This module never calls broker APIs, places orders, downloads data, or wires
 into live order execution.
@@ -57,6 +60,7 @@ from .cost_ledger import (
 from .historical_cost_scenario import (
     HistoricalCostScenario,
     ScenarioAssumption,
+    ScenarioError,
     compile_historical_scenario,
 )
 
@@ -312,115 +316,67 @@ def _assumption(
     )
 
 
-def intraday_cost_assumptions() -> tuple[ScenarioAssumption, ...]:
-    """Return the canonical named assumptions for UNKNOWN intraday components.
+def illustrative_public_shape_assumptions(
+    product: LedgerProduct,
+) -> tuple[ScenarioAssumption, ...]:
+    """Return illustrative scenario-only caller-opt-in presets (brokerage + GST).
 
-    Brokerage follows the shape of current public pricing (0.1% capped at Rs 20)
-    as an illustrative scenario only; it is not account evidence and must never
-    be read as the historical account rate. GST uses the public intraday taxable
-    base; broker sheets vary (some also tax SEBI fees), so the base is a named
-    claim, not a proven composition. Clearing and DP lines are explicitly zero
-    with handling reasons, never silent zeroes.
+    These cover only the components with a public-pricing shape to copy; they
+    deliberately do NOT cover clearing or delivery DP, so a caller that supplies
+    no assumption for those UNKNOWN components still fails closed through the
+    canonical scenario behavior. Presets are opt-in conveniences, never global
+    canonical values: clearing and DP have no numeric preset at all.
     """
-    return (
-        _assumption(
-            "intraday-brokerage-public-illustrative-v1",
-            LedgerComponent.BROKERAGE,
-            LedgerProduct.INTRADAY,
-            "turnover",
-            BROKERAGE_PUBLIC_RATE,
-            f"min(turnover * {BROKERAGE_PUBLIC_RATE}, {BROKERAGE_CAP})",
-            "https://upstox.com/brokerage-charges/",
-            "illustrative current public pricing shape only; no historical "
-            "account brokerage is evidenced and the 2026-09-09 snapshot is not projected",
-        ),
-        _assumption(
-            "intraday-gst-public-base-illustrative-v1",
-            LedgerComponent.GST,
-            LedgerProduct.INTRADAY,
-            "taxable_base:brokerage+transaction+ipft",
-            GST_RATE,
-            f"(brokerage + transaction + ipft) * {GST_RATE}",
-            "https://upstox.com/brokerage-charges/",
-            "named public intraday base only; broker sheets vary and the "
-            "account-specific historical base is unknown",
-        ),
-        _assumption(
-            "intraday-clearing-no-separate-line-v1",
-            LedgerComponent.CLEARING,
-            LedgerProduct.INTRADAY,
-            "turnover",
-            Decimal(0),
-            "0",
-            "retail contract-note convention",
-            "retail NSE cash contract notes typically carry no separate clearing line; "
-            "explicit zero for the turnover model, not a proven charge",
-        ),
-    )
-
-
-def delivery_cost_assumptions() -> tuple[ScenarioAssumption, ...]:
-    """Return the canonical named assumptions for UNKNOWN delivery components.
-
-    Declared separately from intraday: delivery never inherits intraday
-    formulas. DP debit charges are flat per-ISIN settlement debits, not
-    turnover-proportional, so the turnover model carries an explicit zero with
-    a handle-separately reason instead of a fabricated rate.
-    """
-    return (
-        _assumption(
-            "delivery-brokerage-public-illustrative-v1",
-            LedgerComponent.BROKERAGE,
-            LedgerProduct.DELIVERY,
-            "turnover",
-            BROKERAGE_PUBLIC_RATE,
-            f"min(turnover * {BROKERAGE_PUBLIC_RATE}, {BROKERAGE_CAP})",
-            "https://upstox.com/brokerage-charges/",
-            "illustrative current public pricing shape only; no historical "
-            "account delivery brokerage is evidenced",
-        ),
-        _assumption(
-            "delivery-gst-separate-base-illustrative-v1",
-            LedgerComponent.GST,
-            LedgerProduct.DELIVERY,
-            "taxable_base:brokerage+transaction+sebi",
-            GST_RATE,
-            f"(brokerage + transaction + sebi_turnover) * {GST_RATE}",
-            "broker charge-sheet convention",
-            "separately declared delivery base; not shared with intraday and not proven",
-        ),
-        _assumption(
-            "delivery-clearing-no-separate-line-v1",
-            LedgerComponent.CLEARING,
-            LedgerProduct.DELIVERY,
-            "turnover",
-            Decimal(0),
-            "0",
-            "retail contract-note convention",
-            "retail NSE cash contract notes typically carry no separate clearing line; "
-            "explicit zero for the turnover model, not a proven charge",
-        ),
-        _assumption(
-            "delivery-dp-flat-debit-excluded-v1",
-            LedgerComponent.DP_DEMAT,
-            LedgerProduct.DELIVERY,
-            "per-settlement-debit",
-            Decimal(0),
-            "0",
-            "depository tariff convention",
-            "DP debits are flat per-ISIN settlement charges, not turnover-proportional; "
-            "excluded from the turnover model and must be handled separately",
-        ),
-    )
-
-
-def canonical_assumptions_for(product: LedgerProduct) -> tuple[ScenarioAssumption, ...]:
-    """Return the canonical assumption set for one product."""
     if product is LedgerProduct.INTRADAY:
-        return intraday_cost_assumptions()
+        return (
+            _assumption(
+                "intraday-brokerage-illustrative-scenario-only-caller-opt-in-v1",
+                LedgerComponent.BROKERAGE,
+                LedgerProduct.INTRADAY,
+                "turnover",
+                BROKERAGE_PUBLIC_RATE,
+                f"min(turnover * {BROKERAGE_PUBLIC_RATE}, {BROKERAGE_CAP})",
+                "https://upstox.com/brokerage-charges/",
+                "illustrative current public pricing shape only; no historical "
+                "account brokerage is evidenced and the 2026-09-09 snapshot is not projected",
+            ),
+            _assumption(
+                "intraday-gst-illustrative-scenario-only-caller-opt-in-v1",
+                LedgerComponent.GST,
+                LedgerProduct.INTRADAY,
+                "taxable_base:brokerage+transaction+ipft",
+                GST_RATE,
+                f"(brokerage + transaction + ipft) * {GST_RATE}",
+                "https://upstox.com/brokerage-charges/",
+                "named public intraday base only; broker sheets vary and the "
+                "account-specific historical base is unknown",
+            ),
+        )
     if product is LedgerProduct.DELIVERY:
-        return delivery_cost_assumptions()
-    raise ValueError("canonical assumptions exist only for INTRADAY or DELIVERY")
+        return (
+            _assumption(
+                "delivery-brokerage-illustrative-scenario-only-caller-opt-in-v1",
+                LedgerComponent.BROKERAGE,
+                LedgerProduct.DELIVERY,
+                "turnover",
+                BROKERAGE_PUBLIC_RATE,
+                f"min(turnover * {BROKERAGE_PUBLIC_RATE}, {BROKERAGE_CAP})",
+                "https://upstox.com/brokerage-charges/",
+                "illustrative current public pricing shape only; no historical "
+                "account delivery brokerage is evidenced",
+            ),
+            _assumption(
+                "delivery-gst-illustrative-scenario-only-caller-opt-in-v1",
+                LedgerComponent.GST,
+                LedgerProduct.DELIVERY,
+                "taxable_base:brokerage+transaction+sebi",
+                GST_RATE,
+                f"(brokerage + transaction + sebi_turnover) * {GST_RATE}",
+                "broker charge-sheet convention",
+                "separately declared delivery base; not shared with intraday and not proven",
+            ),
+        )
+    raise ValueError("illustrative presets exist only for INTRADAY or DELIVERY")
 
 
 @dataclass(frozen=True)
@@ -512,13 +468,24 @@ def compile_evidence_scenario(
     research_start: date,
     research_end: date,
     product: LedgerProduct,
+    assumptions: tuple[ScenarioAssumption, ...],
 ) -> HistoricalCostScenario:
-    """Compile a scenario using the canonical assumption set for the product.
+    """Compile a scenario from caller-supplied assumptions over ledger evidence.
 
-    Uses the single canonical :class:`HistoricalCostScenario` implementation.
-    Fail-closed behavior (missing assumptions, cross-product leakage) is
-    inherited unchanged.
+    The caller must explicitly provide every assumption; no numeric profile is
+    selected silently, so UNKNOWN clearing or DP without a caller assumption
+    fails closed through the canonical scenario behavior. Delivery all-in
+    scenarios are unsupported: DP debit costs are flat per-ISIN settlement
+    charges that the turnover-rate model cannot represent, so they are marked
+    unresolved instead of zeroed. Uses the single canonical
+    :class:`HistoricalCostScenario` implementation.
     """
+    if product is LedgerProduct.DELIVERY:
+        raise ScenarioError(
+            "delivery all-in scenarios are unsupported: DP debit costs are flat "
+            "per-ISIN settlement charges outside the turnover-rate model; marked "
+            "unresolved rather than zeroed"
+        )
     return compile_historical_scenario(
         scenario_id=scenario_id,
         ledger=ledger,
@@ -526,5 +493,5 @@ def compile_evidence_scenario(
         research_start=research_start,
         research_end=research_end,
         product=product,
-        assumptions=canonical_assumptions_for(product),
+        assumptions=assumptions,
     )
