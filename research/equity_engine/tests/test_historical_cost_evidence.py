@@ -29,14 +29,17 @@ from equity_engine.historical_cost_evidence import (
     EVIDENCE_WINDOW_START,
     EvidenceGrade,
     build_evidence_matrix,
-    canonical_assumptions_for,
     compile_evidence_scenario,
-    delivery_cost_assumptions,
     friction_evidence_fingerprint,
-    intraday_cost_assumptions,
+    illustrative_public_shape_assumptions,
     named_friction_scenarios,
 )
-from equity_engine.historical_cost_scenario import ScenarioAssumption, compile_historical_scenario
+from equity_engine.historical_cost_scenario import (
+    MissingScenarioAssumptionError,
+    ScenarioAssumption,
+    ScenarioError,
+    compile_historical_scenario,
+)
 
 
 def _ledger() -> EffectiveDatedCostLedger:
@@ -153,42 +156,135 @@ def test_unknown_cells_carry_no_rates() -> None:
     assert all(not cell.rate_known for cell in matrix.unknown_cells())
 
 
-def test_canonical_assumption_sets_are_product_locked() -> None:
-    intraday = intraday_cost_assumptions()
-    delivery = delivery_cost_assumptions()
-    assert {item.component for item in intraday} == {
-        LedgerComponent.BROKERAGE,
-        LedgerComponent.GST,
-        LedgerComponent.CLEARING,
-    }
-    assert {item.component for item in delivery} == {
-        LedgerComponent.BROKERAGE,
-        LedgerComponent.GST,
-        LedgerComponent.CLEARING,
-        LedgerComponent.DP_DEMAT,
-    }
+def _intraday_explicit_assumptions() -> tuple[ScenarioAssumption, ...]:
+    return (
+        *illustrative_public_shape_assumptions(LedgerProduct.INTRADAY),
+        ScenarioAssumption(
+            assumption_id="intraday-clearing-caller-explicit-zero-v1",
+            component=LedgerComponent.CLEARING,
+            product=LedgerProduct.INTRADAY,
+            basis="turnover",
+            rate=Decimal(0),
+            formula="0",
+            source="caller-scenario-choice",
+            reason="caller explicitly tests zero clearing for this scenario only; "
+            "clearing evidence remains UNKNOWN",
+        ),
+    )
+
+
+def test_no_canonical_numeric_profiles_exist() -> None:
+    import equity_engine.historical_cost_evidence as evidence_module
+
+    for removed in (
+        "intraday_cost_assumptions",
+        "delivery_cost_assumptions",
+        "canonical_assumptions_for",
+    ):
+        assert not hasattr(evidence_module, removed), removed
+
+
+def test_illustrative_presets_are_opt_in_and_partial() -> None:
+    intraday = illustrative_public_shape_assumptions(LedgerProduct.INTRADAY)
+    delivery = illustrative_public_shape_assumptions(LedgerProduct.DELIVERY)
+    assert {item.component for item in intraday} == {LedgerComponent.BROKERAGE, LedgerComponent.GST}
+    assert {item.component for item in delivery} == {LedgerComponent.BROKERAGE, LedgerComponent.GST}
     assert all(item.product is LedgerProduct.INTRADAY for item in intraday)
     assert all(item.product is LedgerProduct.DELIVERY for item in delivery)
+    assert all(
+        "illustrative-scenario-only-caller-opt-in" in item.assumption_id for item in intraday
+    )
+    assert all(
+        "illustrative-scenario-only-caller-opt-in" in item.assumption_id for item in delivery
+    )
     assert not {item.assumption_id for item in intraday} & {item.assumption_id for item in delivery}
-    assert canonical_assumptions_for(LedgerProduct.INTRADAY) == intraday
-    assert canonical_assumptions_for(LedgerProduct.DELIVERY) == delivery
     with pytest.raises(ValueError, match="INTRADAY or DELIVERY"):
-        canonical_assumptions_for(LedgerProduct.ALL)
+        illustrative_public_shape_assumptions(LedgerProduct.ALL)
 
 
-def test_evidence_scenario_builds_and_stays_non_actual() -> None:
-    for product in (LedgerProduct.INTRADAY, LedgerProduct.DELIVERY):
-        scenario = compile_evidence_scenario(
-            scenario_id=f"evidence-{product.value.lower()}",
+def test_unknown_clearing_without_caller_assumption_fails() -> None:
+    with pytest.raises(MissingScenarioAssumptionError):
+        compile_evidence_scenario(
+            scenario_id="evidence-intraday-no-clearing",
             ledger=_ledger(),
             scenario_date=date(2025, 6, 1),
             research_start=date(2025, 1, 1),
             research_end=date(2025, 12, 31),
-            product=product,
+            product=LedgerProduct.INTRADAY,
+            assumptions=illustrative_public_shape_assumptions(LedgerProduct.INTRADAY),
         )
-        assert scenario.historical_actual is False
-        assert scenario.ledger_fingerprint == _ledger().fingerprint()
-        assert scenario.to_dict()["historical_actual"] is False
+
+
+def test_unknown_dp_without_caller_assumption_fails() -> None:
+    with pytest.raises(ScenarioError, match="unsupported"):
+        compile_evidence_scenario(
+            scenario_id="evidence-delivery",
+            ledger=_ledger(),
+            scenario_date=date(2025, 6, 1),
+            research_start=date(2025, 1, 1),
+            research_end=date(2025, 12, 31),
+            product=LedgerProduct.DELIVERY,
+            assumptions=illustrative_public_shape_assumptions(LedgerProduct.DELIVERY),
+        )
+
+
+def test_delivery_dp_flat_debit_unsupported_not_zeroed() -> None:
+    dp_assumption = ScenarioAssumption(
+        assumption_id="delivery-dp-caller-explicit-v1",
+        component=LedgerComponent.DP_DEMAT,
+        product=LedgerProduct.DELIVERY,
+        basis="turnover",
+        rate=Decimal(0),
+        formula="0",
+        source="caller-scenario-choice",
+        reason="caller attempt that must still fail: flat per-debit costs are unrepresentable",
+    )
+    with pytest.raises(ScenarioError, match="unresolved|unsupported"):
+        compile_evidence_scenario(
+            scenario_id="evidence-delivery-with-dp",
+            ledger=_ledger(),
+            scenario_date=date(2025, 6, 1),
+            research_start=date(2025, 1, 1),
+            research_end=date(2025, 12, 31),
+            product=LedgerProduct.DELIVERY,
+            assumptions=(
+                *illustrative_public_shape_assumptions(LedgerProduct.DELIVERY),
+                dp_assumption,
+            ),
+        )
+
+
+def test_explicit_caller_zero_remains_scenario_only() -> None:
+    scenario = compile_evidence_scenario(
+        scenario_id="evidence-intraday-explicit-zero",
+        ledger=_ledger(),
+        scenario_date=date(2025, 6, 1),
+        research_start=date(2025, 1, 1),
+        research_end=date(2025, 12, 31),
+        product=LedgerProduct.INTRADAY,
+        assumptions=_intraday_explicit_assumptions(),
+    )
+    assert scenario.historical_actual is False
+    assert scenario.classification == "SCENARIO"
+    rate, provenance = scenario.rate_for(LedgerComponent.CLEARING, LedgerSide.BOTH)
+    assert rate == Decimal(0)
+    assert provenance == "assumed"
+    assert "HISTORICAL_ACTUAL" not in json.dumps(scenario.to_dict())
+
+
+def test_evidence_scenario_builds_and_stays_non_actual() -> None:
+    scenario = compile_evidence_scenario(
+        scenario_id="evidence-intraday",
+        ledger=_ledger(),
+        scenario_date=date(2025, 6, 1),
+        research_start=date(2025, 1, 1),
+        research_end=date(2025, 12, 31),
+        product=LedgerProduct.INTRADAY,
+        assumptions=_intraday_explicit_assumptions(),
+    )
+    assert scenario.historical_actual is False
+    assert scenario.ledger_fingerprint == _ledger().fingerprint()
+    assert scenario.to_dict()["historical_actual"] is False
 
 
 def test_evidence_scenario_fingerprint_deterministic_and_sensitive() -> None:
@@ -199,6 +295,7 @@ def test_evidence_scenario_fingerprint_deterministic_and_sensitive() -> None:
         "research_start": date(2025, 1, 1),
         "research_end": date(2025, 12, 31),
         "product": LedgerProduct.INTRADAY,
+        "assumptions": _intraday_explicit_assumptions(),
     }
     first = compile_evidence_scenario(**kwargs)  # type: ignore[arg-type]
     second = compile_evidence_scenario(**kwargs)  # type: ignore[arg-type]
@@ -215,7 +312,7 @@ def test_evidence_scenario_fingerprint_deterministic_and_sensitive() -> None:
             source=item.source,
             reason=item.reason,
         )
-        for item in intraday_cost_assumptions()
+        for item in _intraday_explicit_assumptions()
     )
     changed = compile_historical_scenario(
         scenario_id="evidence-intraday",
