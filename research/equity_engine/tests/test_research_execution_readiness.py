@@ -25,6 +25,7 @@ from decimal import Decimal
 
 import pandas as pd
 import pytest
+
 from equity_engine.candidate_grid import (
     StrategyDefinition,
     baseline_definition,
@@ -93,6 +94,9 @@ from equity_engine.historical_membership import (
     assess_historical_membership,
 )
 from equity_engine.market_sessions import (
+    NSE_CAS_CONTINUOUS_END,
+    NSE_CAS_EFFECTIVE_DATE,
+    NSE_NORMAL_CONTINUOUS_END,
     NSEEquitySessionPolicy,
     filter_to_continuous_session,
 )
@@ -146,39 +150,47 @@ def _make_intraday_bars_with_cas(
     *,
     base_price: float = 100.0,
     daily_drift: float = 1.0,
-    include_cas_bar: bool = True,
+    include_cas_bars: bool = True,
+    include_cas_bar: bool | None = None,
 ) -> pd.DataFrame:
-    """Generate deterministic 5-minute intraday bars plus auxiliary CAS bars."""
+    """Generate deterministic 5-minute intraday bars plus auxiliary CAS bars.
+
+    Retains normal continuous bars before 15:15 (09:15 to 15:10, 72 bars) as well as
+    raw bars at/after 15:15 (15:15, 15:20, 15:25, 15:30, 15:45) in the raw synthetic source.
+    """
+    if include_cas_bar is not None:
+        include_cas_bars = include_cas_bar
+
     frames: list[pd.DataFrame] = []
 
     for day_idx, trade_date in enumerate(trade_dates):
         day_str = trade_date.isoformat()
         day_open = base_price + day_idx * daily_drift
 
-        # Continuous 5m session from 09:15 to 15:25 (75 bars)
+        # Continuous 5m session from 09:15 to 15:25 (75 bars: 72 before 15:15 + 3 at/after 15:15)
         cont_index = pd.date_range(
             f"{day_str} 09:15",
             f"{day_str} 15:25",
             freq="5min",
             tz="Asia/Kolkata",
         )
-        n_bars = len(cont_index)
+        timestamps = list(cont_index)
+        if include_cas_bars:
+            # Auxiliary CAS and closing session bars
+            timestamps.extend(
+                [
+                    pd.Timestamp(f"{day_str} 15:30", tz="Asia/Kolkata"),
+                    pd.Timestamp(f"{day_str} 15:45", tz="Asia/Kolkata"),
+                ]
+            )
+
+        n_bars = len(timestamps)
         intraday_pattern = [0.1 * (i % 5) for i in range(n_bars)]
         opens = [round(day_open + p, 2) for p in intraday_pattern]
         highs = [round(o + 0.5, 2) for o in opens]
         lows = [round(o - 0.4, 2) for o in opens]
         closes = [round(o + 0.1, 2) for o in opens]
         volumes = [50_000 + 1_000 * (i % 10) for i in range(n_bars)]
-
-        timestamps = list(cont_index)
-        if include_cas_bar:
-            cas_ts = pd.Timestamp(f"{day_str} 15:45", tz="Asia/Kolkata")
-            timestamps.append(cas_ts)
-            opens.append(round(day_open + 0.5, 2))
-            highs.append(round(day_open + 1.0, 2))
-            lows.append(round(day_open + 0.2, 2))
-            closes.append(round(day_open + 0.6, 2))
-            volumes.append(10_000)
 
         day_df = pd.DataFrame(
             {
@@ -197,7 +209,13 @@ def _make_intraday_bars_with_cas(
     return df
 
 
-def _make_manifest(instrument_token: str, symbol: str) -> MarketDataManifest:
+def _make_manifest(
+    instrument_token: str,
+    symbol: str,
+    start: datetime = datetime(2026, 8, 3, 9, 15, tzinfo=UTC),
+    end: datetime = datetime(2026, 9, 7, 15, 15, tzinfo=UTC),
+    retrieved_at: datetime = datetime(2026, 9, 8, 0, 0, tzinfo=UTC),
+) -> MarketDataManifest:
     return MarketDataManifest(
         provider="synthetic-local",
         exchange="NSE",
@@ -206,9 +224,9 @@ def _make_manifest(instrument_token: str, symbol: str) -> MarketDataManifest:
         timezone="Asia/Kolkata",
         interval="5m",
         timestamp_semantics="start-of-candle",
-        start=datetime(2026, 6, 1, 9, 15, tzinfo=UTC),
-        end=datetime(2026, 7, 6, 15, 30, tzinfo=UTC),
-        retrieved_at=datetime(2026, 7, 7, 0, 0, tzinfo=UTC),
+        start=start,
+        end=end,
+        retrieved_at=retrieved_at,
         adjustment_policy="split-unadjusted",
         universe_rule_version="nse-cm-2026-v1",
         source_reference="synthetic-readiness-fixture",
@@ -295,8 +313,10 @@ def _parameter_grid_dict() -> dict[str, tuple[str, ...]]:
 
 
 def _canonical_historical_cost_scenario(
-    scenario_date: date = date(2026, 6, 5),
+    scenario_date: date = date(2026, 8, 5),
     *,
+    research_start: date = date(2026, 8, 3),
+    research_end: date = date(2026, 9, 7),
     brokerage_rate: str = "0.0003",
 ) -> HistoricalCostScenario:
     ledger = EffectiveDatedCostLedger()
@@ -336,8 +356,8 @@ def _canonical_historical_cost_scenario(
         scenario_id="scenario:synthetic-readiness-intraday",
         ledger=ledger,
         scenario_date=scenario_date,
-        research_start=date(2026, 6, 1),
-        research_end=date(2026, 7, 6),
+        research_start=research_start,
+        research_end=research_end,
         product=LedgerProduct.INTRADAY,
         assumptions=assumptions,
     )
@@ -375,8 +395,8 @@ def _promotion_evidence_with_scenario_eval(
         paper_trading=PaperTradingEvidence(
             artifact_fingerprint=canonical_sha256({"paper": "paper_001"}),
             environment="upstox_sandbox_v2",
-            session_start=date(2026, 7, 7),
-            session_end=date(2026, 7, 20),
+            session_start=date(2026, 9, 8),
+            session_end=date(2026, 9, 21),
             verified_orders_count=30,
             audit_log_fingerprint=canonical_sha256({"audit": "audit_log_001"}),
             source_reference="broker_sandbox_order_log",
@@ -427,8 +447,8 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
     → promotion gate
     """
     # 1. Validated Research Input
-    # 26 business days: June 1, 2026 to July 6, 2026
-    trading_dates = _generate_business_days(date(2026, 6, 1), 26)
+    # 26 business days starting at canonical NSE_CAS_EFFECTIVE_DATE (2026-08-03)
+    trading_dates = _generate_business_days(NSE_CAS_EFFECTIVE_DATE, 26)
     assert len(trading_dates) == 26
     research_start = trading_dates[0]
     research_end = trading_dates[-1]
@@ -489,10 +509,14 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(vbt, "Portfolio", _FastPortfolio)
 
-    session_policy = NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=15)
+    session_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
     cont_frame_a = filter_to_continuous_session(frame_a, session_policy)
-    # CAS bars (15:45) must be excluded from continuous frame
-    assert not any(ts.time() == time(15, 45) for ts in cont_frame_a.index)
+    cont_frame_b = filter_to_continuous_session(frame_b, session_policy)
+    # CAS bars (>= 15:15) must be excluded from continuous frame
+    assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in cont_frame_a.index)
+    assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in cont_frame_b.index)
+    assert all(ts.time() < NSE_CAS_CONTINUOUS_END for ts in cont_frame_a.index)
+    assert len(cont_frame_a) == 72 * len(trading_dates)
 
     # Generate signals from baseline
     signals = baseline_definition(session_open=time(9, 15)).build_signals(cont_frame_a)
@@ -653,7 +677,7 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
         product_scope="INTRADAY",
         evidence_mode="historical_resolution",
         policy_identity="effective-dated-cost-ledger/default-resolution/v1",
-        resolved_on_date=date(2026, 6, 30),
+        resolved_on_date=date(2026, 9, 7),
         selected_record_ids=("stt:INTRADAY:SELL:2024-07-01:statutory_schedule",),
         unknown_components=("gst: unknown",),
         scenario_identity=None,
@@ -685,8 +709,8 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
         min_observations_per_window=2,
         min_folds=2,
         approved_capital_rupees=Decimal(100000),
-        session_policy_id="NSEEquitySessionPolicy/buf15",
-        cas_policy_id="CAS/eligible False",
+        session_policy_id=f"NSEEquitySessionPolicy/cas True/buf15/continuous_{NSE_CAS_CONTINUOUS_END.strftime('%H%M%S')}",
+        cas_policy_id="CAS/eligible True",
         cost_claim=cost_claim,
         ca_claim=ca_claim,
         dataset_fingerprints={STOCK_A: fp_a, STOCK_B: fp_b},
@@ -729,6 +753,8 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
         trade.exit_reason in (ExitReason.SIGNAL, ExitReason.SESSION_CUTOFF)
         for trade in sim_result.trades
     )
+    assert all(trade.entry_timestamp.time() < NSE_CAS_CONTINUOUS_END for trade in sim_result.trades)
+    assert all(trade.exit_timestamp.time() <= time(15, 0) for trade in sim_result.trades)
 
     # 9. Canonical HistoricalCostScenario
     cost_scenario = _canonical_historical_cost_scenario()
@@ -786,10 +812,10 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
         ),
         session_policy_identity=SessionPolicyIdentity(
             policy_name="NSEEquitySessionPolicy",
-            cas_eligible=False,
+            cas_eligible=True,
             exit_buffer_minutes=15,
-            cas_effective_date="2026-03-01",
-            continuous_end="15:30:00",
+            cas_effective_date=NSE_CAS_EFFECTIVE_DATE.isoformat(),
+            continuous_end=NSE_CAS_CONTINUOUS_END.strftime("%H:%M:%S"),
         ),
         corporate_action_evidence=CorporateActionEvidenceIdentity(
             source="synthetic-ca-evidence",
@@ -856,11 +882,11 @@ def test_pit_population_no_lookahead_and_later_listed_isolation() -> None:
 
     snapshot evidence cannot attest earlier dates.
     """
-    trading_dates = _generate_business_days(date(2026, 6, 1), 26)
+    trading_dates = _generate_business_days(NSE_CAS_EFFECTIVE_DATE, 26)
     research_start = trading_dates[0]
     research_end = trading_dates[-1]
 
-    # STOCK_C is listed on day 10 (2026-06-15)
+    # STOCK_C is listed on day 10
     listing_date = trading_dates[10]
 
     # 1. Attempting to use a later snapshot to attest earlier dates fails closed
@@ -913,8 +939,8 @@ def test_pit_population_no_lookahead_and_later_listed_isolation() -> None:
             min_observations_per_window=2,
             min_folds=2,
             approved_capital_rupees=Decimal(100000),
-            session_policy_id="NSEEquitySessionPolicy/buf15",
-            cas_policy_id="CAS/eligible False",
+            session_policy_id=f"NSEEquitySessionPolicy/cas True/buf15/continuous_{NSE_CAS_CONTINUOUS_END.strftime('%H%M%S')}",
+            cas_policy_id="CAS/eligible True",
             cost_claim=CostEvidenceClaim(
                 ledger_schema_version="effective-dated-cost-ledger/v1",
                 ledger_fingerprint="a" * 64,
@@ -923,7 +949,7 @@ def test_pit_population_no_lookahead_and_later_listed_isolation() -> None:
                 product_scope="INTRADAY",
                 evidence_mode="historical_resolution",
                 policy_identity="effective-dated-cost-ledger/default-resolution/v1",
-                resolved_on_date=date(2026, 6, 30),
+                resolved_on_date=date(2026, 9, 7),
                 selected_record_ids=("stt:INTRADAY:SELL:2024-07-01:statutory_schedule",),
                 unknown_components=("gst: unknown",),
                 scenario_identity=None,
@@ -978,17 +1004,20 @@ def test_vectorbt_screening_invariants_and_cas_exclusion(monkeypatch: pytest.Mon
 
     final signal cannot execute next day, and CAS auxiliary bars are excluded.
     """
-    trading_dates = _generate_business_days(date(2026, 6, 1), 3)
-    frame_with_cas = _make_intraday_bars_with_cas(trading_dates, include_cas_bar=True)
+    trading_dates = _generate_business_days(NSE_CAS_EFFECTIVE_DATE, 3)
+    frame_with_cas = _make_intraday_bars_with_cas(trading_dates, include_cas_bars=True)
 
-    # 1. CAS auxiliary bars excluded: verify 15:45 is present in raw input
+    # 1. CAS auxiliary bars: verify bars at/after 15:15 are present in raw input
+    assert any(ts.time() == time(15, 15) for ts in frame_with_cas.index)
+    assert any(ts.time() == time(15, 25) for ts in frame_with_cas.index)
     assert any(ts.time() == time(15, 45) for ts in frame_with_cas.index)
 
-    session_policy = NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=15)
+    session_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
     filtered = filter_to_continuous_session(frame_with_cas, session_policy)
-    # After continuous filtering, no CAS auxiliary bar exists
-    assert not any(ts.time() == time(15, 45) for ts in filtered.index)
-    assert all(ts.time() <= time(15, 30) for ts in filtered.index)
+    # After continuous filtering, no bar at or after 15:15 exists
+    assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in filtered.index)
+    assert all(ts.time() < NSE_CAS_CONTINUOUS_END for ts in filtered.index)
+    assert filtered.index[-1].time() == time(15, 10)
 
     # 2. same-bar close execution forbidden: shift_close_generated_signals requires lag_bars >= 1
     entries = pd.Series([True, False, True], index=filtered.index[:3])
@@ -1015,6 +1044,8 @@ def test_vectorbt_screening_invariants_and_cas_exclusion(monkeypatch: pytest.Mon
     class _FastPortfolio:
         @staticmethod
         def from_signals(close, **kwargs):
+            # Assert VectorBT receives only continuous bars strictly before 15:15
+            assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in close.index)
             return _FastPortfolio()
 
         def stats(self, settings):
@@ -1045,16 +1076,186 @@ def test_vectorbt_screening_invariants_and_cas_exclusion(monkeypatch: pytest.Mon
     assert screening_res.closed_trades == 4
 
 
+def test_synthetic_cas_eligible_readiness_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prove canonical CAS-eligible readiness contract:
+
+    - date >= canonical NSE_CAS_EFFECTIVE_DATE (2026-08-03)
+    - cas_eligible=True with canonical continuous end at 15:15 (NSE_CAS_CONTINUOUS_END)
+    - normal continuous bars before 15:15 (09:15 to 15:10)
+    - raw bars at/after 15:15 retained in raw synthetic source (15:15, 15:20, 15:25, 15:30, 15:45)
+    - research filtering excludes all timestamp >= canonical continuous end (15:15)
+    - VectorBT receives no auxiliary CAS rows
+    - simulator receives no auxiliary CAS rows
+    - unsafe post-continuous bar cannot become fill
+    - pre-CAS dates retain normal-session semantics
+    - non-CAS instruments retain normal-session semantics
+    - do not assume 15:45 alone represents CAS behavior
+    """
+    post_cas_date = NSE_CAS_EFFECTIVE_DATE  # 2026-08-03
+    next_post_cas_date = date(2026, 8, 4)
+    post_dates = (post_cas_date, next_post_cas_date)
+
+    # 1. Raw synthetic source generation with post-continuous bars
+    raw_df = _make_intraday_bars_with_cas(post_dates, base_price=100.0, daily_drift=1.0)
+
+    # Multi-bar verification: prove we do not assume 15:45 alone represents CAS behavior
+    # Raw source explicitly retains bars at 15:15, 15:20, 15:25, 15:30, 15:45
+    assert any(ts.time() == time(15, 15) for ts in raw_df.index)
+    assert any(ts.time() == time(15, 20) for ts in raw_df.index)
+    assert any(ts.time() == time(15, 25) for ts in raw_df.index)
+    assert any(ts.time() == time(15, 30) for ts in raw_df.index)
+    assert any(ts.time() == time(15, 45) for ts in raw_df.index)
+
+    # Inject an unsafe post-continuous price anomaly in raw source
+    # If this bar were evaluated or executed, it would distort fills
+    for i, ts in enumerate(raw_df.index):
+        if ts.time() >= NSE_CAS_CONTINUOUS_END:
+            raw_df.iloc[i, raw_df.columns.get_loc("open")] = 99999.0
+            raw_df.iloc[i, raw_df.columns.get_loc("high")] = 99999.0
+            raw_df.iloc[i, raw_df.columns.get_loc("low")] = 99999.0
+            raw_df.iloc[i, raw_df.columns.get_loc("close")] = 99999.0
+
+    # 2. Canonical policy for CAS-eligible instrument
+    policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
+    assert policy.continuous_end(post_cas_date) == NSE_CAS_CONTINUOUS_END  # 15:15:00
+    assert policy.exit_time(post_cas_date) == time(15, 0)  # 15:15 - 15m buffer
+
+    # 3. Research filtering excludes all timestamp >= canonical continuous end (15:15)
+    filtered = filter_to_continuous_session(raw_df, policy)
+    assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in filtered.index)
+    assert all(ts.time() < NSE_CAS_CONTINUOUS_END for ts in filtered.index)
+    assert filtered.index[-1].time() == time(15, 10)
+    assert len(filtered) == 72 * len(post_dates)
+    # Unsafe price anomaly is completely stripped
+    assert not any(filtered["open"] == 99999.0)
+
+    # 4. VectorBT receives no auxiliary CAS rows
+    import vectorbt as vbt
+
+    class _VbtSpyPortfolio:
+        @staticmethod
+        def from_signals(close, price, **kwargs):
+            # Verify close and price series passed into VectorBT contain zero rows >= 15:15
+            assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in close.index)
+            assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in price.index)
+            return _VbtSpyPortfolio()
+
+        def stats(self, settings):
+            return {
+                "Total Return [%]": 3.0,
+                "Max Drawdown [%]": 0.8,
+                "Total Closed Trades": 2,
+                "Win Rate [%]": 100.0,
+                "Profit Factor": 2.5,
+            }
+
+    monkeypatch.setattr(vbt, "Portfolio", _VbtSpyPortfolio)
+
+    signals = baseline_definition(session_open=time(9, 15)).build_signals(filtered)
+    assert not any(ts.time() >= NSE_CAS_CONTINUOUS_END for ts in signals.entries_at_close.index)
+
+    screening_res = screen_long_signals(
+        close=filtered["close"],
+        execution_price=filtered["open"],
+        entries_at_close=signals.entries_at_close,
+        exits_at_close=signals.exits_at_close,
+        signal_lag_bars=1,
+        screening_cash=Decimal(100000),
+        screening_fee_rate=Decimal("0.0005"),
+        screening_slippage_rate=Decimal("0.0002"),
+        frequency="5min",
+        session_policy=policy,
+    )
+    assert screening_res.exact_cost_validated is False
+    assert screening_res.closed_trades == 2
+
+    # 5. Simulator receives no auxiliary CAS rows and unsafe post-continuous bar cannot become fill
+    cost_provider = CurrentTermsNSEIntradayCostProvider(pricing_date=date(2026, 9, 7))
+    fills = FillAssumptions(
+        slippage_bps_per_leg=Decimal("1.0"), half_spread_bps_per_leg=Decimal("0.5")
+    )
+    sim_config = IntradaySimulationConfig(initial_cash=Decimal(100000), max_trades_per_day=2)
+    membership = _membership_for("NSE_EQ|STOCK_A", post_dates)
+
+    sim_res = simulate_long_intraday(
+        frame=filtered,  # Correct filtered continuous session frame
+        entries_at_close=signals.entries_at_close,
+        exits_at_close=signals.exits_at_close,
+        instrument_token="token_a",
+        exchange=Exchange.NSE,
+        cost_provider=cost_provider,
+        fills=fills,
+        session_policy=policy,
+        tick_size_policy=FixedTickSizePolicy(tick_size_rupees=Decimal("0.05"), source="test"),
+        trading_eligibility_policy=HistoricalTradingEligibilityPolicy(membership),
+        config=sim_config,
+    )
+    assert len(sim_res.trades) > 0
+    for trade in sim_res.trades:
+        # All entries and exits must be strictly before continuous end (15:15)
+        assert trade.entry_timestamp.time() < NSE_CAS_CONTINUOUS_END
+        assert trade.exit_timestamp.time() <= time(15, 0)
+        # Proves unsafe 99999.0 price bar was never filled
+        assert trade.fill_entry_price < 500.0
+        assert trade.fill_exit_price < 500.0
+        assert trade.exit_reason in (ExitReason.SIGNAL, ExitReason.SESSION_CUTOFF)
+
+    # 6. Unsafe post-continuous bar cannot become fill:
+    # Directly attempting to simulate unfiltered raw frame containing bars >= 15:15 fails closed
+    with pytest.raises(ValueError, match="simulation frame contains non-continuous-session bars"):
+        simulate_long_intraday(
+            frame=raw_df,  # Unfiltered raw frame
+            entries_at_close=pd.Series(False, index=raw_df.index),
+            exits_at_close=pd.Series(False, index=raw_df.index),
+            instrument_token="token_a",
+            exchange=Exchange.NSE,
+            cost_provider=cost_provider,
+            fills=fills,
+            session_policy=policy,
+            tick_size_policy=FixedTickSizePolicy(tick_size_rupees=Decimal("0.05"), source="test"),
+            trading_eligibility_policy=HistoricalTradingEligibilityPolicy(membership),
+            config=sim_config,
+        )
+
+    # 7. Pre-CAS dates retain normal-session semantics
+    pre_cas_date = date(2026, 7, 31)  # Prior to 2026-08-03
+    assert policy.continuous_end(pre_cas_date) == NSE_NORMAL_CONTINUOUS_END  # 15:30:00
+    assert policy.exit_time(pre_cas_date) == time(15, 15)  # 15:30 - 15m buffer
+    raw_pre = _make_intraday_bars_with_cas((pre_cas_date,))
+    filtered_pre = filter_to_continuous_session(raw_pre, policy)
+    # Bars at 15:15, 15:20, 15:25 are preserved under normal-session semantics
+    assert any(ts.time() == time(15, 15) for ts in filtered_pre.index)
+    assert any(ts.time() == time(15, 20) for ts in filtered_pre.index)
+    assert any(ts.time() == time(15, 25) for ts in filtered_pre.index)
+    assert filtered_pre.index[-1].time() == time(15, 25)
+    assert len(filtered_pre) == 75  # 75 bars: 09:15 to 15:25
+    assert not any(ts.time() >= NSE_NORMAL_CONTINUOUS_END for ts in filtered_pre.index)
+
+    # 8. Non-CAS instruments retain normal-session semantics
+    non_cas_policy = NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=15)
+    # Even after NSE_CAS_EFFECTIVE_DATE, non-CAS continuous end remains 15:30
+    assert non_cas_policy.continuous_end(post_cas_date) == NSE_NORMAL_CONTINUOUS_END  # 15:30:00
+    assert non_cas_policy.exit_time(post_cas_date) == time(15, 15)
+    filtered_non_cas = filter_to_continuous_session(raw_df, non_cas_policy)
+    # Bars at 15:15, 15:20, 15:25 are preserved for non-CAS instruments
+    assert any(ts.time() == time(15, 15) for ts in filtered_non_cas.index)
+    assert any(ts.time() == time(15, 20) for ts in filtered_non_cas.index)
+    assert any(ts.time() == time(15, 25) for ts in filtered_non_cas.index)
+    assert filtered_non_cas.index[-1].time() == time(15, 25)
+    assert len(filtered_non_cas) == 75 * len(post_dates)
+    assert not any(ts.time() >= NSE_NORMAL_CONTINUOUS_END for ts in filtered_non_cas.index)
+
+
 def test_tournament_requires_full_frozen_population_no_cherry_picking() -> None:
     """Prove that tournament requires the complete frozen eligible universe.
 
     Dropping any instrument after performance is known is strictly rejected.
     """
-    trading_dates = _generate_business_days(date(2026, 6, 1), 5)
+    trading_dates = _generate_business_days(NSE_CAS_EFFECTIVE_DATE, 5)
     frame_a = _make_intraday_bars_with_cas(trading_dates, base_price=100.0, daily_drift=1.0)
     frame_b = _make_intraday_bars_with_cas(trading_dates, base_price=100.0, daily_drift=0.1)
 
-    session_policy = NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=15)
+    session_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
     cont_a = filter_to_continuous_session(frame_a, session_policy)
     cont_b = filter_to_continuous_session(frame_b, session_policy)
 
@@ -1097,14 +1298,14 @@ def test_wfo_chronological_isolation_and_frozen_winner_behavior() -> None:
 
     the frozen winner selected during train.
     """
-    train_day = date(2026, 6, 1)
-    test_day = date(2026, 6, 2)
+    train_day = NSE_CAS_EFFECTIVE_DATE
+    test_day = date(2026, 8, 4)
     window = WalkForwardWindow(
         window_id=1,
         train_dates=(train_day,),
         test_dates=(test_day,),
     )
-    session_policy = NSEEquitySessionPolicy(cas_eligible=False, exit_buffer_minutes=15)
+    session_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
 
     # STOCK_A wins train (strong rally); STOCK_B wins test (huge rally)
     a_train = filter_to_continuous_session(
@@ -1210,7 +1411,7 @@ def test_untouched_oos_isolation_and_no_direct_plan_bridge() -> None:
 
     and verify the architecture blocks direct ResearchWindowPlan -> Experiment integration.
     """
-    trading_dates = _generate_business_days(date(2026, 6, 1), 26)
+    trading_dates = _generate_business_days(NSE_CAS_EFFECTIVE_DATE, 26)
     research_start = trading_dates[0]
     research_end = trading_dates[-1]
 
@@ -1235,7 +1436,7 @@ def test_untouched_oos_isolation_and_no_direct_plan_bridge() -> None:
         product_scope="INTRADAY",
         evidence_mode="historical_resolution",
         policy_identity="effective-dated-cost-ledger/default-resolution/v1",
-        resolved_on_date=date(2026, 6, 30),
+        resolved_on_date=date(2026, 9, 7),
         selected_record_ids=("stt:INTRADAY:SELL:2024-07-01:statutory_schedule",),
         unknown_components=("gst: unknown",),
         scenario_identity=None,
@@ -1267,8 +1468,8 @@ def test_untouched_oos_isolation_and_no_direct_plan_bridge() -> None:
         min_observations_per_window=2,
         min_folds=2,
         approved_capital_rupees=Decimal(100000),
-        session_policy_id="NSEEquitySessionPolicy/buf15",
-        cas_policy_id="CAS/eligible False",
+        session_policy_id="NSEEquitySessionPolicy/cas_eligible_True/buf15",
+        cas_policy_id=f"CAS/eligible True/effective {NSE_CAS_EFFECTIVE_DATE.isoformat()}",
         cost_claim=cost_claim,
         ca_claim=ca_claim,
         dataset_fingerprints={STOCK_A: "fp_a", STOCK_B: "fp_b"},
@@ -1349,9 +1550,9 @@ def test_canonical_historical_cost_scenario_and_unknown_not_zero() -> None:
         compile_historical_scenario(
             scenario_id="scenario:missing-assumption",
             ledger=ledger,
-            scenario_date=date(2026, 6, 5),
-            research_start=date(2026, 6, 1),
-            research_end=date(2026, 7, 6),
+            scenario_date=date(2026, 8, 5),
+            research_start=NSE_CAS_EFFECTIVE_DATE,
+            research_end=date(2026, 9, 7),
             product=LedgerProduct.INTRADAY,
             assumptions=(),  # No assumptions provided for unknown brokerage
         )
@@ -1399,9 +1600,9 @@ def test_experiment_fingerprint_changes_on_material_input() -> None:
     param_grid = _parameter_grid_dict()
 
     exp_1 = orchestrator.build_experiment(
-        research_window=ResearchWindowConfig(start=date(2026, 6, 1), end=date(2026, 7, 6)),
-        train_windows=(WindowSpec(1, date(2026, 6, 1), date(2026, 6, 10), 8),),
-        validation_test_windows=(WindowSpec(1, date(2026, 6, 12), date(2026, 6, 18), 5),),
+        research_window=ResearchWindowConfig(start=NSE_CAS_EFFECTIVE_DATE, end=date(2026, 9, 7)),
+        train_windows=(WindowSpec(1, date(2026, 8, 3), date(2026, 8, 12), 8),),
+        validation_test_windows=(WindowSpec(1, date(2026, 8, 14), date(2026, 8, 20), 5),),
         embargo=EmbargoSpec(1),
         approved_capital=ApprovedCapital(Decimal(100000), "INR"),
         universe_fingerprint="u" * 64,
@@ -1410,10 +1611,10 @@ def test_experiment_fingerprint_changes_on_material_input() -> None:
         nse_membership_evidence=NSEMembershipEvidenceIdentity(("ref",), True, "m" * 64, 20),
         tick_evidence=TickEvidenceIdentity("fixed-0.05", "source", True, "t" * 64),
         session_policy_identity=SessionPolicyIdentity(
-            "policy", False, 15, "2026-03-01", "15:30:00"
+            "policy", True, 15, NSE_CAS_EFFECTIVE_DATE.isoformat(), "15:15:00"
         ),
         corporate_action_evidence=CorporateActionEvidenceIdentity("ca", True, (), "c" * 64),
-        cost_model_identity=CostModelIdentity("model", "2026-06-05", {"b": "0.0003"}, ("ref",)),
+        cost_model_identity=CostModelIdentity("model", "2026-08-05", {"b": "0.0003"}, ("ref",)),
         cost_evidence_identity=identity_1,
         cost_evidence_class=SCENARIO_LABEL,
         strategy_definitions=(StrategySpec("strat_1", "ORB", "basis", (), {"buf": "5"}),),
@@ -1464,9 +1665,9 @@ def test_promotion_gate_fail_closed_rejection_proofs() -> None:
     orchestrator = ExperimentOrchestrator(code_commit_sha=CODE_COMMIT_SHA)
 
     base_exp = orchestrator.build_experiment(
-        research_window=ResearchWindowConfig(start=date(2026, 6, 1), end=date(2026, 7, 6)),
-        train_windows=(WindowSpec(1, date(2026, 6, 1), date(2026, 6, 10), 8),),
-        validation_test_windows=(WindowSpec(1, date(2026, 6, 12), date(2026, 6, 18), 5),),
+        research_window=ResearchWindowConfig(start=NSE_CAS_EFFECTIVE_DATE, end=date(2026, 9, 7)),
+        train_windows=(WindowSpec(1, date(2026, 8, 3), date(2026, 8, 12), 8),),
+        validation_test_windows=(WindowSpec(1, date(2026, 8, 14), date(2026, 8, 20), 5),),
         embargo=EmbargoSpec(1),
         approved_capital=ApprovedCapital(Decimal(100000), "INR"),
         universe_fingerprint="u" * 64,
@@ -1475,10 +1676,10 @@ def test_promotion_gate_fail_closed_rejection_proofs() -> None:
         nse_membership_evidence=NSEMembershipEvidenceIdentity(("ref",), True, "m" * 64, 20),
         tick_evidence=TickEvidenceIdentity("fixed-0.05", "source", True, "t" * 64),
         session_policy_identity=SessionPolicyIdentity(
-            "policy", False, 15, "2026-03-01", "15:30:00"
+            "policy", True, 15, NSE_CAS_EFFECTIVE_DATE.isoformat(), "15:15:00"
         ),
         corporate_action_evidence=CorporateActionEvidenceIdentity("ca", True, (), "c" * 64),
-        cost_model_identity=CostModelIdentity("model", "2026-06-05", {"b": "0.0003"}, ("ref",)),
+        cost_model_identity=CostModelIdentity("model", "2026-08-05", {"b": "0.0003"}, ("ref",)),
         cost_evidence_identity=identity,
         cost_evidence_class=SCENARIO_LABEL,
         strategy_definitions=(StrategySpec("strat_1", "ORB", "basis", (), {"buf": "5"}),),
