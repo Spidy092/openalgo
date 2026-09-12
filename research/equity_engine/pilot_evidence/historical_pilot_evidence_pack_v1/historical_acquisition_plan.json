@@ -1,0 +1,205 @@
+{
+  "acquisition_exclusions": [],
+  "calendar_source_id": "nse-cm-calendar:2026",
+  "capital_scenarios": [],
+  "corporate_action_evidence": {
+    "blocking_events": [],
+    "complete": true,
+    "coverage_end": "2026-08-03",
+    "coverage_start": "2026-07-30",
+    "covered_instruments": [
+      "NSE_EQ|INE745G01043"
+    ],
+    "events_count": 0,
+    "fingerprint": "309e4a74a821734d9ec87e33fd8e777c62eb71ba86e65f79ed2a1cffb1777362",
+    "policy_identity": "raw-unadjusted-block-structural-actions-v1",
+    "source_id": "nse-corporate-actions:equities:2026-07-30:2026-08-03",
+    "unknown_instruments": []
+  },
+  "deterministic_fingerprint": "5f45d0b05f1b1ffa067a9b33b558bbf134a5f4f2caee2695cfe6dffd80fd5fb3",
+  "estimated_bytes_per_row": 160,
+  "estimated_rows": 226,
+  "estimated_storage_bytes": 36160,
+  "evidence_sources": [
+    {
+      "evidence_type": "NSE CM calendar evidence",
+      "fingerprint": "5e1db7d0ec7d7cd17325ee615b2255fa449fe72039506276e34e615665f5771f",
+      "source_id": "nse-cm-calendar:2026"
+    },
+    {
+      "evidence_type": "NSE session policy and CAS evidence",
+      "fingerprint": "418336f2d3b9e93915ec4901f52e9a8b0a170b036c5b16ced72c4d789fa6eaf1",
+      "source_id": "nse-cm-session-policy:cas-effective-2026-08-03"
+    },
+    {
+      "evidence_type": "corporate-action coverage and no-action evidence",
+      "fingerprint": "309e4a74a821734d9ec87e33fd8e777c62eb71ba86e65f79ed2a1cffb1777362",
+      "source_id": "nse-corporate-actions:equities:2026-07-30:2026-08-03"
+    },
+    {
+      "evidence_type": "PITMembershipSegment/NSE MII security snapshot",
+      "fingerprint": "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001",
+      "source_id": "nse-mii-pit-snapshot:2026-07-30"
+    },
+    {
+      "evidence_type": "PITMembershipSegment/NSE MII security snapshot",
+      "fingerprint": "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
+      "source_id": "nse-mii-pit-snapshot:2026-07-31"
+    },
+    {
+      "evidence_type": "PITMembershipSegment/NSE MII security snapshot",
+      "fingerprint": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
+      "source_id": "nse-mii-pit-snapshot:2026-08-03"
+    },
+    {
+      "evidence_type": "CAS eligibility current BOD record only",
+      "fingerprint": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
+      "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12"
+    }
+  ],
+  "excluded_special_session_dates": [],
+  "expected_request_count": 1,
+  "formation_boundary_adapter": {
+    "formation_boundary": "2026-07-30",
+    "frozen_train_universe": {
+      "frozen_as_of": "2026-07-30",
+      "instruments": [
+        "NSE_EQ|INE745G01043"
+      ],
+      "population_fingerprint": "ccb136ad6e471e9954f3c8846b30a1c62510a08460355ccc3a0e970b6721fd8b",
+      "universe_policy_id": "historical-pilot-evidence-pack-v1:cas-filtered-pit-v1"
+    },
+    "research_window_plan_fingerprint": "0d8729c5c9d5d96bfadf4fc663177a9cf44adb0ec9028f2f14aa0ea19b1f6542"
+  },
+  "frozen_wfo_population": [
+    "NSE_EQ|INE745G01043"
+  ],
+  "historical_acquisition_superset": [
+    "NSE_EQ|INE745G01043"
+  ],
+  "holiday_dates": [],
+  "instrument_acquisition_union": [
+    {
+      "eligible_trade_dates": [
+        "2026-07-30",
+        "2026-07-31",
+        "2026-08-03"
+      ],
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "source_fingerprints": [
+        "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
+        "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
+        "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001"
+      ]
+    }
+  ],
+  "live_orders_called": false,
+  "mode": "DRY_RUN",
+  "normal_trading_dates": [
+    "2026-07-30",
+    "2026-07-31",
+    "2026-08-03"
+  ],
+  "pit_segments": [
+    {
+      "eligible": true,
+      "evidence_as_of": "2026-07-30",
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "source_fingerprint": "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001",
+      "valid_from": "2026-07-30",
+      "valid_to": "2026-07-30"
+    },
+    {
+      "eligible": true,
+      "evidence_as_of": "2026-07-31",
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "source_fingerprint": "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
+      "valid_from": "2026-07-31",
+      "valid_to": "2026-08-02"
+    },
+    {
+      "eligible": true,
+      "evidence_as_of": "2026-08-03",
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "source_fingerprint": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
+      "valid_from": "2026-08-03",
+      "valid_to": "2026-08-03"
+    }
+  ],
+  "plan_id": "hap_5f45d0b05f1b1ffa",
+  "requested_interval_minutes": [
+    5
+  ],
+  "requested_intervals": [
+    {
+      "end": "2026-08-03",
+      "estimated_storage_bytes": 36160,
+      "expected_rows": 226,
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "interval_minutes": 5,
+      "request_count": 1,
+      "start": "2026-07-30",
+      "trade_dates": [
+        "2026-07-30",
+        "2026-07-31",
+        "2026-08-03"
+      ]
+    }
+  ],
+  "research_window": {
+    "end": "2026-08-03",
+    "start": "2026-07-30"
+  },
+  "safe_chunk_calendar_days": 28,
+  "schema_version": "historical-acquisition-plan/v2",
+  "session_evidence": [
+    {
+      "acquisition_allowed": true,
+      "end_time_exclusive": "15:30:00",
+      "exclusion_reason": null,
+      "expected_rows_by_interval": [
+        [
+          5,
+          75
+        ]
+      ],
+      "session_kind": "NORMAL",
+      "source_id": "nse-cm-session-policy:cas-effective-2026-08-03",
+      "start_time": "09:15:00",
+      "timezone": "Asia/Kolkata",
+      "trade_date": "2026-07-30"
+    },
+    {
+      "acquisition_allowed": true,
+      "end_time_exclusive": "15:30:00",
+      "exclusion_reason": null,
+      "expected_rows_by_interval": [
+        [
+          5,
+          75
+        ]
+      ],
+      "session_kind": "NORMAL",
+      "source_id": "nse-cm-session-policy:cas-effective-2026-08-03",
+      "start_time": "09:15:00",
+      "timezone": "Asia/Kolkata",
+      "trade_date": "2026-07-31"
+    },
+    {
+      "acquisition_allowed": true,
+      "end_time_exclusive": "15:15:00",
+      "exclusion_reason": null,
+      "expected_rows_by_interval": [
+        [
+          5,
+          76
+        ]
+      ],
+      "session_kind": "NORMAL",
+      "source_id": "nse-cm-session-policy:cas-effective-2026-08-03",
+      "start_time": "09:15:00",
+      "timezone": "Asia/Kolkata",
+      "trade_date": "2026-08-03"
+    }
+  ]
+}

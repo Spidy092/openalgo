@@ -1,0 +1,36 @@
+{
+  "candidate_file": "candidate_file.json",
+  "cas_estimate": {
+    "auxiliary_rows_upper_bound": 4,
+    "auxiliary_window": [
+      "15:15:00",
+      "15:35:00"
+    ],
+    "continuous_end": "15:15:00",
+    "continuous_rows": 72,
+    "raw_rows_used_for_estimate": 76
+  },
+  "estimated_bytes_per_row": 160,
+  "estimated_raw_storage_bytes": 36160,
+  "estimated_request_count": 1,
+  "estimated_rows": 226,
+  "interval_minutes": 5,
+  "live_orders_called": false,
+  "mode": "DRY_RUN",
+  "requests": [
+    {
+      "chunk_count": 1,
+      "end": "2026-08-03",
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "start": "2026-07-30",
+      "symbol": "MCX",
+      "trade_dates": [
+        "2026-07-30",
+        "2026-07-31",
+        "2026-08-03"
+      ]
+    }
+  ],
+  "safe_chunk_calendar_days": 28,
+  "schema_version": "historical-pilot-dry-run-request-plan/v1"
+}
