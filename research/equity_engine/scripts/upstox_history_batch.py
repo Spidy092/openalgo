@@ -24,6 +24,14 @@ def main() -> int:
     source.add_argument("--universe-manifest")
     source.add_argument("--candidate-file")
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "verify candidate, canonical acquisition plan, acquisition evidence, fingerprints, "
+            "and interval bindings without reading a token or making network requests"
+        ),
+    )
     parser.add_argument("--prefilter-evidence")
     parser.add_argument(
         "--acquisition-plan",
@@ -41,6 +49,8 @@ def main() -> int:
     parser.add_argument("--universe-rule-version", default="nse-cm-v15-point-in-time")
     parser.add_argument("--adjustment-policy", default="raw-unadjusted-block-structural-actions")
     args = parser.parse_args()
+    if args.dry_run and args.execute:
+        parser.error("--dry-run and --execute cannot be combined")
 
     trading_day_counts = None
     if args.universe_manifest:
@@ -76,6 +86,42 @@ def main() -> int:
         "note": plan.note,
         "live_orders_called": False,
     }
+
+    if args.dry_run:
+        if args.universe_manifest:
+            parser.error("--dry-run requires --candidate-file, not the full universe manifest")
+        if not args.prefilter_evidence:
+            parser.error("--dry-run requires --prefilter-evidence describing candidate selection")
+        if not args.acquisition_plan:
+            parser.error("--dry-run requires --acquisition-plan from the canonical planner")
+        if not args.acquisition_evidence:
+            parser.error("--dry-run requires --acquisition-evidence binding historical evidence")
+
+        evidence = load_acquisition_evidence(Path(args.acquisition_evidence))
+        acquisition_plan = load_acquisition_plan_binding(Path(args.acquisition_plan))
+        acquisition_plan.validate_execution(
+            candidates=plan.candidates,
+            interval_minutes=args.interval,
+            evidence=evidence,
+        )
+        canonical_plan_payload = json.loads(Path(args.acquisition_plan).read_text(encoding="utf-8"))
+        dry_run_output = {
+            **plan_output,
+            "mode": "dry-run-verified",
+            "status": "verified",
+            "acquisition_plan_fingerprint": acquisition_plan.deterministic_fingerprint,
+            "acquisition_evidence_fingerprint": evidence.fingerprint(),
+            "canonical_estimated_request_count": canonical_plan_payload["expected_request_count"],
+            "canonical_estimated_rows": canonical_plan_payload["estimated_rows"],
+            "canonical_estimated_storage_bytes": canonical_plan_payload["estimated_storage_bytes"],
+            "candidate_intervals": [asdict(item) for item in plan.candidates],
+            "network_requests": 0,
+            "token_required": False,
+            "downloader_constructed": False,
+            "live_orders_called": False,
+        }
+        print(json.dumps(dry_run_output, indent=2, default=str))
+        return 0
 
     if not args.execute:
         print(json.dumps(plan_output, indent=2))

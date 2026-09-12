@@ -1,0 +1,56 @@
+{
+  "acquisition_plan_fingerprint": "5f45d0b05f1b1ffa067a9b33b558bbf134a5f4f2caee2695cfe6dffd80fd5fb3",
+  "corporate_action_evidence_fingerprint": "309e4a74a821734d9ec87e33fd8e777c62eb71ba86e65f79ed2a1cffb1777362",
+  "evidence_fingerprint": "b93d8c131f0037ff5f8b9880d3a74d532f09a28fdebce612512c721184a24c85",
+  "expected_trade_dates": [
+    "2026-07-30",
+    "2026-07-31",
+    "2026-08-03"
+  ],
+  "pit_evidence_fingerprint": "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001",
+  "session_policy_identity": "nse-cm-session-policy:cas-effective-2026-08-03",
+  "session_rules": [
+    {
+      "rule": {
+        "auxiliary_end_time_exclusive": null,
+        "auxiliary_semantics": null,
+        "auxiliary_start_time": null,
+        "end_time_exclusive": "15:30:00",
+        "interval_minutes": 5,
+        "rule_id": "nse-cm-normal-continuous-session",
+        "source_reference": "nse_cm_normal_session_calendar + NSEEquitySessionPolicy",
+        "start_time": "09:15:00",
+        "timezone": "Asia/Kolkata"
+      },
+      "trade_date": "2026-07-30"
+    },
+    {
+      "rule": {
+        "auxiliary_end_time_exclusive": null,
+        "auxiliary_semantics": null,
+        "auxiliary_start_time": null,
+        "end_time_exclusive": "15:30:00",
+        "interval_minutes": 5,
+        "rule_id": "nse-cm-normal-continuous-session",
+        "source_reference": "nse_cm_normal_session_calendar + NSEEquitySessionPolicy",
+        "start_time": "09:15:00",
+        "timezone": "Asia/Kolkata"
+      },
+      "trade_date": "2026-07-31"
+    },
+    {
+      "rule": {
+        "auxiliary_end_time_exclusive": "15:35:00",
+        "auxiliary_semantics": "broker-observed-CAS-auxiliary-window; provider historical bucket semantics unverified",
+        "auxiliary_start_time": "15:15:00",
+        "end_time_exclusive": "15:15:00",
+        "interval_minutes": 5,
+        "rule_id": "nse-cm-cas-continuous-session",
+        "source_reference": "nse_cm_normal_session_calendar + NSEEquitySessionPolicy",
+        "start_time": "09:15:00",
+        "timezone": "Asia/Kolkata"
+      },
+      "trade_date": "2026-08-03"
+    }
+  ]
+}

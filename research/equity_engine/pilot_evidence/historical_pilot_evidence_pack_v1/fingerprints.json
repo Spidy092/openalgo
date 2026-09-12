@@ -1,0 +1,30 @@
+{
+  "acquisition_evidence_fingerprint": "b93d8c131f0037ff5f8b9880d3a74d532f09a28fdebce612512c721184a24c85",
+  "acquisition_plan_fingerprint": "5f45d0b05f1b1ffa067a9b33b558bbf134a5f4f2caee2695cfe6dffd80fd5fb3",
+  "candidate_manifest_fingerprint": "8393b440e0400e71207a748e009748a1b8cd89107c4a26ecb9bf4329685753ce",
+  "file_sha256": {
+    "acquisition_evidence.json": "3191c33be96b893b50dda457e3e4471a0e2a368fb4099193d7b0f08a9052d545",
+    "candidate_file.json": "03713a0736611e755edeb55a5dac20c42b8b20c5d4498fc6c84696bfd6a2ec1d",
+    "dry_run_request_plan.json": "3436fbff855ffba1ea114de9c08c37f09b563500328d31047f706c1a45134fc4",
+    "excluded_special_session.json": "a6546e10a922217a7f4b8a5cb3865cd0e49d814d97994874bdf94b4c03954623",
+    "historical_acquisition_plan.json": "0e9bc98b41190ab7f0624dfdd97a657e438d8301b6f30558e85953bda9303a96",
+    "prefilter_evidence.json": "6640a2c109fc190e907968398701e567728b926f49004bf8c09f83bb6715e8f3",
+    "selected_candidate_manifest.json": "b7fa67c5e2fd25ad28e9fddb5c948f6e64044498c1d285d817ff4931f5237c50",
+    "source_evidence.json": "0a3dba6f46cc1e4a5321be1e663650e6cec5505ac2f7d8a682c781a221a6f4b3"
+  },
+  "live_orders_called": false,
+  "plan_id": "hap_5f45d0b05f1b1ffa",
+  "prefilter_evidence_fingerprint": "ffd2819ff933c323b642bfa59ce8743c9b758770f125ef8fc97ebd2a86d37e82",
+  "schema_version": "historical-pilot-fingerprints/v1",
+  "source_fingerprints": {
+    "calendar": "5e1db7d0ec7d7cd17325ee615b2255fa449fe72039506276e34e615665f5771f",
+    "corporate_actions": "309e4a74a821734d9ec87e33fd8e777c62eb71ba86e65f79ed2a1cffb1777362",
+    "nse_mii": {
+      "2026-07-30": "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001",
+      "2026-07-31": "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
+      "2026-08-03": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359"
+    },
+    "session_policy": "418336f2d3b9e93915ec4901f52e9a8b0a170b036c5b16ced72c4d789fa6eaf1",
+    "upstox_bod": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "affordability_note": "Pilot scope is deterministic and bounded; no price/performance ranking or broad acquisition was performed.",
+  "affordability_prefilter_applied": true,
+  "candidate_file": "candidate_file.json",
+  "candidate_file_sha256": "a4f7f430f823ac67e835865552e6d85b7add8f69871cc7d4705b9915724d64d8",
+  "candidate_manifest_fingerprint": "8393b440e0400e71207a748e009748a1b8cd89107c4a26ecb9bf4329685753ce",
+  "fingerprint": "ffd2819ff933c323b642bfa59ce8743c9b758770f125ef8fc97ebd2a86d37e82",
+  "frozen_wfo_population": [
+    "NSE_EQ|INE745G01043"
+  ],
+  "historical_acquisition_superset": [
+    "NSE_EQ|INE745G01043"
+  ],
+  "live_orders_called": false,
+  "schema_version": "historical-pilot-prefilter-evidence/v1",
+  "selection_rule": "From the exact pilot date intersection, retain NSE CM EQ rows with canonical v1.5 PrtdToTrad=1, ElgbltyNrmlMkt=1, active normal-market status, exact ISIN identity, and one PITMembershipSegment per date; on 2026-08-03 additionally require CallAuctnInd=1 and ElgbltyClsgAuctnSsn=1 plus current Upstox NSE EQ BOD cas_eligible=true. Sort instrument_key and select the first result. No price, performance, liquidity, MIS, BOD, or suspension backprojection is used."
+}

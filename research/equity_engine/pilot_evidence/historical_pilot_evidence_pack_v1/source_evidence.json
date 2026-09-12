@@ -1,0 +1,182 @@
+{
+  "calendar": {
+    "fingerprint": "5e1db7d0ec7d7cd17325ee615b2255fa449fe72039506276e34e615665f5771f",
+    "holiday_dates": [],
+    "normal_trading_dates": [
+      "2026-07-30",
+      "2026-07-31",
+      "2026-08-03"
+    ],
+    "research_window": [
+      "2026-07-30",
+      "2026-08-03"
+    ],
+    "source_id": "nse-cm-calendar:2026",
+    "source_urls": [
+      "https://nsearchives.nseindia.com/content/circulars/CMTR71775.pdf",
+      "https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf"
+    ]
+  },
+  "corporate_action_query": {
+    "complete": true,
+    "coverage_end": "2026-08-03",
+    "coverage_start": "2026-07-30",
+    "exact_instrument_events": [],
+    "fingerprint": "309e4a74a821734d9ec87e33fd8e777c62eb71ba86e65f79ed2a1cffb1777362",
+    "http_status": 200,
+    "identity_payload": {
+      "coverage": {
+        "complete": true,
+        "exact_instrument_events": [],
+        "same_symbol_events": [],
+        "unknown": false
+      },
+      "policy": {
+        "name": "raw-unadjusted-block-structural-actions-v1",
+        "structural_event_types": [
+          "Split",
+          "Bonus",
+          "Rights",
+          "Merger",
+          "Demerger",
+          "Delisting",
+          "Capital Reduction",
+          "Other Structural"
+        ],
+        "unknown_is_not_no_action": true
+      },
+      "query": {
+        "end": "2026-08-03",
+        "instrument_key": "NSE_EQ|INE745G01043",
+        "start": "2026-07-30",
+        "symbol": "MCX"
+      },
+      "response_sha256": "25414df6bdcd16634a6fb1ff7f1fc02750443762341882beefaddc6735468342",
+      "source_id": "nse-corporate-actions:equities:2026-07-30:2026-08-03"
+    },
+    "response_bytes": 25440,
+    "response_rows": 85,
+    "response_sha256": "25414df6bdcd16634a6fb1ff7f1fc02750443762341882beefaddc6735468342",
+    "same_symbol_events": [],
+    "source_id": "nse-corporate-actions:equities:2026-07-30:2026-08-03",
+    "unknown": false,
+    "url": "https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=30-07-2026&to_date=03-08-2026"
+  },
+  "credentials_included": false,
+  "historical_candles_downloaded": false,
+  "live_orders_called": false,
+  "nse_mii_pit_snapshots": [
+    {
+      "payload_bytes": 1209661,
+      "payload_sha256": "e991c7bec6bbd1d7a51aabaeeb0359632eec5de00f3bf6f4e0aee8de60590001",
+      "raw_fields": {
+        "BidIntrvl": "10",
+        "CallAuctnInd": "1",
+        "DelFlg": "N",
+        "ElgbltyClsgAuctnSsn": null,
+        "ElgbltyNrmlMkt": "1",
+        "FinInstrmId": "31181",
+        "ISIN": "INE745G01043",
+        "NewBrdLotQty": "1",
+        "PrtdToTrad": "1",
+        "SctySrs": "EQ",
+        "SctyStsNrmlMkt": "6",
+        "SctyTpFlg": "0",
+        "TckrSymb": "MCX"
+      },
+      "source_id": "nse-mii-pit-snapshot:2026-07-30",
+      "source_row_number": 24116,
+      "url": "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_30072026.csv.gz"
+    },
+    {
+      "payload_bytes": 1210241,
+      "payload_sha256": "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
+      "raw_fields": {
+        "BidIntrvl": "10",
+        "CallAuctnInd": "1",
+        "DelFlg": "N",
+        "ElgbltyClsgAuctnSsn": "1",
+        "ElgbltyNrmlMkt": "1",
+        "FinInstrmId": "31181",
+        "ISIN": "INE745G01043",
+        "NewBrdLotQty": "1",
+        "PrtdToTrad": "1",
+        "SctySrs": "EQ",
+        "SctyStsNrmlMkt": "6",
+        "SctyTpFlg": "0",
+        "TckrSymb": "MCX"
+      },
+      "source_id": "nse-mii-pit-snapshot:2026-07-31",
+      "source_row_number": 24120,
+      "url": "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_31072026.csv.gz"
+    },
+    {
+      "payload_bytes": 1209602,
+      "payload_sha256": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
+      "raw_fields": {
+        "BidIntrvl": "10",
+        "CallAuctnInd": "1",
+        "DelFlg": "N",
+        "ElgbltyClsgAuctnSsn": "1",
+        "ElgbltyNrmlMkt": "1",
+        "FinInstrmId": "31181",
+        "ISIN": "INE745G01043",
+        "NewBrdLotQty": "1",
+        "PrtdToTrad": "1",
+        "SctySrs": "EQ",
+        "SctyStsNrmlMkt": "6",
+        "SctyTpFlg": "0",
+        "TckrSymb": "MCX"
+      },
+      "source_id": "nse-mii-pit-snapshot:2026-08-03",
+      "source_row_number": 24122,
+      "url": "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_03082026.csv.gz"
+    }
+  ],
+  "planner_special_session": {
+    "calendar_source_id": "nse-cm-calendar:2026",
+    "classification": "SPECIAL_SESSION_EXCLUDED",
+    "source_urls": [
+      "https://nsearchives.nseindia.com/content/circulars/CMTR71775.pdf",
+      "https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf"
+    ],
+    "trade_date": "2026-11-08"
+  },
+  "schema_version": "historical-pilot-source-evidence/v1",
+  "session_policy": {
+    "calendar_source_urls": [
+      "https://nsearchives.nseindia.com/content/circulars/CMTR71775.pdf",
+      "https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf"
+    ],
+    "cas_auxiliary_window": [
+      "15:15:00",
+      "15:35:00"
+    ],
+    "cas_continuous_end": "15:15:00",
+    "cas_effective_date": "2026-08-03",
+    "cas_source": "https://www.nseindia.com/static/products-services/closing-auction-session",
+    "continuous_start": "09:15:00",
+    "fingerprint": "418336f2d3b9e93915ec4901f52e9a8b0a170b036c5b16ced72c4d789fa6eaf1",
+    "normal_continuous_end": "15:30:00",
+    "policy": "NSEEquitySessionPolicy",
+    "policy_id": "nse-cm-session-policy:cas-effective-2026-08-03",
+    "timezone": "Asia/Kolkata"
+  },
+  "upstox_bod_cas_evidence": {
+    "instrument_record": {
+      "cas_eligible": true,
+      "instrument_key": "NSE_EQ|INE745G01043",
+      "instrument_type": "EQ",
+      "isin": "INE745G01043",
+      "name": "MULTI COMMODITY EXCHANGE",
+      "security_type": "NORMAL",
+      "segment": "NSE_EQ",
+      "trading_symbol": "MCX"
+    },
+    "payload_bytes": 1940184,
+    "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
+    "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
+    "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+    "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
+  }
+}
