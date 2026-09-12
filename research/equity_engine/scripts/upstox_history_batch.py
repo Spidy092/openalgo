@@ -9,6 +9,8 @@ from pathlib import Path
 from equity_engine.upstox_batch_history import (
     UpstoxHistoricalBatchDownloader,
     candidates_from_universe_manifest,
+    load_acquisition_evidence,
+    load_acquisition_plan_binding,
     load_candidate_file,
     plan_historical_batch,
 )
@@ -23,6 +25,14 @@ def main() -> int:
     source.add_argument("--candidate-file")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--prefilter-evidence")
+    parser.add_argument(
+        "--acquisition-plan",
+        help="canonical HistoricalAcquisitionPlan JSON required for execution",
+    )
+    parser.add_argument(
+        "--acquisition-evidence",
+        help="JSON file binding PIT, corporate-action, acquisition-plan, and session evidence",
+    )
     parser.add_argument("--output-dir", default="data/upstox_history_batch")
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--expected-rows-per-trading-day", type=int, default=75)
@@ -78,6 +88,18 @@ def main() -> int:
         )
     if not args.prefilter_evidence:
         parser.error("--execute requires --prefilter-evidence describing candidate selection")
+    if not args.acquisition_plan:
+        parser.error("--execute requires --acquisition-plan from the canonical planner")
+    if not args.acquisition_evidence:
+        parser.error("--execute requires --acquisition-evidence binding historical evidence")
+
+    evidence = load_acquisition_evidence(Path(args.acquisition_evidence))
+    acquisition_plan = load_acquisition_plan_binding(Path(args.acquisition_plan))
+    acquisition_plan.validate_execution(
+        candidates=plan.candidates,
+        interval_minutes=args.interval,
+        evidence=evidence,
+    )
 
     token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
     if not token:
@@ -93,6 +115,7 @@ def main() -> int:
         candidates=plan.candidates,
         universe_rule_version=args.universe_rule_version,
         adjustment_policy=args.adjustment_policy,
+        evidence=evidence,
     )
     output = {
         **plan_output,
