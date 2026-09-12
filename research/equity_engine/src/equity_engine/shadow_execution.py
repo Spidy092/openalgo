@@ -1172,6 +1172,7 @@ class ExitOnSecondBarStrategy:
         return self._bars_seen == 1
 
     def exit_signal_at_close(self, event: ShadowMarketEvent) -> bool:
+        self._bars_seen += 1
         return self._bars_seen >= 3
 
 

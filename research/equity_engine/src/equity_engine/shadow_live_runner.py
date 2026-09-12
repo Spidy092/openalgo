@@ -613,15 +613,6 @@ class ShadowLiveRunner:
                 json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-        checksums: dict[str, str] = {}
-        for path in sorted(output_dir.iterdir()):
-            if path.is_file():
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                checksums[path.name] = digest
-        (output_dir / "CHECKSUMS.sha256").write_text(
-            "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
-            encoding="utf-8",
-        )
         summary = {
             "schema_version": SCHEMA_VERSION,
             "session_id": self._config.session_id,
@@ -634,6 +625,15 @@ class ShadowLiveRunner:
         }
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        checksums: dict[str, str] = {}
+        for path in sorted(output_dir.iterdir()):
+            if path.is_file() and path.name != "CHECKSUMS.sha256":
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                checksums[path.name] = digest
+        (output_dir / "CHECKSUMS.sha256").write_text(
+            "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
+            encoding="utf-8",
         )
         return summary
 
