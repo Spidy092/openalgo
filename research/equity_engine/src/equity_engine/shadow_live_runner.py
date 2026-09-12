@@ -790,7 +790,6 @@ class ShadowLiveRunner:
                 json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-
         summary = {
             "schema_version": SCHEMA_VERSION,
             "session_id": self._config.session_id,
@@ -808,7 +807,6 @@ class ShadowLiveRunner:
         summary_path.write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-
         def _write_checksums() -> None:
             checksums: dict[str, str] = {}
             for path in sorted(output_dir.iterdir()):
