@@ -1,13 +1,37 @@
-"""Monday live-market readiness gate V1 (shadow testing only).
+"""Monday live-market readiness gate (shadow testing only).
 
 Strict machine-readable aggregate that fails closed unless all required
-evidence is available. This module is research/read-only:
+evidence is available for the requested scope. This module is research/read-only:
 
 - It never places, modifies, or cancels an order.
 - It never accepts a broker token value: auth is PRESENT/ABSENT only.
 - It reuses existing readiness, broker, market-context, session, cost and
   safety components instead of duplicating them.
-- ``READY_FOR_LIVE_ORDER_REVIEW`` is NOT authorization to trade.
+- ``READY_FOR_LIVE_ORDER_REVIEW`` is NOT authorization to trade. Human/Product
+  Owner approval remains separately required.
+
+Readiness scopes (ascending):
+
+- ``READY_FOR_SHADOW_INFRA``: live-market plumbing with theoretical decisions
+  only. Proves token, read-only connectivity, session/calendar, clock, fresh
+  quotes/feed without gaps, instrument identity with suspension/tradability
+  evidence for consuming live prices, tick evidence, known CAS policy, valid
+  session boundary, explicit approved shadow capital, kill switch off.
+  Deliberately does NOT require prior paper evidence, strategy evidence,
+  PIT/historical research evidence, or cost reconciliation: the first shadow
+  session is what creates paper evidence, so requiring it here would be
+  circular.
+- ``READY_FOR_RESEARCH_SHADOW``: all infra requirements PLUS complete PIT
+  evidence, complete historical dataset validation, valid selected research
+  strategy/experiment evidence, and an explicit scenario cost
+  identity/reconciliation policy. Still does NOT require prior paper/shadow
+  evidence. This is the state required to start collecting real paper/shadow
+  evidence.
+- ``READY_FOR_LIVE_ORDER_REVIEW``: all research-shadow requirements PLUS
+  sufficient accumulated paper/shadow evidence, passing broker cost
+  reconciliation, static-IP/live prerequisites, broker balance at or above
+  approved capital, and proven live tradability. Still NOT authorization to
+  trade.
 
 Reused components (imported, not reimplemented):
 
@@ -51,7 +75,7 @@ from .tick_size import TickSizeVerification
 from .upstox_market_context import QuoteBatchResult
 from .upstox_readiness import UpstoxReadinessSnapshot
 
-SCHEMA_VERSION = "live-market-readiness/v1"
+SCHEMA_VERSION = "live-market-readiness/v2"
 REQUIRED_TIMEZONE = "Asia/Kolkata"
 
 
@@ -59,7 +83,8 @@ class ReadinessClassification(StrEnum):
     """Explicit final gate classification."""
 
     NOT_READY_FOR_SHADOW = "NOT_READY_FOR_SHADOW"
-    READY_FOR_SHADOW = "READY_FOR_SHADOW"
+    READY_FOR_SHADOW_INFRA = "READY_FOR_SHADOW_INFRA"
+    READY_FOR_RESEARCH_SHADOW = "READY_FOR_RESEARCH_SHADOW"
     READY_FOR_LIVE_ORDER_REVIEW = "READY_FOR_LIVE_ORDER_REVIEW"
 
 
@@ -90,6 +115,7 @@ COST_RECONCILIATION_MISSING = "COST_RECONCILIATION_MISSING"
 COST_RECONCILIATION_FAILED = "COST_RECONCILIATION_FAILED"
 PIT_EVIDENCE_INCOMPLETE = "PIT_EVIDENCE_INCOMPLETE"
 HISTORICAL_EVIDENCE_MISSING = "HISTORICAL_EVIDENCE_MISSING"
+STRATEGY_EVIDENCE_MISSING = "STRATEGY_EVIDENCE_MISSING"
 PAPER_EVIDENCE_MISSING = "PAPER_EVIDENCE_MISSING"
 KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"
 LIVE_ORDERS_CALLED = "LIVE_ORDERS_CALLED"
@@ -122,17 +148,35 @@ REASON_MESSAGES: dict[str, str] = {
     COST_RECONCILIATION_FAILED: "cost reconciliation did not pass within tolerance",
     PIT_EVIDENCE_INCOMPLETE: "point-in-time membership evidence is incomplete",
     HISTORICAL_EVIDENCE_MISSING: "historical dataset validation evidence is missing or failed",
+    STRATEGY_EVIDENCE_MISSING: "selected research strategy/experiment evidence is missing",
     PAPER_EVIDENCE_MISSING: "paper/shadow trading evidence artifact is missing",
     KILL_SWITCH_ENGAGED: "kill switch is engaged; gate fails closed",
     LIVE_ORDERS_CALLED: "live order execution was requested; strictly forbidden in readiness",
     LIVE_TRADABILITY_UNPROVEN: "live tradability is not proven for live-order review",
 }
 
-# Codes that block shadow. The three live-only codes allow READY_FOR_SHADOW
-# but block READY_FOR_LIVE_ORDER_REVIEW.
+# Codes that block research-shadow and live review but NOT pure plumbing shadow.
+# PIT/historical/strategy/cost evidence is required to run a research strategy,
+# never to prove the live feed works.
+RESEARCH_ONLY_CODES = frozenset(
+    {
+        PIT_EVIDENCE_INCOMPLETE,
+        HISTORICAL_EVIDENCE_MISSING,
+        STRATEGY_EVIDENCE_MISSING,
+        COST_RECONCILIATION_MISSING,
+        COST_RECONCILIATION_FAILED,
+    }
+)
+
+# Codes that block live-order review only. Prior paper evidence, static IP,
+# broker-balance knowledge/sufficiency and proven live tradability are
+# live-review concerns; none is genuinely required for read-only feed access
+# or theoretical shadow decisions.
 LIVE_ONLY_CODES = frozenset(
     {
+        PAPER_EVIDENCE_MISSING,
         STATIC_IP_MISSING,
+        BROKER_BALANCE_UNKNOWN,
         INSUFFICIENT_BALANCE,
         LIVE_TRADABILITY_UNPROVEN,
     }
@@ -164,11 +208,11 @@ class FeedHealthEvidence:
 class LiveMarketReadinessInputs:
     """All evidence required by the gate. Every field is mandatory input.
 
-    Nullable fields mean "explicitly missing evidence" and fail closed; they
-    are not hidden defaults. Thresholds (``max_quote_age_seconds``,
-    ``cost_tolerance_inr``) have no defaults and must be caller-supplied.
-    Auth is a boolean only: this type cannot carry a token value, prefix, or
-    length.
+    Nullable fields mean "explicitly missing evidence" and fail closed at the
+    scope that requires them; they are not hidden defaults. Thresholds
+    (``max_quote_age_seconds``, ``cost_tolerance_inr``) have no defaults and
+    must be caller-supplied. Auth is a boolean only: this type cannot carry a
+    token value, prefix, or length.
     """
 
     token_present: bool
@@ -192,6 +236,7 @@ class LiveMarketReadinessInputs:
     cost_tolerance_inr: Decimal
     pit_complete: bool
     historical_validation: HistoricalDatasetValidation | None
+    strategy_evidence_present: bool
     paper_evidence: PaperTradingEvidence | None
     kill_switch_engaged: bool
     live_orders_called: bool
@@ -223,6 +268,8 @@ class LiveMarketReadinessInputs:
             raise ValueError("cost_tolerance_inr must be a non-negative finite Decimal")
         if not isinstance(self.pit_complete, bool):
             raise TypeError("pit_complete must be boolean")
+        if not isinstance(self.strategy_evidence_present, bool):
+            raise TypeError("strategy_evidence_present must be boolean")
         if not isinstance(self.kill_switch_engaged, bool):
             raise TypeError("kill_switch_engaged must be boolean")
         if not isinstance(self.live_orders_called, bool):
@@ -238,13 +285,15 @@ class LiveMarketReadinessInputs:
 class ReasonDetail:
     code: str
     message: str
-    blocks_shadow: bool
+    blocks_infra: bool
+    blocks_research_shadow: bool
 
     def as_dict(self) -> dict[str, object]:
         return {
             "code": self.code,
             "message": self.message,
-            "blocks_shadow": self.blocks_shadow,
+            "blocks_infra": self.blocks_infra,
+            "blocks_research_shadow": self.blocks_research_shadow,
         }
 
 
@@ -282,11 +331,23 @@ class LiveMarketReadinessReport:
             raise TypeError("checked_at_ist must be a datetime")
 
     @property
-    def shadow_ready(self) -> bool:
+    def infra_ready(self) -> bool:
         return self.classification in (
-            ReadinessClassification.READY_FOR_SHADOW,
+            ReadinessClassification.READY_FOR_SHADOW_INFRA,
+            ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
             ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW,
         )
+
+    @property
+    def research_shadow_ready(self) -> bool:
+        return self.classification in (
+            ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+            ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW,
+        )
+
+    @property
+    def shadow_ready(self) -> bool:
+        return self.infra_ready
 
     @property
     def live_review_ready(self) -> bool:
@@ -315,6 +376,8 @@ class LiveMarketReadinessReport:
                 if self.effective_capital_rupees is not None
                 else None
             ),
+            "infra_ready": self.infra_ready,
+            "research_shadow_ready": self.research_shadow_ready,
             "shadow_ready": self.shadow_ready,
             "live_review_ready": self.live_review_ready,
             "live_orders_called": False,
@@ -341,12 +404,14 @@ def _parse_quote_timestamp(raw: object) -> datetime | None:
 
 
 def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMarketReadinessReport:
-    """Evaluate the Monday live-market shadow readiness gate.
+    """Evaluate the Monday live-market shadow readiness gate across three scopes.
 
-    Fails closed: any missing or stale evidence yields
-    ``NOT_READY_FOR_SHADOW`` unless the only failures are live-only codes,
-    which yield ``READY_FOR_SHADOW``. A fully evidenced run yields
-    ``READY_FOR_LIVE_ORDER_REVIEW``, which is still NOT authorization to trade.
+    Fails closed per scope: infra-blocking evidence yields
+    ``NOT_READY_FOR_SHADOW``; research-only gaps yield
+    ``READY_FOR_SHADOW_INFRA``; live-only gaps yield
+    ``READY_FOR_RESEARCH_SHADOW``. A fully evidenced run yields
+    ``READY_FOR_LIVE_ORDER_REVIEW``, which is still NOT authorization to
+    trade.
 
     Raises:
         LiveOrderAttemptError: if ``live_orders_called`` is True.
@@ -355,14 +420,24 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
     if inputs.live_orders_called:
         raise LiveOrderAttemptError("live orders are strictly forbidden in readiness")
 
-    shadow_blocking: list[str] = []
+    infra_blocking: list[str] = []
+    research_blocking: list[str] = []
     live_blocking: list[str] = []
 
     def add(code: str) -> None:
         if code not in ALL_REASON_CODES:
             raise ValueError(f"unknown reason code {code!r}")
-        target = live_blocking if code in LIVE_ONLY_CODES else shadow_blocking
-        if code not in target and code not in shadow_blocking and code not in live_blocking:
+        if code in LIVE_ONLY_CODES:
+            target = live_blocking
+        elif code in RESEARCH_ONLY_CODES:
+            target = research_blocking
+        else:
+            target = infra_blocking
+        if (
+            code not in infra_blocking
+            and code not in research_blocking
+            and code not in live_blocking
+        ):
             target.append(code)
 
     # Auth: PRESENT/ABSENT only. The token value is never accepted here.
@@ -519,6 +594,8 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
         add(TICK_SIZE_UNVERIFIED)
 
     # Approved capital is explicit; broker balance can never raise it.
+    # Balance knowledge/sufficiency is a live-review concern only: infra and
+    # research shadow run theoretical decisions on approved capital.
     approved = (
         inputs.approved_capital.amount_rupees if inputs.approved_capital is not None else None
     )
@@ -537,7 +614,9 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
     elif approved is not None:
         effective = approved
 
-    # Cost-reconciliation readiness (reuses CostReconciliationEvidence).
+    # Scenario cost identity/reconciliation policy (reuses
+    # CostReconciliationEvidence). Required for research shadow and live
+    # review; pure plumbing shadow has no cost-policy requirement.
     cost = inputs.cost_evidence
     if cost is None:
         add(COST_RECONCILIATION_MISSING)
@@ -545,14 +624,22 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
         if cost.status != "PASS" or cost.max_reconciliation_error_inr > inputs.cost_tolerance_inr:
             add(COST_RECONCILIATION_FAILED)
 
-    # Historical evidence readiness + PIT completeness.
+    # Historical research evidence: PIT completeness plus dataset validation.
+    # Required for research shadow and live review, never for pure infra.
     if not inputs.pit_complete:
         add(PIT_EVIDENCE_INCOMPLETE)
     validation = inputs.historical_validation
     if validation is None or not validation.passed:
         add(HISTORICAL_EVIDENCE_MISSING)
 
-    # Paper/shadow evidence readiness (reuses PaperTradingEvidence).
+    # Selected research strategy/experiment evidence. Required for research
+    # shadow and live review, never for pure infra plumbing.
+    if not inputs.strategy_evidence_present:
+        add(STRATEGY_EVIDENCE_MISSING)
+
+    # Paper/shadow evidence readiness (reuses PaperTradingEvidence). Required
+    # for live-order review only: the first shadow sessions are what create
+    # this evidence, so requiring it earlier would be circular.
     if inputs.paper_evidence is None:
         add(PAPER_EVIDENCE_MISSING)
 
@@ -560,19 +647,22 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
     if inputs.kill_switch_engaged:
         add(KILL_SWITCH_ENGAGED)
 
-    if shadow_blocking:
+    if infra_blocking:
         classification = ReadinessClassification.NOT_READY_FOR_SHADOW
+    elif research_blocking:
+        classification = ReadinessClassification.READY_FOR_SHADOW_INFRA
     elif live_blocking:
-        classification = ReadinessClassification.READY_FOR_SHADOW
+        classification = ReadinessClassification.READY_FOR_RESEARCH_SHADOW
     else:
         classification = ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW
 
-    ordered_codes = tuple(sorted(set(shadow_blocking) | set(live_blocking)))
+    ordered_codes = tuple(sorted(set(infra_blocking) | set(research_blocking) | set(live_blocking)))
     reasons = tuple(
         ReasonDetail(
             code=code,
             message=REASON_MESSAGES[code],
-            blocks_shadow=code not in LIVE_ONLY_CODES,
+            blocks_infra=code not in RESEARCH_ONLY_CODES and code not in LIVE_ONLY_CODES,
+            blocks_research_shadow=code not in LIVE_ONLY_CODES,
         )
         for code in ordered_codes
     )
@@ -631,10 +721,12 @@ __all__ = [
     "QUOTE_TIMESTAMP_INVALID",
     "REASON_MESSAGES",
     "REQUIRED_TIMEZONE",
+    "RESEARCH_ONLY_CODES",
     "SCHEMA_VERSION",
     "SESSION_BOUNDARY_VIOLATED",
     "SESSION_CLOSED",
     "STATIC_IP_MISSING",
+    "STRATEGY_EVIDENCE_MISSING",
     "SUSPENSION_ACTIVE",
     "SUSPENSION_CONFLICT",
     "TICK_SIZE_UNVERIFIED",
