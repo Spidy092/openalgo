@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
+from equity_engine.live_market_readiness import build_synthetic_readiness_report
 from equity_engine.shadow_live_runner import (
     FeedMode,
     RunnerMode,
@@ -59,13 +62,26 @@ def _config(tmp_path: Path, **overrides) -> ShadowLiveConfig:
 def _run_session(
     tmp_path: Path, batches: list[dict[str, dict[str, object]]], times: list[str]
 ) -> Path:
-    from datetime import datetime
-
     moments = [datetime.fromisoformat(item) for item in times]
+    config = _config(tmp_path, max_polls=len(batches))
+    config = replace(
+        config,
+        readiness_report=build_synthetic_readiness_report(
+            checked_at_ist=moments[0],
+            trade_date=moments[0].date(),
+            instrument_keys=config.instrument_keys,
+            cas_eligible_by_key=config.cas_eligible_by_key,
+            tick_size_by_key=config.tick_size_by_key,
+            exit_buffer_minutes=config.exit_buffer_minutes,
+            approved_capital=config.approved_capital(),
+            quote_freshness_threshold_seconds=config.quote_freshness_threshold_seconds,
+        ),
+    )
     runner = ShadowLiveRunner(
-        config=_config(tmp_path, max_polls=len(batches)),
+        config=config,
         source=SyntheticQuoteSource(batches),
         now=lambda: moments.pop(0),
+        session_day=moments[0].date(),
     )
     runner.run()
     out = tmp_path / "out"
@@ -159,13 +175,26 @@ def test_reconnect_duplicate_out_of_order_degrade() -> None:
 
 def test_cas_uncertainty_blocks_trades(tmp_path: Path) -> None:
     config = _config(tmp_path, cas_eligible_by_key=((KEY, True),), max_polls=1)
-    from datetime import datetime
-
-    moments = [datetime.fromisoformat("2026-09-08T15:16:05+05:30")]
+    moment = datetime.fromisoformat("2026-09-08T15:16:05+05:30")
+    config = replace(
+        config,
+        readiness_report=build_synthetic_readiness_report(
+            checked_at_ist=moment,
+            trade_date=moment.date(),
+            instrument_keys=config.instrument_keys,
+            cas_eligible_by_key=config.cas_eligible_by_key,
+            tick_size_by_key=config.tick_size_by_key,
+            exit_buffer_minutes=config.exit_buffer_minutes,
+            approved_capital=config.approved_capital(),
+            quote_freshness_threshold_seconds=config.quote_freshness_threshold_seconds,
+        ),
+    )
+    moments = [moment]
     runner = ShadowLiveRunner(
         config=config,
         source=SyntheticQuoteSource([{KEY: _quote("2026-09-08T15:16:00+05:30", 100)}]),
         now=lambda: moments.pop(0),
+        session_day=moment.date(),
     )
     runner.run()
     out = tmp_path / "out"

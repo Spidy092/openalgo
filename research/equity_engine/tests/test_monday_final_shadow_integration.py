@@ -5,20 +5,32 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from equity_engine.experiment import CostReconciliationEvidence
+from equity_engine.historical_validation import (
+    DailyIntradayValidation,
+    HistoricalDatasetValidation,
+)
 from equity_engine.live_market_readiness import (
     CAS_POLICY_UNKNOWN,
     FEED_GAP_DETECTED,
     FEED_UNAVAILABLE,
     QUOTE_STALE,
+    FeedHealthEvidence,
     LiveMarketReadinessReport,
     ReadinessClassification,
     ReasonDetail,
     build_synthetic_readiness_report,
+)
+from equity_engine.monday_readiness_probe import (
+    MondayProbeConfig,
+    ProbeMode,
+    run_live_read_only,
 )
 from equity_engine.shadow_live_runner import (
     READINESS_CONTEXT_MISMATCH,
@@ -34,6 +46,8 @@ from equity_engine.shadow_live_runner import (
     scan_output_for_credentials,
     verify_persisted_replay,
 )
+from equity_engine.upstox_market_context import QuoteBatchResult
+from equity_engine.upstox_readiness import ReadinessCheck, UpstoxReadinessSnapshot
 
 IST = ZoneInfo("Asia/Kolkata")
 TRADE_DATE = date(2026, 9, 7)
@@ -63,6 +77,7 @@ def _config(
     trade_date: date = TRADE_DATE,
     capital: str = "100000",
     cas_eligible: bool = False,
+    exit_buffer_minutes: int = 15,
     max_polls: int = 3,
 ) -> ShadowLiveConfig:
     config = ShadowLiveConfig(
@@ -76,7 +91,7 @@ def _config(
         quote_freshness_threshold_seconds=60.0,
         expected_cadence_seconds=300.0,
         approved_capital_rupees=capital,
-        exit_buffer_minutes=15,
+        exit_buffer_minutes=exit_buffer_minutes,
         strategy_name="always",
         output_dir=str(tmp_path / "shadow"),
         mode=RunnerMode.LIVE_READ_ONLY,
@@ -134,6 +149,136 @@ def _normal_batches(
     ]
     times = [first + timedelta(minutes=5 * index, seconds=5) for index in range(count)]
     return batches, times
+
+
+def _probe_bod_row() -> dict[str, object]:
+    return {
+        "segment": "NSE_EQ",
+        "name": "RELIANCE INDUSTRIES",
+        "exchange": "NSE",
+        "isin": "INE002A01018",
+        "instrument_type": "EQ",
+        "instrument_key": KEY,
+        "exchange_token": 2885,
+        "lot_size": 1,
+        "freeze_quantity": 100000,
+        "tick_size": 5,
+        "trading_symbol": "RELIANCE",
+        "series": "EQ",
+        "security_type": "NORMAL",
+        "cas_eligible": False,
+    }
+
+
+def _probe_historical() -> HistoricalDatasetValidation:
+    per_day = DailyIntradayValidation(
+        trade_date=TRADE_DATE,
+        row_count=2,
+        first_timestamp="2026-09-07 09:15:00+05:30",
+        last_timestamp="2026-09-07 09:20:00+05:30",
+        duplicate_count=0,
+        continuous_session_rows=2,
+        cas_auxiliary_rows=0,
+        cas_auxiliary_timestamps=(),
+        missing_expected_slots=(),
+        unexpected_timestamps=(),
+        timezone="Asia/Kolkata",
+        ohlcv_violations=(),
+        session_rule={"rule_id": "synthetic-normal-session"},
+    )
+    return HistoricalDatasetValidation(
+        rows=2,
+        trading_dates=(TRADE_DATE,),
+        per_day=(per_day,),
+        structural_violations=(),
+        deterministic_data_fingerprint="d" * 64,
+        manifest_fingerprint_reference="m" * 64,
+        fingerprint_schema="equity-market-data-v2",
+        manifest_reference="synthetic-validated-dataset",
+        timezone="Asia/Kolkata",
+        calendar_evidence=None,
+    )
+
+
+def _probe_quote(timestamp: datetime) -> QuoteBatchResult:
+    return QuoteBatchResult(
+        requested_instrument_keys=(KEY,),
+        quotes={
+            KEY: {
+                "instrument_token": KEY,
+                "timestamp": timestamp.isoformat(),
+                "last_price": "100",
+                "prev_close_price": "100",
+                "ohlc": {"open": "100", "high": "100.15", "low": "99.95", "close": "100.1"},
+            }
+        },
+        failures={},
+        request_count=1,
+    )
+
+
+def _probe_readiness_report(checked_at: datetime):
+    config = MondayProbeConfig(
+        mode=ProbeMode.LIVE_READ_ONLY,
+        instrument_key=KEY,
+        approved_capital_rupees=Decimal(100000),
+        cost_tolerance_inr=Decimal("0.01"),
+        max_quote_age_seconds=60.0,
+        exit_buffer_minutes=59,
+        tick_size_scale_rupees_per_raw_unit=Decimal("0.01"),
+        tick_reference_price_rupees=Decimal(500),
+        pit_complete=True,
+        historical_validation=_probe_historical(),
+        strategy_evidence_present=True,
+        cost_evidence=CostReconciliationEvidence(
+            artifact_fingerprint="cost-artifact-synthetic",
+            schema_version="upstox-cost-reconciliation/v1",
+            cost_model_name="documented",
+            orders_checked=1,
+            passed_count=1,
+            failed_count=0,
+            max_reconciliation_error_inr=Decimal("0.00"),
+            tolerance_inr=Decimal("0.01"),
+            status="PASS",
+        ),
+        paper_evidence=None,
+        feed=FeedHealthEvidence(
+            available=True,
+            gap_detected=False,
+            last_heartbeat_ist=checked_at,
+        ),
+        kill_switch_engaged=False,
+    )
+    snapshot = UpstoxReadinessSnapshot(
+        checks=tuple(
+            ReadinessCheck(name=name, passed=True, detail="synthetic")
+            for name in (
+                "profile_api",
+                "nse_enabled",
+                "intraday_product_enabled",
+                "funds_api",
+                "minimum_test_capital_present",
+                "primary_static_ip",
+            )
+        ),
+        available_to_trade=Decimal(150000),
+        exchanges=("NSE",),
+        products=("D",),
+        primary_static_ip_configured=True,
+        secondary_static_ip_configured=False,
+    )
+    result = run_live_read_only(
+        config,
+        token_present=True,
+        now_ist=checked_at,
+        readiness_snapshot=snapshot,
+        quotes=_probe_quote(checked_at - timedelta(seconds=5)),
+        bod_rows=(_probe_bod_row(),),
+        mis_rows=({"instrument_key": KEY},),
+        suspended_rows=(),
+    )
+    assert result.report is not None
+    return result
 
 
 def _runner(
@@ -314,3 +459,82 @@ def test_shadow_surface_has_no_broker_order_api_or_credential_persistence() -> N
     assert all(name not in source_text for name in ("place_order", "modify_order", "cancel_order"))
     assert "UPSTOX_ACCESS_TOKEN" in source_text
     assert "live_orders_called" in source_text
+
+
+def test_monday_probe_to_shadow_rehearsal_persists_healthy_trade_and_replays(
+    tmp_path: Path,
+) -> None:
+    checked_at = datetime(2026, 9, 7, 14, 30, 5, tzinfo=IST)
+    probe = _probe_readiness_report(checked_at)
+    assert probe.report is not None
+    assert probe.report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
+    assert probe.live_orders_called is False
+
+    config = _config(
+        tmp_path,
+        checked_at=checked_at,
+        exit_buffer_minutes=59,
+        max_polls=4,
+    )
+    config = replace(config, readiness_report=probe.report)
+    bar_times = (
+        datetime(2026, 9, 7, 14, 30, tzinfo=IST),
+        datetime(2026, 9, 7, 14, 30, 5, tzinfo=IST),
+        datetime(2026, 9, 7, 14, 30, 10, tzinfo=IST),
+        datetime(2026, 9, 7, 14, 31, tzinfo=IST),
+    )
+    received_times = tuple(item + timedelta(seconds=5) for item in bar_times)
+    runner = ShadowLiveRunner(
+        config=config,
+        source=SyntheticQuoteSource(
+            [{KEY: _quote(item, 100 + index)} for index, item in enumerate(bar_times)]
+        ),
+        now=iter(received_times).__next__,
+        session_day=TRADE_DATE,
+    )
+
+    reports = runner.run()
+    output = tmp_path / "monday-rehearsal"
+    summary = runner.persist(output)
+    replay = verify_persisted_replay(output, config=config, session_day=TRADE_DATE)
+
+    assert len(reports[KEY].trades) == 1
+    assert reports[KEY].trades[0].label == "theoretical_never_broker_confirmed"
+    assert summary["live_orders_called"] is False
+    assert runner.health_report is not None
+    assert runner.health_report.status.value == "HEALTHY"
+    assert runner.health_report.theoretical_trades_count == 1
+    assert json.loads((output / "health-report.json").read_text())["status"] == "HEALTHY"
+    assert replay["matched"] == {KEY: True}
+
+
+def test_degraded_health_stops_new_theoretical_trade_generation(tmp_path: Path) -> None:
+    config = _config(tmp_path, max_polls=4)
+    batches = [
+        {KEY: _quote(datetime(2026, 9, 7, 9, 15, tzinfo=IST), 100)},
+        {KEY: _quote(datetime(2026, 9, 7, 9, 20, tzinfo=IST), 101)},
+        {KEY: _quote(datetime(2026, 9, 7, 9, 30, tzinfo=IST), 102)},
+        {KEY: _quote(datetime(2026, 9, 7, 9, 35, tzinfo=IST), 103)},
+    ]
+    received = [
+        datetime(2026, 9, 7, 9, 15, 5, tzinfo=IST),
+        datetime(2026, 9, 7, 9, 20, 5, tzinfo=IST),
+        datetime(2026, 9, 7, 9, 30, 5, tzinfo=IST),
+        datetime(2026, 9, 7, 9, 35, 5, tzinfo=IST),
+    ]
+    runner = ShadowLiveRunner(
+        config=config,
+        source=SyntheticQuoteSource(batches),
+        now=iter(received).__next__,
+        session_day=TRADE_DATE,
+    )
+
+    reports = runner.run()
+
+    assert len(reports[KEY].decisions) == 3
+    assert reports[KEY].decisions[-1].reason == "feed_gap_no_trade"
+    assert reports[KEY].trades == ()
+    assert runner.health_report is not None
+    assert runner.health_report.status.value == "DEGRADED_NO_TRADING"
+    assert runner.health_report.allow_new_theoretical_trades is False
+    assert runner.health_report.live_orders_called is False

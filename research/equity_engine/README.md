@@ -76,9 +76,22 @@ command, document, or evidence artifact:
 ```bash
 export UPSTOX_ACCESS_TOKEN
 
-# Preflight/readiness: produce data/monday-shadow-v2/readiness-report.json
-# with the canonical readiness evaluator. STOP unless its classification is
-# READY_FOR_RESEARCH_SHADOW or READY_FOR_LIVE_ORDER_REVIEW.
+# Preflight/readiness: write the credential-free probe envelope to
+# data/monday-shadow-v2/readiness-report.json using the canonical evaluator.
+uv run python scripts/monday_readiness_probe.py \
+  --mode live-read-only \
+  --instrument-key 'NSE_EQ|INE002A01018' \
+  --approved-capital 100000 \
+  --cost-tolerance 0.01 \
+  --max-quote-age-seconds 60 \
+  --exit-buffer-minutes 15 \
+  --tick-size-scale 0.01 \
+  --tick-reference-price 500 \
+  --feed-status available \
+  --output data/monday-shadow-v2/readiness-report.json
+# STOP unless the persisted canonical report classification is
+# READY_FOR_RESEARCH_SHADOW or READY_FOR_LIVE_ORDER_REVIEW. The shadow CLI
+# unwraps this envelope and validates the same canonical report.
 
 # Synthetic rehearsal; no network and no broker credential is used.
 uv run python scripts/shadow_live.py \
@@ -98,7 +111,8 @@ uv run python scripts/shadow_live.py \
 
 Evidence is written below the selected output directory, including
 `readiness-report.json`, `market_events.jsonl`, `decisions.jsonl`,
-`trades.jsonl`, `summary.json`, and `CHECKSUMS.sha256`. STOP on any readiness,
+`trades.jsonl`, `summary.json`, `health-report.json`, and `CHECKSUMS.sha256`.
+STOP on any readiness,
 CAS, stale-feed, feed-gap, credential, or polling failure. All outputs remain
 theoretical and record `live_orders_called=false`; even
 `READY_FOR_LIVE_ORDER_REVIEW` is evidence only and cannot enable broker orders.

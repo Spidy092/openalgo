@@ -83,6 +83,13 @@ from .shadow_execution import (
     replay_shadow_session,
     shadow_event_fingerprint,
 )
+from .shadow_session_health import (
+    HealthStatus,
+    HealthThresholds,
+    ShadowSessionHealthReport,
+    check_persisted_session,
+    evaluate_session_health,
+)
 from .upstox_market_context import UpstoxFullQuoteV3Client
 
 SCHEMA_VERSION = "shadow-live-runner/v1"
@@ -461,6 +468,8 @@ class ShadowLiveRunner:
         self._normalized: list[NormalizedLiveEvent] = []
         self._saw_failure = False
         self._shadow_strategy_enabled = False
+        self._health_report: ShadowSessionHealthReport | None = None
+        self._recovery_observation_reasons: list[str] = []
 
     def _validate_readiness(self, now: datetime | None = None) -> LiveMarketReadinessReport:
         report = self._readiness_report
@@ -549,6 +558,55 @@ class ShadowLiveRunner:
     def normalized(self) -> tuple[NormalizedLiveEvent, ...]:
         return tuple(self._normalized)
 
+    @property
+    def health_report(self) -> ShadowSessionHealthReport | None:
+        """Latest read-only health gate for this bounded run."""
+
+        return self._health_report
+
+    def _decision_reasons(self) -> tuple[str, ...]:
+        return tuple(
+            decision.reason
+            for engine in self._engines.values()
+            for decision in engine.report().decisions
+        )
+
+    def _theoretical_trade_count(self) -> int:
+        return sum(len(engine.report().trades) for engine in self._engines.values())
+
+    def _update_health(
+        self,
+        *,
+        now: datetime,
+        last_quote_age_seconds: float | None = None,
+    ) -> ShadowSessionHealthReport:
+        report = evaluate_session_health(
+            session_id=self._config.session_id,
+            runner_started=True,
+            runner_stopped=False,
+            killed=False,
+            disk_error=False,
+            persistence_ok=True,
+            checksums_ok=True,
+            reports_ok=True,
+            normalized_feed_statuses=tuple(item.feed_status for item in self._normalized),
+            normalized_received_ats=tuple(item.received_timestamp for item in self._normalized),
+            normalized_reconnects=tuple(item.reconnect_boundary for item in self._normalized),
+            decision_reasons=self._decision_reasons() + tuple(self._recovery_observation_reasons),
+            decisions_count=sum(
+                len(engine.report().decisions) for engine in self._engines.values()
+            ),
+            theoretical_trades_count=self._theoretical_trade_count(),
+            expected_cadence_seconds=self._config.expected_cadence_seconds,
+            last_quote_age_seconds=last_quote_age_seconds,
+            now_iso=now.isoformat(),
+            thresholds=HealthThresholds(
+                freshness_seconds=self._config.quote_freshness_threshold_seconds,
+            ),
+        )
+        self._health_report = report
+        return report
+
     def run(self) -> dict[str, ShadowSessionReport]:
         first_received = self._now()
         report = self._validate_readiness(first_received)
@@ -583,6 +641,7 @@ class ShadowLiveRunner:
                             reason=f"poll_failure_no_trade: {type(exc).__name__}",
                         )
                     )
+                self._update_health(now=received)
                 self._sleep(self._config.poll_interval_seconds)
                 continue
             reconnect = self._saw_failure
@@ -607,6 +666,7 @@ class ShadowLiveRunner:
                             reason="missing_instrument_no_trade",
                         )
                     )
+                    self._update_health(now=received)
                     continue
                 normalized = normalize_quote(
                     instrument_key=key,
@@ -630,8 +690,37 @@ class ShadowLiveRunner:
                         reason=normalized.reason,
                     )
                 self._normalized.append(normalized)
-                if normalized.event is not None and self._shadow_strategy_enabled:
+                health = self._update_health(
+                    now=received,
+                    last_quote_age_seconds=normalized.quote_age_seconds,
+                )
+                safe_evidence = normalized.feed_status == "cas_auxiliary" or (
+                    normalized.quote_age_seconds is not None
+                    and normalized.quote_age_seconds
+                    > self._config.quote_freshness_threshold_seconds
+                )
+                if (
+                    normalized.event is not None
+                    and self._shadow_strategy_enabled
+                    and (health.status is HealthStatus.HEALTHY or safe_evidence)
+                    and not normalized.reconnect_boundary
+                ):
                     self._engines[key].process(normalized.event)
+                elif (
+                    normalized.event is not None
+                    and self._shadow_strategy_enabled
+                    and health.status is not HealthStatus.HEALTHY
+                    and normalized.feed_status == "ok"
+                    and not normalized.reconnect_boundary
+                    and normalized.quote_age_seconds is not None
+                    and normalized.quote_age_seconds
+                    <= self._config.quote_freshness_threshold_seconds
+                ):
+                    self._recovery_observation_reasons.append("recovery_observation_ok")
+                self._update_health(
+                    now=received,
+                    last_quote_age_seconds=normalized.quote_age_seconds,
+                )
             self._sleep(self._config.poll_interval_seconds)
         return {key: engine.report() for key, engine in self._engines.items()}
 
@@ -701,15 +790,7 @@ class ShadowLiveRunner:
                 json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-        checksums: dict[str, str] = {}
-        for path in sorted(output_dir.iterdir()):
-            if path.is_file():
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-                checksums[path.name] = digest
-        (output_dir / "CHECKSUMS.sha256").write_text(
-            "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
-            encoding="utf-8",
-        )
+
         summary = {
             "schema_version": SCHEMA_VERSION,
             "session_id": self._config.session_id,
@@ -723,9 +804,39 @@ class ShadowLiveRunner:
             },
             "live_orders_called": False,
         }
-        (output_dir / "summary.json").write_text(
+        summary_path = output_dir / "summary.json"
+        summary_path.write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+
+        def _write_checksums() -> None:
+            checksums: dict[str, str] = {}
+            for path in sorted(output_dir.iterdir()):
+                if path.is_file() and path.name != "CHECKSUMS.sha256":
+                    checksums[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            (output_dir / "CHECKSUMS.sha256").write_text(
+                "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
+                encoding="utf-8",
+            )
+
+        _write_checksums()
+        health_now = (
+            self._normalized[-1].received_timestamp
+            if self._normalized
+            else self._readiness_report.checked_at_ist.isoformat()
+        )
+        self._health_report = check_persisted_session(output_dir, now_iso=health_now)
+        health_payload = self._health_report.as_dict()
+        health_payload["fingerprint"] = self._health_report.fingerprint()
+        (output_dir / "health-report.json").write_text(
+            json.dumps(health_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        summary["health_status"] = self._health_report.status.value
+        summary["health_report_fingerprint"] = self._health_report.fingerprint()
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _write_checksums()
         return summary
 
 

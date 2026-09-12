@@ -155,6 +155,10 @@ def main() -> int:
         readiness_payload = json.loads(args.readiness_report.read_text(encoding="utf-8"))
         if not isinstance(readiness_payload, dict):
             raise TypeError("report root must be an object")
+        # monday_readiness_probe persists a credential-free result envelope;
+        # consume its one canonical report without introducing a second model.
+        if isinstance(readiness_payload.get("report"), dict):
+            readiness_payload = readiness_payload["report"]
         readiness_report = LiveMarketReadinessReport.from_dict(readiness_payload)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         print("READINESS_REPORT_INVALID", file=sys.stderr)
