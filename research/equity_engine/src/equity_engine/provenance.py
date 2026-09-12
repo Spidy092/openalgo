@@ -8,8 +8,26 @@ from typing import Any
 
 import pandas as pd
 
-
 FINGERPRINT_SCHEMA = "equity-market-data-v2"
+
+
+def canonical_sha256(payload: Any) -> str:
+    """Return a deterministic SHA-256 for JSON-compatible provenance payloads."""
+
+    encoded = json.dumps(
+        _canonical_value(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def bytes_sha256(payload: bytes) -> str:
+    """Return the SHA-256 of an immutable raw artifact byte sequence."""
+
+    if not isinstance(payload, bytes):
+        raise TypeError("raw artifact payload must be bytes")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)

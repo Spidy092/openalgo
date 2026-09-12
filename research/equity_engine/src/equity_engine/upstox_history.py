@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import quote
@@ -13,6 +15,34 @@ from .provenance import MarketDataManifest, dataframe_fingerprint, validate_ohlc
 
 UPSTOX_HISTORY_DOC = "https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/"
 UPSTOX_HISTORY_BASE = "https://api.upstox.com/v3/historical-candle"
+_HISTORY_COLUMNS = [
+    "timestamp",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_interest",
+]
+
+
+@dataclass(frozen=True)
+class HistoricalChunk:
+    """One raw Upstox response and its normalized candle frame.
+
+    ``raw_payload`` is the exact response body received from the provider. The batch layer
+    persists it write-once and uses ``raw_sha256`` as the immutable chunk identity.
+    """
+
+    start: date
+    end: date
+    frame: pd.DataFrame
+    raw_payload: bytes
+    request_url: str
+
+    @property
+    def raw_sha256(self) -> str:
+        return hashlib.sha256(self.raw_payload).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -20,6 +50,37 @@ class HistoricalDataset:
     frame: pd.DataFrame
     manifest: MarketDataManifest
     fingerprint: str
+    chunks: tuple[HistoricalChunk, ...] = ()
+
+
+def candles_from_raw_payload(raw_payload: bytes) -> list[list[object]]:
+    """Decode one captured response without making a network call."""
+
+    if not isinstance(raw_payload, bytes) or not raw_payload:
+        raise ValueError("raw historical response must be non-empty bytes")
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("raw historical response is not valid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        raise ValueError("raw historical response does not have successful Upstox status")
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("candles"), list):
+        raise TypeError("raw historical response did not contain data.candles")
+    return data["candles"]
+
+
+def frame_from_candles(candles: Iterable[object]) -> pd.DataFrame:
+    """Normalize captured candle rows into the provider's canonical frame shape."""
+
+    rows = list(candles)
+    frame = pd.DataFrame(rows, columns=_HISTORY_COLUMNS)
+    if frame.empty:
+        frame = pd.DataFrame(columns=_HISTORY_COLUMNS).set_index("timestamp")
+        frame.index = pd.DatetimeIndex([], name="timestamp")
+        return frame
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False)
+    return frame.set_index("timestamp").sort_index()
 
 
 class UpstoxHistoricalDataProvider:
@@ -55,6 +116,49 @@ class UpstoxHistoricalDataProvider:
         self._monotonic = monotonic
         self._last_request_at: float | None = None
 
+    def _validate_request(
+        self,
+        *,
+        start: date,
+        end: date,
+        interval_minutes: int,
+    ) -> None:
+        if interval_minutes < 1 or interval_minutes > 15:
+            raise ValueError("this loader currently supports 1-15 minute V3 intervals")
+        if start > end:
+            raise ValueError("start must be on or before end")
+        if start < date(2022, 1, 1):
+            raise ValueError("Upstox documents minute history availability from January 2022")
+
+    def fetch_minute_chunk(
+        self,
+        *,
+        instrument_token: str,
+        start: date,
+        end: date,
+        interval_minutes: int,
+    ) -> HistoricalChunk:
+        """Fetch one bounded raw chunk for the resumable batch layer."""
+
+        self._validate_request(start=start, end=end, interval_minutes=interval_minutes)
+        candles, raw_payload, request_url = self._fetch_chunk(
+            instrument_token=instrument_token,
+            start=start,
+            end=end,
+            interval_minutes=interval_minutes,
+        )
+        frame = frame_from_candles(candles)
+        violations = validate_ohlcv_frame(frame)
+        if violations and not frame.empty:
+            raise ValueError("invalid Upstox historical dataset: " + "; ".join(violations))
+        return HistoricalChunk(
+            start=start,
+            end=end,
+            frame=frame,
+            raw_payload=raw_payload,
+            request_url=request_url,
+        )
+
     def fetch_minutes(
         self,
         *,
@@ -67,21 +171,16 @@ class UpstoxHistoricalDataProvider:
         universe_rule_version: str,
         adjustment_policy: str,
     ) -> HistoricalDataset:
-        if interval_minutes < 1 or interval_minutes > 15:
-            raise ValueError("this loader currently supports 1-15 minute V3 intervals")
-        if start > end:
-            raise ValueError("start must be on or before end")
-        if start < date(2022, 1, 1):
-            raise ValueError("Upstox documents minute history availability from January 2022")
+        self._validate_request(start=start, end=end, interval_minutes=interval_minutes)
 
-        all_rows: list[list[object]] = []
+        chunks: list[HistoricalChunk] = []
         chunk_start = start
         # Upstox caps 1-15 minute retrieval at one month. 28-day inclusive windows remain
         # safely inside that documented maximum without making calendar-month assumptions.
         while chunk_start <= end:
             chunk_end = min(chunk_start + timedelta(days=27), end)
-            all_rows.extend(
-                self._fetch_chunk(
+            chunks.append(
+                self.fetch_minute_chunk(
                     instrument_token=instrument_token,
                     start=chunk_start,
                     end=chunk_end,
@@ -90,15 +189,10 @@ class UpstoxHistoricalDataProvider:
             )
             chunk_start = chunk_end + timedelta(days=1)
 
-        if not all_rows:
+        non_empty = [chunk.frame for chunk in chunks if not chunk.frame.empty]
+        if not non_empty:
             raise ValueError("Upstox returned no candles for requested range")
-
-        frame = pd.DataFrame(
-            all_rows,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "open_interest"],
-        )
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=False)
-        frame = frame.set_index("timestamp").sort_index()
+        frame = pd.concat(non_empty).sort_index()
 
         violations = validate_ohlcv_frame(frame)
         if violations:
@@ -120,7 +214,12 @@ class UpstoxHistoricalDataProvider:
             source_reference=UPSTOX_HISTORY_DOC,
         )
         fingerprint = dataframe_fingerprint(frame, manifest)
-        return HistoricalDataset(frame=frame, manifest=manifest, fingerprint=fingerprint)
+        return HistoricalDataset(
+            frame=frame,
+            manifest=manifest,
+            fingerprint=fingerprint,
+            chunks=tuple(chunks),
+        )
 
     def _fetch_chunk(
         self,
@@ -129,7 +228,7 @@ class UpstoxHistoricalDataProvider:
         start: date,
         end: date,
         interval_minutes: int,
-    ) -> list[list[object]]:
+    ) -> tuple[list[list[object]], bytes, str]:
         encoded_instrument = quote(instrument_token, safe="")
         url = (
             f"{UPSTOX_HISTORY_BASE}/{encoded_instrument}/minutes/{interval_minutes}/"
@@ -141,14 +240,9 @@ class UpstoxHistoricalDataProvider:
         }
 
         response = self._request_with_retry(url, headers=headers)
-        payload = response.json()
-        if payload.get("status") != "success":
-            raise RuntimeError(f"unexpected Upstox history response: {payload!r}")
-
-        candles = payload.get("data", {}).get("candles")
-        if candles is None:
-            raise RuntimeError("Upstox history response did not contain data.candles")
-        return candles
+        raw_payload = response.content
+        candles = candles_from_raw_payload(raw_payload)
+        return candles, raw_payload, url
 
     def _request_with_retry(self, url: str, *, headers: dict[str, str]) -> httpx.Response:
         for attempt in range(self._max_retries + 1):
