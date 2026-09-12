@@ -37,12 +37,19 @@ from .experiment import (
     PaperTradingEvidence,
     canonical_sha256,
 )
+from .live_market_readiness import (
+    REQUIRED_TIMEZONE,
+    LiveMarketReadinessReport,
+    ReadinessClassification,
+    build_runner_readiness_context,
+)
 from .shadow_live_runner import (
     FeedMode,
     RunnerMode,
     ShadowLiveConfig,
     verify_persisted_replay,
 )
+from .shadow_session_health import HealthStatus, HealthThresholds, check_persisted_session
 
 SCHEMA_VERSION = "shadow-evidence-qualification/v1"
 
@@ -416,11 +423,13 @@ def inspect_shadow_session(
 
     required_files = (
         "config.json",
+        "readiness-report.json",
         "market_events.jsonl",
         "decisions.jsonl",
         "trades.jsonl",
         "summary.json",
         "CHECKSUMS.sha256",
+        "health-report.json",
     )
     for fname in required_files:
         if not (output_dir / fname).is_file():
@@ -507,11 +516,26 @@ def inspect_shadow_session(
         if not report_file.is_file():
             violations.append(f"missing_report_file: report-{safe_key}.json")
 
+    readiness_report: LiveMarketReadinessReport | None = None
+    readiness_path = output_dir / "readiness-report.json"
+    if readiness_path.is_file():
+        try:
+            readiness_payload = json.loads(readiness_path.read_text(encoding="utf-8"))
+            if not isinstance(readiness_payload, dict):
+                raise TypeError("readiness report must be an object")
+            readiness_report = LiveMarketReadinessReport.from_dict(readiness_payload)
+        except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError) as exc:
+            violations.append(f"readiness_report_parse_error: {exc}")
+
     # Parse summary.json
+    summary_data: dict[str, Any] | None = None
     summary_path = output_dir / "summary.json"
     if summary_path.is_file():
         try:
-            summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+            loaded_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded_summary, dict):
+                raise TypeError("summary must be an object")
+            summary_data = loaded_summary
             if summary_data.get("live_orders_called") is not False:
                 raise LiveOrderAttemptError(
                     "summary.json contains live_orders_called=True; live orders are strictly forbidden"
@@ -520,6 +544,59 @@ def inspect_shadow_session(
             raise
         except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError) as exc:
             violations.append(f"summary_parse_error: {exc}")
+
+    if readiness_report is not None and summary_data is not None:
+        if (
+            summary_data.get("readiness_context_fingerprint")
+            != readiness_report.context.fingerprint()
+        ):
+            violations.append("readiness_context_fingerprint_mismatch")
+        if summary_data.get("readiness_classification") != readiness_report.classification.value:
+            violations.append("readiness_classification_mismatch")
+    if readiness_report is not None and readiness_report.classification not in (
+        ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+        ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW,
+    ):
+        violations.append("readiness_not_research_shadow_capable")
+
+    # The health report is the persisted output of the canonical Monday health
+    # monitor. Validate its own fingerprint and compare it with a fresh,
+    # read-only recomputation over the same persisted evidence.
+    health_payload: dict[str, Any] | None = None
+    stored_health_fingerprint: str | None = None
+    health_path = output_dir / "health-report.json"
+    if health_path.is_file():
+        try:
+            loaded_health = json.loads(health_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded_health, dict):
+                raise TypeError("health report must be an object")
+            stored_health_fingerprint = loaded_health.pop("fingerprint", None)
+            expected_health_fingerprint = hashlib.sha256(
+                json.dumps(loaded_health, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if stored_health_fingerprint != expected_health_fingerprint:
+                violations.append("health_report_fingerprint_mismatch")
+            if loaded_health.get("live_orders_called") is not False:
+                raise LiveOrderAttemptError(
+                    "health-report.json contains live_orders_called=True; "
+                    "live orders are strictly forbidden"
+                )
+            if loaded_health.get("status") not in {item.value for item in HealthStatus}:
+                violations.append("health_report_status_invalid")
+            health_payload = loaded_health
+            if summary_data is not None and summary_data.get("health_status") != loaded_health.get(
+                "status"
+            ):
+                violations.append("health_status_mismatch")
+            if (
+                summary_data is not None
+                and summary_data.get("health_report_fingerprint") != stored_health_fingerprint
+            ):
+                violations.append("health_report_summary_fingerprint_mismatch")
+        except LiveOrderAttemptError:
+            raise
+        except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError) as exc:
+            violations.append(f"health_report_parse_error: {exc}")
 
     # Parse decisions.jsonl
     no_trade_decisions: dict[str, int] = {}
@@ -566,6 +643,11 @@ def inspect_shadow_session(
     cost_scenario_identity = "unknown"
     approved_capital_identity = "unknown"
     max_drawdown = Decimal(0)
+    identity_values: dict[str, set[str]] = {
+        "strategy_identity": set(),
+        "cost_scenario_identity": set(),
+        "approved_capital_identity": set(),
+    }
     for key in instrument_keys:
         safe_key = key.replace("|", "_").replace(":", "_")
         report_file = output_dir / f"report-{safe_key}.json"
@@ -577,14 +659,25 @@ def inspect_shadow_session(
                         f"report-{safe_key}.json contains live_orders_called=True; "
                         "live orders are strictly forbidden"
                     )
-                strategy_identity = rep.get("strategy_identity", strategy_identity)
-                cost_scenario_identity = rep.get(
-                    "cost_scenario_fingerprint", cost_scenario_identity
+                strategy_identity = str(rep.get("strategy_identity", strategy_identity))
+                cost_scenario_identity = str(
+                    rep.get("cost_scenario_fingerprint", cost_scenario_identity)
                 )
-                approved_capital_identity = rep.get(
-                    "approved_capital_identity", approved_capital_identity
+                approved_capital_identity = str(
+                    rep.get("approved_capital_identity", approved_capital_identity)
                 )
-                dd = Decimal(str(rep.get("max_drawdown_rupees", "0")))
+                for identity_key, identity_value in (
+                    ("strategy_identity", strategy_identity),
+                    ("cost_scenario_identity", cost_scenario_identity),
+                    ("approved_capital_identity", approved_capital_identity),
+                ):
+                    if identity_value.strip() and identity_value != "unknown":
+                        identity_values[identity_key].add(identity_value)
+                if "max_drawdown_rupees" not in rep:
+                    violations.append(f"report_missing_drawdown_evidence: {safe_key}")
+                    dd = Decimal(0)
+                else:
+                    dd = Decimal(str(rep["max_drawdown_rupees"]))
                 max_drawdown = max(max_drawdown, dd)
                 reports_by_key[key] = rep
             except LiveOrderAttemptError:
@@ -600,6 +693,7 @@ def inspect_shadow_session(
     duplicate_or_out_of_order_events = 0
     cas_exclusions = 0
     session_date = expected_session_date or date(2026, 9, 7)
+    latest_received: datetime | None = None
 
     events_path = output_dir / "market_events.jsonl"
     if events_path.is_file():
@@ -625,6 +719,14 @@ def inspect_shadow_session(
                     row.get("event") and row["event"].get("is_cas_auxiliary")
                 ):
                     cas_exclusions += 1
+                received_timestamp = row.get("received_timestamp")
+                if received_timestamp:
+                    try:
+                        received = datetime.fromisoformat(str(received_timestamp))
+                        if received.tzinfo is not None:
+                            latest_received = max(latest_received or received, received)
+                    except ValueError:
+                        violations.append("market_event_received_timestamp_invalid")
                 # Infer session date from source timestamp if not passed
                 if expected_session_date is None and row.get("source_timestamp"):
                     try:
@@ -634,6 +736,39 @@ def inspect_shadow_session(
         except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError) as exc:
             violations.append(f"market_events_parse_error: {exc}")
 
+    if readiness_report is not None and config is not None:
+        try:
+            expected_context = build_runner_readiness_context(
+                trade_date=session_date,
+                timezone_name=REQUIRED_TIMEZONE,
+                instrument_keys=config.instrument_keys,
+                cas_eligible_by_key=config.cas_eligible_by_key,
+                tick_size_by_key=config.tick_size_by_key,
+                exit_buffer_minutes=config.exit_buffer_minutes,
+                approved_capital=config.approved_capital(),
+                quote_freshness_threshold_seconds=config.quote_freshness_threshold_seconds,
+            )
+            if readiness_report.trade_date != session_date:
+                violations.append("readiness_trade_date_mismatch")
+            if readiness_report.context != expected_context:
+                violations.append("readiness_context_mismatch")
+            if readiness_report.approved_capital_rupees != config.approved_capital().amount_rupees:
+                violations.append("readiness_capital_mismatch")
+            checked_at = readiness_report.checked_at_ist
+            if checked_at.tzinfo is None:
+                violations.append("readiness_checked_at_timezone_missing")
+            elif latest_received is not None:
+                readiness_age = (
+                    latest_received.astimezone(checked_at.tzinfo) - checked_at
+                ).total_seconds()
+                if (
+                    readiness_age < 0
+                    or readiness_age > readiness_report.context.readiness_max_age_seconds
+                ):
+                    violations.append("readiness_stale")
+        except (KeyError, TypeError, ValueError) as exc:
+            violations.append(f"readiness_context_verification_exception: {exc}")
+
     # Incorporate engine-level decision reasons into anomaly counts
     data_gaps += no_trade_decisions.get("feed_gap_no_trade", 0)
     stale_events += no_trade_decisions.get("stale_quote_no_trade", 0)
@@ -642,6 +777,31 @@ def inspect_shadow_session(
         "duplicate_event_no_trade", 0
     ) + no_trade_decisions.get("out_of_order_event_no_trade", 0)
     cas_exclusions += no_trade_decisions.get("cas_auxiliary_excluded_no_trade", 0)
+
+    for identity_key, values in identity_values.items():
+        if not values:
+            violations.append(f"missing_{identity_key}")
+        elif len(values) > 1:
+            violations.append(f"mismatched_{identity_key}")
+
+    if health_payload is not None:
+        try:
+            freshness_seconds = (
+                float(config.quote_freshness_threshold_seconds) if config is not None else 60.0
+            )
+            recomputed_health = check_persisted_session(
+                output_dir,
+                now_iso=(latest_received.isoformat() if latest_received is not None else None),
+                thresholds=HealthThresholds(freshness_seconds=freshness_seconds),
+            )
+            if health_payload != recomputed_health.as_dict():
+                violations.append("health_report_mismatch")
+            if stored_health_fingerprint != recomputed_health.fingerprint():
+                violations.append("health_report_fingerprint_recomputed_mismatch")
+            if recomputed_health.status is HealthStatus.FAILED_CLOSED:
+                violations.append("health_failed_closed")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            violations.append(f"health_verification_exception: {exc}")
 
     # Compute coverage per instrument
     max_polls = config.max_polls if config is not None else 1
@@ -673,7 +833,7 @@ def inspect_shadow_session(
     )
 
     # Perform replay verification
-    if config is not None and len(violations) == 0:
+    if config is not None and events_path.is_file():
         try:
             replay_res = verify_persisted_replay(
                 output_dir, config=config, session_day=session_date
@@ -693,10 +853,20 @@ def inspect_shadow_session(
     losses = 0
     for t in trades_list:
         try:
-            entry = Decimal(str(t.get("theoretical_entry", "0")))
-            exit_p = Decimal(str(t.get("theoretical_exit", "0")))
-            qty = int(t.get("quantity", 0))
-            net_pnl = Decimal(str(t.get("net_theoretical_pnl", "0")))
+            required_trade_fields = (
+                "theoretical_entry",
+                "theoretical_exit",
+                "quantity",
+                "net_theoretical_pnl",
+            )
+            missing_trade_fields = [field for field in required_trade_fields if field not in t]
+            if missing_trade_fields:
+                violations.append("trade_missing_pnl_evidence: " + ",".join(missing_trade_fields))
+                continue
+            entry = Decimal(str(t["theoretical_entry"]))
+            exit_p = Decimal(str(t["theoretical_exit"]))
+            qty = int(t["quantity"])
+            net_pnl = Decimal(str(t["net_theoretical_pnl"]))
             gross = (exit_p - entry) * qty
             total_gross_pnl += gross
             total_net_theoretical_pnl += net_pnl

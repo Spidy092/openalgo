@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from dataclasses import replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -53,6 +54,7 @@ from equity_engine.experiment import (
     WindowSpec,
 )
 from equity_engine.gates import DrawdownBasis, PromotionThresholds
+from equity_engine.live_market_readiness import build_synthetic_readiness_report
 from equity_engine.shadow_evidence_qualification import (
     ShadowEvidenceClassification,
     ShadowQualificationPolicy,
@@ -67,6 +69,7 @@ from equity_engine.shadow_live_runner import (
     ShadowLiveRunner,
     SyntheticQuoteSource,
 )
+from equity_engine.shadow_session_health import KILL_SENTINEL, HealthStatus
 
 IST = ZoneInfo("Asia/Kolkata")
 KEY_A = "NSE_EQ|INE002A01018"
@@ -166,10 +169,35 @@ def _run_and_persist_session(
         output_dir=str(out_dir),
         mode=RunnerMode.DRY_RUN,
     )
+    session_day = times_iter[0].date()
+    cfg = replace(
+        cfg,
+        readiness_report=build_synthetic_readiness_report(
+            checked_at_ist=times_iter[0],
+            trade_date=session_day,
+            instrument_keys=cfg.instrument_keys,
+            cas_eligible_by_key=cfg.cas_eligible_by_key,
+            tick_size_by_key=cfg.tick_size_by_key,
+            exit_buffer_minutes=cfg.exit_buffer_minutes,
+            approved_capital=cfg.approved_capital(),
+            quote_freshness_threshold_seconds=cfg.quote_freshness_threshold_seconds,
+        ),
+    )
+    next_time = times_iter[-1]
+
+    def next_poll_time() -> datetime:
+        nonlocal next_time
+        if times_iter:
+            next_time = times_iter.pop(0)
+        else:
+            next_time += timedelta(minutes=1)
+        return next_time
+
     runner = ShadowLiveRunner(
         config=cfg,
         source=SyntheticQuoteSource(batches),
-        now=lambda: times_iter.pop(0) if times_iter else datetime.now(tz=IST),
+        now=next_poll_time,
+        session_day=session_day,
     )
     runner.run()
     runner.persist(out_dir)
@@ -198,6 +226,102 @@ def test_valid_profitable_session_qualifies(tmp_path: Path) -> None:
     assert qualification.total_stale_events == 0
     assert qualification.live_orders_called is False
     assert qualification.theoretical_only_confirmation is True
+
+
+def test_monday_rehearsal_qualifies_and_adapts_canonical_evidence(tmp_path: Path) -> None:
+    """Prove the complete persisted Monday rehearsal reaches only paper evidence."""
+    out = tmp_path / "monday_rehearsal"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+
+    readiness = json.loads((out / "readiness-report.json").read_text(encoding="utf-8"))
+    assert readiness["classification"] == "READY_FOR_RESEARCH_SHADOW"
+    health = json.loads((out / "health-report.json").read_text(encoding="utf-8"))
+    assert health["status"] == HealthStatus.HEALTHY.value
+    assert health["live_orders_called"] is False
+
+    qualification = qualify_single_shadow_session(out, _make_policy())
+    assert (
+        qualification.classification
+        == ShadowEvidenceClassification.VALID_SHADOW_EVIDENCE_SUFFICIENT_FOR_REVIEW
+    )
+    paper_evidence = qualification.to_paper_trading_evidence()
+    assert paper_evidence.environment == "shadow-live-read-only"
+    assert paper_evidence.verified_orders_count == 1
+    assert paper_evidence.artifact_fingerprint == qualification.qualification_fingerprint()
+
+
+def test_failed_closed_health_cannot_qualify(tmp_path: Path) -> None:
+    """Prove the persisted Monday health kill gate blocks evidence qualification."""
+    out = tmp_path / "failed_closed"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+    (out / KILL_SENTINEL).touch()
+
+    qualification = qualify_single_shadow_session(out, _make_policy())
+
+    assert qualification.classification == ShadowEvidenceClassification.INVALID_SHADOW_EVIDENCE
+    assert qualification.qualification_passed is False
+    assert any("health_failed_closed" in r for r in qualification.qualification_reasons)
+
+
+def test_stale_readiness_report_cannot_qualify(tmp_path: Path) -> None:
+    """Prove readiness freshness is bound to the persisted session evidence."""
+    out = tmp_path / "stale_readiness"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+
+    readiness_path = out / "readiness-report.json"
+    readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    readiness["checked_at_ist"] = "2026-09-07T08:00:00+05:30"
+    readiness_path.write_text(
+        json.dumps(readiness, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    checksums = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(out.iterdir())
+        if path.is_file() and path.name != "CHECKSUMS.sha256"
+    }
+    (out / "CHECKSUMS.sha256").write_text(
+        "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
+        encoding="utf-8",
+    )
+
+    qualification = qualify_single_shadow_session(out, _make_policy())
+
+    assert qualification.classification == ShadowEvidenceClassification.INVALID_SHADOW_EVIDENCE
+    assert any("readiness_stale" in r for r in qualification.qualification_reasons)
+
+
+def test_missing_trade_pnl_is_unknown_not_zero(tmp_path: Path) -> None:
+    """Prove absent P&L fields are not silently interpreted as zero."""
+    out = tmp_path / "unknown_pnl"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+
+    trades_path = out / "trades.jsonl"
+    trade = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+    del trade["net_theoretical_pnl"]
+    trades_path.write_text(json.dumps(trade, sort_keys=True) + "\n", encoding="utf-8")
+    checksums = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(out.iterdir())
+        if path.is_file() and path.name != "CHECKSUMS.sha256"
+    }
+    (out / "CHECKSUMS.sha256").write_text(
+        "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())),
+        encoding="utf-8",
+    )
+
+    qualification = qualify_single_shadow_session(out, _make_policy())
+
+    assert qualification.classification == ShadowEvidenceClassification.INVALID_SHADOW_EVIDENCE
+    assert any("trade_missing_pnl_evidence" in r for r in qualification.qualification_reasons)
+
+
+def test_missing_qualification_policy_fails_closed(tmp_path: Path) -> None:
+    """Prove qualification cannot run without an explicit, fingerprinted policy."""
+    out = tmp_path / "missing_policy"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+
+    with pytest.raises(ValueError, match="qualification policy is required"):
+        qualify_single_shadow_session(out, None)  # type: ignore[arg-type]
 
 
 def test_valid_losing_session_qualifies_proof_profitability_not_qualification(
