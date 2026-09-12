@@ -1,4 +1,10 @@
-"""Monday live-market readiness gate V1 tests (synthetic, no network, no orders)."""
+"""Monday live-market readiness gate tests (synthetic, no network, no orders).
+
+Covers the three readiness scopes: pure plumbing shadow (INFRA) must not
+require prior paper evidence, research shadow must not require it either, and
+only live-order review requires accumulated paper evidence. No hidden
+defaults; no order capability.
+"""
 
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ from equity_engine.live_market_readiness import (
     INSTRUMENT_NOT_TRADABLE,
     INSUFFICIENT_BALANCE,
     KILL_SWITCH_ENGAGED,
+    LIVE_TRADABILITY_UNPROVEN,
     PAPER_EVIDENCE_MISSING,
     PIT_EVIDENCE_INCOMPLETE,
     QUOTE_MISSING,
@@ -44,6 +51,7 @@ from equity_engine.live_market_readiness import (
     SESSION_BOUNDARY_VIOLATED,
     SESSION_CLOSED,
     STATIC_IP_MISSING,
+    STRATEGY_EVIDENCE_MISSING,
     SUSPENSION_ACTIVE,
     SUSPENSION_CONFLICT,
     TICK_SIZE_UNVERIFIED,
@@ -231,6 +239,7 @@ def _ready_inputs() -> LiveMarketReadinessInputs:
         cost_tolerance_inr=Decimal("0.01"),
         pit_complete=True,
         historical_validation=_historical(),
+        strategy_evidence_present=True,
         paper_evidence=_paper(),
         kill_switch_engaged=False,
         live_orders_called=False,
@@ -243,6 +252,8 @@ def test_fully_synthetic_ready_for_live_order_review() -> None:
     assert report.classification is ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW
     assert report.reason_codes == ()
     assert report.live_orders_called is False
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is True
     assert report.shadow_ready is True
     assert report.live_review_ready is True
     # Broker balance cannot increase approved capital.
@@ -251,14 +262,58 @@ def test_fully_synthetic_ready_for_live_order_review() -> None:
     assert report.effective_capital_rupees == Decimal(10000)
 
 
-def test_static_ip_missing_allows_shadow_but_blocks_live_review() -> None:
+def test_first_ever_shadow_session_reaches_infra_without_paper_evidence() -> None:
+    # The first live-market shadow session creates paper evidence, so prior
+    # paper evidence — and research evidence — must not block plumbing.
+    inputs = replace(
+        _ready_inputs(),
+        paper_evidence=None,
+        pit_complete=False,
+        historical_validation=None,
+        strategy_evidence_present=False,
+        cost_evidence=None,
+    )
+
+    report = evaluate_live_market_readiness(inputs)
+
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
+    assert PAPER_EVIDENCE_MISSING in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is False
+    assert report.live_review_ready is False
+    assert report.live_orders_called is False
+
+
+def test_research_evidence_reaches_research_shadow_without_paper_evidence() -> None:
+    inputs = replace(_ready_inputs(), paper_evidence=None)
+
+    report = evaluate_live_market_readiness(inputs)
+
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
+    assert PAPER_EVIDENCE_MISSING in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is True
+    assert report.live_review_ready is False
+
+
+def test_paper_evidence_missing_blocks_live_order_review() -> None:
+    report = evaluate_live_market_readiness(replace(_ready_inputs(), paper_evidence=None))
+
+    assert report.classification is not ReadinessClassification.READY_FOR_LIVE_ORDER_REVIEW
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
+    assert PAPER_EVIDENCE_MISSING in report.reason_codes
+    assert report.live_review_ready is False
+
+
+def test_static_ip_missing_blocks_live_review_but_not_research_shadow() -> None:
     inputs = replace(_ready_inputs(), readiness_snapshot=_snapshot(static_ip=False))
 
     report = evaluate_live_market_readiness(inputs)
 
-    assert report.classification is ReadinessClassification.READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
     assert STATIC_IP_MISSING in report.reason_codes
-    assert report.shadow_ready is True
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is True
     assert report.live_review_ready is False
 
 
@@ -308,6 +363,19 @@ def test_stale_quote_fails_closed() -> None:
 
     assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
     assert QUOTE_STALE in report.reason_codes
+
+
+def test_stale_quote_blocks_every_shadow_mode() -> None:
+    stale_ts = datetime(2026, 9, 7, 9, 0, 0, tzinfo=IST)
+    # Even a research-level session (paper missing, all else ready) is still
+    # blocked at infra scope by a stale quote.
+    inputs = replace(_ready_inputs(), paper_evidence=None, quotes=_quotes(timestamp=stale_ts))
+
+    report = evaluate_live_market_readiness(inputs)
+
+    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert QUOTE_STALE in report.reason_codes
+    assert report.infra_ready is False
 
 
 def test_missing_quote_fails_closed() -> None:
@@ -366,6 +434,17 @@ def test_cas_unknown_fails_closed() -> None:
     assert CAS_POLICY_UNKNOWN in report.reason_codes
 
 
+def test_cas_unknown_blocks_every_shadow_mode() -> None:
+    # A research-level session is still blocked at infra scope without CAS policy.
+    inputs = replace(_ready_inputs(), paper_evidence=None, session_policy=None)
+
+    report = evaluate_live_market_readiness(inputs)
+
+    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert CAS_POLICY_UNKNOWN in report.reason_codes
+    assert report.infra_ready is False
+
+
 def test_cas_mismatch_fails_closed() -> None:
     mismatched_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=15)
     report = evaluate_live_market_readiness(
@@ -410,6 +489,16 @@ def test_non_mis_instrument_fails_closed() -> None:
     assert INSTRUMENT_NOT_TRADABLE in report.reason_codes
 
 
+def test_unproven_live_tradability_blocks_live_review_only() -> None:
+    unproven = replace(_instrument(), live_tradability_proven=False)
+    report = evaluate_live_market_readiness(replace(_ready_inputs(), instrument=unproven))
+
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
+    assert LIVE_TRADABILITY_UNPROVEN in report.reason_codes
+    assert report.research_shadow_ready is True
+    assert report.live_review_ready is False
+
+
 def test_tick_unverified_fails_closed() -> None:
     bad_tick = TickSizeVerification(
         passed=False,
@@ -430,13 +519,15 @@ def test_capital_absent_fails_closed() -> None:
     assert CAPITAL_NOT_APPROVED in report.reason_codes
 
 
-def test_broker_balance_unknown_fails_closed() -> None:
+def test_broker_balance_unknown_blocks_live_review_only() -> None:
     report = evaluate_live_market_readiness(
         replace(_ready_inputs(), broker_available_to_trade=None)
     )
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
     assert BROKER_BALANCE_UNKNOWN in report.reason_codes
+    assert report.research_shadow_ready is True
+    assert report.live_review_ready is False
 
 
 def test_broker_balance_cannot_increase_approved_capital() -> None:
@@ -451,18 +542,20 @@ def test_broker_balance_cannot_increase_approved_capital() -> None:
     )
     assert low.effective_capital_rupees == Decimal(4000)
     assert low.effective_capital_rupees <= Decimal(10000)
-    assert low.classification is ReadinessClassification.READY_FOR_SHADOW
+    assert low.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
     assert INSUFFICIENT_BALANCE in low.reason_codes
 
 
-def test_missing_cost_evidence_fails_closed() -> None:
+def test_missing_cost_evidence_blocks_research_but_not_infra() -> None:
     report = evaluate_live_market_readiness(replace(_ready_inputs(), cost_evidence=None))
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
     assert COST_RECONCILIATION_MISSING in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is False
 
 
-def test_failed_cost_reconciliation_fails_closed() -> None:
+def test_failed_cost_reconciliation_blocks_research_but_not_infra() -> None:
     # CostReconciliationEvidence itself fails closed at construction for
     # non-PASS status, so a FAIL artifact can never be built. Exercise the
     # gate's FAILED branch with a duck-typed artifact carrying FAIL status.
@@ -476,7 +569,7 @@ def test_failed_cost_reconciliation_fails_closed() -> None:
         replace(_ready_inputs(), cost_evidence=FailedCost())  # type: ignore[arg-type]
     )
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
     assert COST_RECONCILIATION_FAILED in report.reason_codes
 
 
@@ -485,33 +578,48 @@ def test_non_pass_cost_evidence_cannot_be_constructed() -> None:
         replace(_cost(), status="FAIL")
 
 
-def test_cost_tolerance_exceeded_fails_closed() -> None:
+def test_cost_tolerance_exceeded_blocks_research_but_not_infra() -> None:
     report = evaluate_live_market_readiness(
         replace(_ready_inputs(), cost_tolerance_inr=Decimal("0.001"))
     )
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
     assert COST_RECONCILIATION_FAILED in report.reason_codes
 
 
-def test_pit_incomplete_fails_closed() -> None:
+def test_pit_incomplete_blocks_research_but_not_infra() -> None:
     report = evaluate_live_market_readiness(replace(_ready_inputs(), pit_complete=False))
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
     assert PIT_EVIDENCE_INCOMPLETE in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is False
 
 
-def test_historical_missing_fails_closed() -> None:
+def test_historical_missing_blocks_research_but_not_infra() -> None:
     report = evaluate_live_market_readiness(replace(_ready_inputs(), historical_validation=None))
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
     assert HISTORICAL_EVIDENCE_MISSING in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is False
 
 
-def test_missing_paper_evidence_fails_closed() -> None:
+def test_strategy_evidence_missing_blocks_research_but_not_infra() -> None:
+    report = evaluate_live_market_readiness(
+        replace(_ready_inputs(), strategy_evidence_present=False)
+    )
+
+    assert report.classification is ReadinessClassification.READY_FOR_SHADOW_INFRA
+    assert STRATEGY_EVIDENCE_MISSING in report.reason_codes
+    assert report.infra_ready is True
+    assert report.research_shadow_ready is False
+
+
+def test_missing_paper_evidence_allows_research_shadow() -> None:
     report = evaluate_live_market_readiness(replace(_ready_inputs(), paper_evidence=None))
 
-    assert report.classification is ReadinessClassification.NOT_READY_FOR_SHADOW
+    assert report.classification is ReadinessClassification.READY_FOR_RESEARCH_SHADOW
     assert PAPER_EVIDENCE_MISSING in report.reason_codes
 
 
@@ -541,6 +649,8 @@ def test_report_is_credential_free_and_machine_readable() -> None:
     assert "secret-token" not in serialized
     assert "Bearer" not in serialized
     assert payload["reason_codes"] == []
+    assert payload["infra_ready"] is True
+    assert payload["research_shadow_ready"] is True
     # No hidden defaults: thresholds are explicit caller inputs.
     inputs = _ready_inputs()
     assert inputs.max_quote_age_seconds == 60.0
