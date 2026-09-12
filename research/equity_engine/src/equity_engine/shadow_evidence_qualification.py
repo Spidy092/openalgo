@@ -464,6 +464,15 @@ def inspect_shadow_session(
                     else:
                         checksum_results[target_name] = True
 
+            persisted_targets = {
+                path.name
+                for path in output_dir.iterdir()
+                if path.is_file() and path.name != "CHECKSUMS.sha256"
+            }
+            for target_name in sorted(persisted_targets - checksum_results.keys()):
+                checksum_results[target_name] = False
+                violations.append(f"checksum_manifest_missing_target: {target_name}")
+
     # Parse config.json
     config: ShadowLiveConfig | None = None
     config_path = output_dir / "config.json"

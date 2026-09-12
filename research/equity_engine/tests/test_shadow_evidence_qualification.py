@@ -403,6 +403,28 @@ def test_checksum_sha256_file_tampering_fails_closed(tmp_path: Path) -> None:
     assert any("checksum_mismatch" in r for r in qualification.qualification_reasons)
 
 
+def test_checksum_manifest_omission_fails_closed(tmp_path: Path) -> None:
+    """Prove every persisted artifact must be covered by the checksum manifest."""
+    out = tmp_path / "omitted_checksum"
+    _run_and_persist_session(out, strategy_name="exit-second-bar")
+
+    checksums_path = out / "CHECKSUMS.sha256"
+    retained = [
+        line
+        for line in checksums_path.read_text(encoding="utf-8").splitlines()
+        if line.split()[-1] != "summary.json"
+    ]
+    checksums_path.write_text("\n".join(retained) + "\n", encoding="utf-8")
+
+    qualification = qualify_single_shadow_session(out, _make_policy())
+
+    assert qualification.classification == ShadowEvidenceClassification.INVALID_SHADOW_EVIDENCE
+    assert any(
+        "checksum_manifest_missing_target: summary.json" in r
+        for r in qualification.qualification_reasons
+    )
+
+
 def test_replay_mismatch_fails_closed(tmp_path: Path) -> None:
     """Prove that replayed state not matching persisted reports fails closed with INVALID."""
     out = tmp_path / "replay_mismatch"
