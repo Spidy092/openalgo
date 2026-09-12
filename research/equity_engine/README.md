@@ -61,6 +61,48 @@ python scripts/upstox_history_batch.py \
 
 Neither batch CLI contains a live-order path.
 
+## Monday read-only shadow procedure
+
+The only Monday runner modes are `DRY_RUN` and `LIVE_READ_ONLY`; there is no
+live-order mode. The readiness producer must write the canonical
+`LiveMarketReadinessReport` JSON first. It binds the trade date, session and
+instrument context, approved-capital identity, and quote/feed freshness
+evidence. The runner rejects a missing, stale, mismatched, or non-infrastructure-ready
+report before polling.
+
+Use the environment variable name only; never put a credential value in a
+command, document, or evidence artifact:
+
+```bash
+export UPSTOX_ACCESS_TOKEN
+
+# Preflight/readiness: produce data/monday-shadow-v2/readiness-report.json
+# with the canonical readiness evaluator. STOP unless its classification is
+# READY_FOR_RESEARCH_SHADOW or READY_FOR_LIVE_ORDER_REVIEW.
+
+# Synthetic rehearsal; no network and no broker credential is used.
+uv run python scripts/shadow_live.py \
+  --mode DRY_RUN \
+  --instrument-keys 'NSE_EQ|INE002A01018' \
+  --trade-date 2026-09-07 \
+  --output-dir data/monday-shadow-v2/dry-run
+
+# Real market data, readiness-gated, read-only shadow evidence.
+uv run python scripts/shadow_live.py \
+  --mode LIVE_READ_ONLY \
+  --instrument-keys 'NSE_EQ|INE002A01018' \
+  --trade-date 2026-09-07 \
+  --readiness-report data/monday-shadow-v2/readiness-report.json \
+  --output-dir data/monday-shadow-v2/live-read-only
+```
+
+Evidence is written below the selected output directory, including
+`readiness-report.json`, `market_events.jsonl`, `decisions.jsonl`,
+`trades.jsonl`, `summary.json`, and `CHECKSUMS.sha256`. STOP on any readiness,
+CAS, stale-feed, feed-gap, credential, or polling failure. All outputs remain
+theoretical and record `live_orders_called=false`; even
+`READY_FOR_LIVE_ORDER_REVIEW` is evidence only and cannot enable broker orders.
+
 ## Two independent research tracks
 
 ### Intraday

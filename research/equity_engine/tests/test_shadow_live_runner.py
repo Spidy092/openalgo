@@ -6,10 +6,12 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from equity_engine.live_market_readiness import build_synthetic_readiness_report
 from equity_engine.shadow_live_runner import (
     BLOCKED_TOKEN_MISSING,
     FeedMode,
@@ -27,6 +29,10 @@ KEY = "NSE_EQ|INE002A01018"
 
 
 def _config(tmp_path: Path, **overrides) -> ShadowLiveConfig:
+    readiness_trade_date = overrides.pop("readiness_trade_date", date(2026, 9, 7))
+    readiness_checked_at = overrides.pop(
+        "readiness_checked_at", datetime.fromisoformat("2026-09-07T09:15:05+05:30")
+    )
     params: dict[str, object] = {
         "session_id": "test-live-v1",
         "instrument_keys": (KEY,),
@@ -44,7 +50,20 @@ def _config(tmp_path: Path, **overrides) -> ShadowLiveConfig:
         "mode": RunnerMode.DRY_RUN,
     }
     params.update(overrides)
-    return ShadowLiveConfig(**params)  # type: ignore[arg-type]
+    config = ShadowLiveConfig(**params)  # type: ignore[arg-type]
+    return replace(
+        config,
+        readiness_report=build_synthetic_readiness_report(
+            checked_at_ist=readiness_checked_at,
+            trade_date=readiness_trade_date,
+            instrument_keys=config.instrument_keys,
+            cas_eligible_by_key=config.cas_eligible_by_key,
+            tick_size_by_key=config.tick_size_by_key,
+            exit_buffer_minutes=config.exit_buffer_minutes,
+            approved_capital=config.approved_capital(),
+            quote_freshness_threshold_seconds=config.quote_freshness_threshold_seconds,
+        ),
+    )
 
 
 def _quote(ts: str, price: float) -> dict[str, object]:
@@ -150,7 +169,11 @@ def test_out_of_order_quote_fails_closed(tmp_path: Path) -> None:
         datetime.fromisoformat("2026-09-07T09:20:10+05:30"),
     ]
     runner = ShadowLiveRunner(
-        config=_config(tmp_path, max_polls=2),
+        config=_config(
+            tmp_path,
+            max_polls=2,
+            readiness_checked_at=datetime.fromisoformat("2026-09-07T09:20:05+05:30"),
+        ),
         source=SyntheticQuoteSource(batches),
         now=lambda: times.pop(0),
     )
@@ -168,7 +191,7 @@ def test_feed_gap_and_reconnect_boundary(tmp_path: Path) -> None:
         datetime.fromisoformat("2026-09-07T09:30:05+05:30"),
     ]
     runner = ShadowLiveRunner(
-        config=_config(tmp_path, max_polls=2),
+        config=_config(tmp_path, max_polls=2, quote_freshness_threshold_seconds=901.0),
         source=SyntheticQuoteSource(batches),
         now=lambda: times.pop(0),
     )
@@ -199,11 +222,16 @@ def test_cas_cutoff_and_session_closed(tmp_path: Path) -> None:
         tmp_path,
         cas_eligible_by_key=((KEY, True),),
         max_polls=1,
+        readiness_trade_date=date(2026, 9, 8),
+        readiness_checked_at=datetime.fromisoformat("2026-09-08T15:16:05+05:30"),
     )
     cas_batches = [{KEY: _quote("2026-09-08T15:16:00+05:30", 100)}]
     times = [datetime.fromisoformat("2026-09-08T15:16:05+05:30")]
     runner = ShadowLiveRunner(
-        config=cas_cfg, source=SyntheticQuoteSource(cas_batches), now=lambda: times.pop(0)
+        config=cas_cfg,
+        source=SyntheticQuoteSource(cas_batches),
+        now=lambda: times.pop(0),
+        session_day=date(2026, 9, 8),
     )
     reports = runner.run()
     assert reports[KEY].decisions[0].reason == "cas_auxiliary_excluded_no_trade"
@@ -211,7 +239,11 @@ def test_cas_cutoff_and_session_closed(tmp_path: Path) -> None:
     closed_batches = [{KEY: _quote("2026-09-07T18:00:00+05:30", 100)}]
     times2 = [datetime.fromisoformat("2026-09-07T18:00:05+05:30")]
     runner2 = ShadowLiveRunner(
-        config=_config(tmp_path, max_polls=1),
+        config=_config(
+            tmp_path,
+            max_polls=1,
+            readiness_checked_at=datetime.fromisoformat("2026-09-07T18:00:05+05:30"),
+        ),
         source=SyntheticQuoteSource(closed_batches),
         now=lambda: times2.pop(0),
     )

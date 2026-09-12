@@ -50,7 +50,7 @@ Reused components (imported, not reimplemented):
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -66,6 +66,7 @@ from .historical_validation import HistoricalDatasetValidation
 from .instrument_master import EquityInstrument
 from .market_sessions import NSEEquitySessionPolicy
 from .nse_calendar import CalendarEvidence
+from .provenance import canonical_sha256
 from .suspension_identity import (
     AMBIGUOUS_EXACT,
     NO_SUSPENSION_RECORD,
@@ -77,6 +78,37 @@ from .upstox_readiness import UpstoxReadinessSnapshot
 
 SCHEMA_VERSION = "live-market-readiness/v2"
 REQUIRED_TIMEZONE = "Asia/Kolkata"
+DEFAULT_READINESS_MAX_AGE_SECONDS = 1800.0
+
+
+def _safe_identity_value(value: Any) -> Any:
+    """Convert evidence state to credential-free, JSON-stable identity values."""
+
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, StrEnum):
+        return value.value
+    if is_dataclass(value):
+        return _safe_identity_value(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _safe_identity_value(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_safe_identity_value(item) for item in value]
+    return value
+
+
+def _identity_fingerprint(payload: Any) -> str:
+    return canonical_sha256(_safe_identity_value(payload))
+
+
+def _capital_identity(capital: ApprovedCapital | None) -> str | None:
+    if capital is None:
+        return None
+    return _identity_fingerprint(
+        {"amount_rupees": capital.amount_rupees, "currency": capital.currency}
+    )
 
 
 class ReadinessClassification(StrEnum):
@@ -86,6 +118,126 @@ class ReadinessClassification(StrEnum):
     READY_FOR_SHADOW_INFRA = "READY_FOR_SHADOW_INFRA"
     READY_FOR_RESEARCH_SHADOW = "READY_FOR_RESEARCH_SHADOW"
     READY_FOR_LIVE_ORDER_REVIEW = "READY_FOR_LIVE_ORDER_REVIEW"
+
+
+@dataclass(frozen=True)
+class LiveMarketReadinessContext:
+    """Deterministic binding between a readiness report and one shadow run."""
+
+    trade_date: date
+    timezone_name: str
+    instrument_keys: tuple[str, ...]
+    instrument_context_fingerprint: str
+    session_context_fingerprint: str | None
+    capital_identity: str | None
+    quote_feed_fingerprint: str
+    quote_freshness_threshold_seconds: float
+    readiness_max_age_seconds: float = DEFAULT_READINESS_MAX_AGE_SECONDS
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trade_date, date):
+            raise TypeError("context trade_date must be a date")
+        if not self.timezone_name.strip():
+            raise ValueError("context timezone_name is required")
+        if not self.instrument_keys or len(set(self.instrument_keys)) != len(self.instrument_keys):
+            raise ValueError("context instrument_keys must be non-empty and unique")
+        if not self.instrument_context_fingerprint:
+            raise ValueError("context instrument fingerprint is required")
+        if not self.quote_feed_fingerprint:
+            raise ValueError("context quote/feed fingerprint is required")
+        if self.quote_freshness_threshold_seconds <= 0:
+            raise ValueError("context quote freshness threshold must be positive")
+        if self.readiness_max_age_seconds <= 0:
+            raise ValueError("context readiness max age must be positive")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "trade_date": self.trade_date.isoformat(),
+            "timezone_name": self.timezone_name,
+            "instrument_keys": list(self.instrument_keys),
+            "instrument_context_fingerprint": self.instrument_context_fingerprint,
+            "session_context_fingerprint": self.session_context_fingerprint,
+            "capital_identity": self.capital_identity,
+            "quote_feed_fingerprint": self.quote_feed_fingerprint,
+            "quote_freshness_threshold_seconds": self.quote_freshness_threshold_seconds,
+            "readiness_max_age_seconds": self.readiness_max_age_seconds,
+        }
+
+    def fingerprint(self) -> str:
+        return _identity_fingerprint(self.as_dict())
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> LiveMarketReadinessContext:
+        try:
+            return cls(
+                trade_date=date.fromisoformat(str(payload["trade_date"])),
+                timezone_name=str(payload["timezone_name"]),
+                instrument_keys=tuple(str(item) for item in payload["instrument_keys"]),
+                instrument_context_fingerprint=str(payload["instrument_context_fingerprint"]),
+                session_context_fingerprint=(
+                    str(payload["session_context_fingerprint"])
+                    if payload.get("session_context_fingerprint") is not None
+                    else None
+                ),
+                capital_identity=(
+                    str(payload["capital_identity"])
+                    if payload.get("capital_identity") is not None
+                    else None
+                ),
+                quote_feed_fingerprint=str(payload["quote_feed_fingerprint"]),
+                quote_freshness_threshold_seconds=float(
+                    payload["quote_freshness_threshold_seconds"]
+                ),
+                readiness_max_age_seconds=float(
+                    payload.get("readiness_max_age_seconds", DEFAULT_READINESS_MAX_AGE_SECONDS)
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid readiness context") from exc
+
+
+def _instrument_context_fingerprint(
+    *, expected_instrument_keys: tuple[str, ...], instrument: EquityInstrument | None
+) -> str:
+    instrument_state: object = None
+    if instrument is not None:
+        instrument_state = {
+            "instrument_key": instrument.instrument_key,
+            "exchange": instrument.exchange,
+            "segment": instrument.segment,
+            "instrument_type": instrument.instrument_type,
+            "cas_eligible": instrument.cas_eligible,
+            "tick_size_rupees": instrument.tick_size_rupees,
+        }
+    return _identity_fingerprint(
+        {
+            "expected_instrument_keys": expected_instrument_keys,
+            "instrument": instrument_state,
+        }
+    )
+
+
+def _session_context_fingerprint(policy: NSEEquitySessionPolicy | None) -> str | None:
+    if policy is None:
+        return None
+    return _identity_fingerprint(
+        {
+            "class": f"{type(policy).__module__}.{type(policy).__qualname__}",
+            "state": policy,
+        }
+    )
+
+
+def _quote_feed_fingerprint(
+    *, quotes: QuoteBatchResult | None, feed: FeedHealthEvidence | None, threshold: float
+) -> str:
+    return _identity_fingerprint(
+        {
+            "quotes": quotes,
+            "feed": feed,
+            "quote_freshness_threshold_seconds": threshold,
+        }
+    )
 
 
 # Reason codes: stable, human-readable, machine-checkable.
@@ -280,6 +432,141 @@ class LiveMarketReadinessInputs:
         ):
             raise ValueError("broker_available_to_trade must be a finite Decimal when supplied")
 
+    def readiness_context(self) -> LiveMarketReadinessContext:
+        """Return the canonical credential-free context bound to this evidence set."""
+
+        return LiveMarketReadinessContext(
+            trade_date=self.trade_date,
+            timezone_name=self.timezone_name,
+            instrument_keys=self.expected_instrument_keys,
+            instrument_context_fingerprint=_instrument_context_fingerprint(
+                expected_instrument_keys=self.expected_instrument_keys,
+                instrument=self.instrument,
+            ),
+            session_context_fingerprint=_session_context_fingerprint(self.session_policy),
+            capital_identity=_capital_identity(self.approved_capital),
+            quote_feed_fingerprint=_quote_feed_fingerprint(
+                quotes=self.quotes,
+                feed=self.feed,
+                threshold=self.max_quote_age_seconds,
+            ),
+            quote_freshness_threshold_seconds=self.max_quote_age_seconds,
+        )
+
+
+def build_runner_readiness_context(
+    *,
+    trade_date: date,
+    timezone_name: str,
+    instrument_keys: tuple[str, ...],
+    cas_eligible_by_key: tuple[tuple[str, bool], ...],
+    tick_size_by_key: tuple[tuple[str, str], ...],
+    exit_buffer_minutes: int,
+    approved_capital: ApprovedCapital | None,
+    quote_freshness_threshold_seconds: float,
+    readiness_max_age_seconds: float = DEFAULT_READINESS_MAX_AGE_SECONDS,
+) -> LiveMarketReadinessContext:
+    """Build the structural context a runner must match to a readiness report."""
+
+    cas_by_key = dict(cas_eligible_by_key)
+    tick_by_key = dict(tick_size_by_key)
+    if len(instrument_keys) == 1:
+        key = instrument_keys[0]
+        instrument_state: object = {
+            "instrument_key": key,
+            "exchange": "NSE",
+            "segment": "NSE_EQ",
+            "instrument_type": "EQ",
+            "cas_eligible": cas_by_key[key],
+            "tick_size_rupees": tick_by_key[key],
+        }
+        policy_state: object = NSEEquitySessionPolicy(
+            cas_eligible=cas_by_key[key],
+            exit_buffer_minutes=exit_buffer_minutes,
+        )
+    else:
+        instrument_state = [
+            {
+                "instrument_key": key,
+                "exchange": "NSE",
+                "segment": "NSE_EQ",
+                "instrument_type": "EQ",
+                "cas_eligible": cas_by_key[key],
+                "tick_size_rupees": tick_by_key[key],
+            }
+            for key in instrument_keys
+        ]
+        policy_state = [
+            NSEEquitySessionPolicy(
+                cas_eligible=cas_by_key[key],
+                exit_buffer_minutes=exit_buffer_minutes,
+            )
+            for key in instrument_keys
+        ]
+    return LiveMarketReadinessContext(
+        trade_date=trade_date,
+        timezone_name=timezone_name,
+        instrument_keys=instrument_keys,
+        instrument_context_fingerprint=_identity_fingerprint(
+            {"expected_instrument_keys": instrument_keys, "instrument": instrument_state}
+        ),
+        session_context_fingerprint=_identity_fingerprint(
+            {
+                "class": f"{type(policy_state).__module__}.{type(policy_state).__qualname__}",
+                "state": policy_state,
+            }
+        ),
+        capital_identity=_capital_identity(approved_capital),
+        quote_feed_fingerprint=_identity_fingerprint(
+            {
+                "source": "runner-declared-readiness-context",
+                "instrument_keys": instrument_keys,
+                "quote_freshness_threshold_seconds": quote_freshness_threshold_seconds,
+            }
+        ),
+        quote_freshness_threshold_seconds=quote_freshness_threshold_seconds,
+        readiness_max_age_seconds=readiness_max_age_seconds,
+    )
+
+
+def build_synthetic_readiness_report(
+    *,
+    checked_at_ist: datetime,
+    trade_date: date,
+    instrument_keys: tuple[str, ...],
+    cas_eligible_by_key: tuple[tuple[str, bool], ...],
+    tick_size_by_key: tuple[tuple[str, str], ...],
+    exit_buffer_minutes: int,
+    approved_capital: ApprovedCapital,
+    quote_freshness_threshold_seconds: float,
+    classification: ReadinessClassification = ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+) -> LiveMarketReadinessReport:
+    """Construct an explicit synthetic report for offline DRY_RUN rehearsal only."""
+
+    context = build_runner_readiness_context(
+        trade_date=trade_date,
+        timezone_name=REQUIRED_TIMEZONE,
+        instrument_keys=instrument_keys,
+        cas_eligible_by_key=cas_eligible_by_key,
+        tick_size_by_key=tick_size_by_key,
+        exit_buffer_minutes=exit_buffer_minutes,
+        approved_capital=approved_capital,
+        quote_freshness_threshold_seconds=quote_freshness_threshold_seconds,
+    )
+    return LiveMarketReadinessReport(
+        schema_version=SCHEMA_VERSION,
+        classification=classification,
+        reason_codes=(),
+        reasons=(),
+        checked_at_ist=checked_at_ist,
+        trade_date=trade_date,
+        context=context,
+        approved_capital_rupees=approved_capital.amount_rupees,
+        broker_available_to_trade=None,
+        effective_capital_rupees=approved_capital.amount_rupees,
+        live_orders_called=False,
+    )
+
 
 @dataclass(frozen=True)
 class ReasonDetail:
@@ -307,6 +594,7 @@ class LiveMarketReadinessReport:
     reasons: tuple[ReasonDetail, ...]
     checked_at_ist: datetime
     trade_date: date
+    context: LiveMarketReadinessContext
     approved_capital_rupees: Decimal | None
     broker_available_to_trade: Decimal | None
     effective_capital_rupees: Decimal | None
@@ -329,6 +617,10 @@ class LiveMarketReadinessReport:
             raise ValueError("reasons must match reason_codes exactly")
         if not isinstance(self.checked_at_ist, datetime):
             raise TypeError("checked_at_ist must be a datetime")
+        if self.context.trade_date != self.trade_date:
+            raise ValueError("readiness context trade_date does not match report")
+        if self.approved_capital_rupees is not None and self.context.capital_identity is None:
+            raise ValueError("readiness context lacks approved-capital identity")
 
     @property
     def infra_ready(self) -> bool:
@@ -347,7 +639,9 @@ class LiveMarketReadinessReport:
 
     @property
     def shadow_ready(self) -> bool:
-        return self.infra_ready
+        """Whether strategy shadow execution is permitted, not just infrastructure."""
+
+        return self.research_shadow_ready
 
     @property
     def live_review_ready(self) -> bool:
@@ -361,6 +655,8 @@ class LiveMarketReadinessReport:
             "reasons": [item.as_dict() for item in self.reasons],
             "checked_at_ist": self.checked_at_ist.isoformat(),
             "trade_date": self.trade_date.isoformat(),
+            "context": self.context.as_dict(),
+            "context_fingerprint": self.context.fingerprint(),
             "approved_capital_rupees": (
                 format(self.approved_capital_rupees, "f")
                 if self.approved_capital_rupees is not None
@@ -382,6 +678,60 @@ class LiveMarketReadinessReport:
             "live_review_ready": self.live_review_ready,
             "live_orders_called": False,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> LiveMarketReadinessReport:
+        """Load a persisted report while ignoring derived convenience booleans."""
+
+        if payload.get("live_orders_called") is not False:
+            raise ValueError("persisted readiness report has live-order activity")
+        context_payload = payload.get("context")
+        if not isinstance(context_payload, dict):
+            raise TypeError("persisted readiness report lacks context")
+        context = LiveMarketReadinessContext.from_dict(context_payload)
+        if payload.get("context_fingerprint") != context.fingerprint():
+            raise ValueError("persisted readiness context fingerprint mismatch")
+        raw_reasons = payload.get("reasons")
+        if not isinstance(raw_reasons, list):
+            raise TypeError("persisted readiness report reasons are invalid")
+        reasons = tuple(
+            ReasonDetail(
+                code=str(item["code"]),
+                message=str(item["message"]),
+                blocks_infra=bool(item["blocks_infra"]),
+                blocks_research_shadow=bool(item["blocks_research_shadow"]),
+            )
+            for item in raw_reasons
+            if isinstance(item, dict)
+        )
+        try:
+            return cls(
+                schema_version=str(payload["schema_version"]),
+                classification=ReadinessClassification(str(payload["classification"])),
+                reason_codes=tuple(str(item) for item in payload["reason_codes"]),
+                reasons=reasons,
+                checked_at_ist=datetime.fromisoformat(str(payload["checked_at_ist"])),
+                trade_date=date.fromisoformat(str(payload["trade_date"])),
+                context=context,
+                approved_capital_rupees=(
+                    Decimal(str(payload["approved_capital_rupees"]))
+                    if payload.get("approved_capital_rupees") is not None
+                    else None
+                ),
+                broker_available_to_trade=(
+                    Decimal(str(payload["broker_available_to_trade"]))
+                    if payload.get("broker_available_to_trade") is not None
+                    else None
+                ),
+                effective_capital_rupees=(
+                    Decimal(str(payload["effective_capital_rupees"]))
+                    if payload.get("effective_capital_rupees") is not None
+                    else None
+                ),
+                live_orders_called=False,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid persisted readiness report") from exc
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, indent=2) + "\n"
@@ -674,6 +1024,7 @@ def evaluate_live_market_readiness(inputs: LiveMarketReadinessInputs) -> LiveMar
         reasons=reasons,
         checked_at_ist=inputs.now_ist,
         trade_date=inputs.trade_date,
+        context=inputs.readiness_context(),
         approved_capital_rupees=approved,
         broker_available_to_trade=broker_balance,
         effective_capital_rupees=effective,
@@ -703,6 +1054,7 @@ __all__ = [
     "CLOCK_INVALID",
     "COST_RECONCILIATION_FAILED",
     "COST_RECONCILIATION_MISSING",
+    "DEFAULT_READINESS_MAX_AGE_SECONDS",
     "FEED_GAP_DETECTED",
     "FEED_STATUS_UNKNOWN",
     "FEED_UNAVAILABLE",
@@ -732,10 +1084,13 @@ __all__ = [
     "TICK_SIZE_UNVERIFIED",
     "TOKEN_MISSING",
     "FeedHealthEvidence",
+    "LiveMarketReadinessContext",
     "LiveMarketReadinessInputs",
     "LiveMarketReadinessReport",
     "ReadinessClassification",
     "ReasonDetail",
+    "build_runner_readiness_context",
+    "build_synthetic_readiness_report",
     "evaluate_live_market_readiness",
     "report_as_dict",
     "report_as_json",
