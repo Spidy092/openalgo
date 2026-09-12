@@ -105,13 +105,16 @@ def main(argv: list[str] | None = None) -> int:
             interval_minutes=_parse_interval(manifest.interval),
             cas_eligible=cas_eligible,
         )
+        manifest_fingerprint_reference = payload.get("fingerprint_sha256")
+        if manifest_fingerprint_reference is None:
+            manifest_fingerprint_reference = payload.get("data_fingerprint")
         report = validate_intraday_dataset(
             frame,
             manifest,
             session_rules=rules,
             manifest_fingerprint_reference=(
-                str(payload["fingerprint_sha256"])
-                if payload.get("fingerprint_sha256") is not None
+                str(manifest_fingerprint_reference)
+                if manifest_fingerprint_reference is not None
                 else None
             ),
             fingerprint_schema=(
