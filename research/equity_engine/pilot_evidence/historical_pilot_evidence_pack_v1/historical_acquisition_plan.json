@@ -16,7 +16,7 @@
     "source_id": "nse-corporate-actions:equities:2026-07-30:2026-08-03",
     "unknown_instruments": []
   },
-  "deterministic_fingerprint": "5f45d0b05f1b1ffa067a9b33b558bbf134a5f4f2caee2695cfe6dffd80fd5fb3",
+  "deterministic_fingerprint": "f7dd6582ff582a3aecadb77172ad06b5a99ce9df30171489f5fab0603c48f795",
   "estimated_bytes_per_row": 160,
   "estimated_rows": 226,
   "estimated_storage_bytes": 36160,
@@ -50,11 +50,6 @@
       "evidence_type": "PITMembershipSegment/NSE MII security snapshot",
       "fingerprint": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
       "source_id": "nse-mii-pit-snapshot:2026-08-03"
-    },
-    {
-      "evidence_type": "CAS eligibility current BOD record only",
-      "fingerprint": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
-      "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12"
     }
   ],
   "excluded_special_session_dates": [],
@@ -66,8 +61,8 @@
       "instruments": [
         "NSE_EQ|INE745G01043"
       ],
-      "population_fingerprint": "ccb136ad6e471e9954f3c8846b30a1c62510a08460355ccc3a0e970b6721fd8b",
-      "universe_policy_id": "historical-pilot-evidence-pack-v1:cas-filtered-pit-v1"
+      "population_fingerprint": "da717670aa47d6cd6855f030c4eb0c44b61770569dc5b8b2fff07fb2da923fef",
+      "universe_policy_id": "historical-pilot-evidence-pack-v1:dated-nse-cas-pit-v2"
     },
     "research_window_plan_fingerprint": "0d8729c5c9d5d96bfadf4fc663177a9cf44adb0ec9028f2f14aa0ea19b1f6542"
   },
@@ -100,6 +95,7 @@
     "2026-07-31",
     "2026-08-03"
   ],
+  "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
   "pit_segments": [
     {
       "eligible": true,
@@ -126,7 +122,7 @@
       "valid_to": "2026-08-03"
     }
   ],
-  "plan_id": "hap_5f45d0b05f1b1ffa",
+  "plan_id": "hap_f7dd6582ff582a3a",
   "requested_interval_minutes": [
     5
   ],

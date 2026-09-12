@@ -1,6 +1,6 @@
 {
   "live_orders_called": false,
-  "manifest_fingerprint": "8393b440e0400e71207a748e009748a1b8cd89107c4a26ecb9bf4329685753ce",
+  "manifest_fingerprint": "e58ff682bd0b1ea5dd27981850115a05c60574e54c4460b0e65b0ddbace0fea0",
   "pack_id": "historical-pilot-evidence-pack-v1",
   "population_separation": {
     "frozen_wfo_population": [
@@ -25,23 +25,6 @@
           "2026-08-03"
         ]
       },
-      "cas_eligibility_evidence": {
-        "instrument_record": {
-          "cas_eligible": true,
-          "instrument_key": "NSE_EQ|INE745G01043",
-          "instrument_type": "EQ",
-          "isin": "INE745G01043",
-          "name": "MULTI COMMODITY EXCHANGE",
-          "security_type": "NORMAL",
-          "segment": "NSE_EQ",
-          "trading_symbol": "MCX"
-        },
-        "payload_bytes": 1940184,
-        "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
-        "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
-        "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
-        "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
-      },
       "corporate_action_evidence": {
         "complete": true,
         "coverage_end": "2026-08-03",
@@ -60,6 +43,65 @@
         "unknown": false,
         "unknown_is_not_no_action": true,
         "url": "https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=30-07-2026&to_date=03-08-2026"
+      },
+      "corroborative_current_metadata": {
+        "blocking": false,
+        "classification": "CORROBORATIVE_CURRENT_METADATA",
+        "may_change_without_historical_plan_change": true,
+        "present": true,
+        "source": {
+          "instrument_record": {
+            "cas_eligible": true,
+            "instrument_key": "NSE_EQ|INE745G01043",
+            "instrument_type": "EQ",
+            "isin": "INE745G01043",
+            "name": "MULTI COMMODITY EXCHANGE",
+            "security_type": "NORMAL",
+            "segment": "NSE_EQ",
+            "trading_symbol": "MCX"
+          },
+          "payload_bytes": 1940184,
+          "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
+          "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
+          "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+          "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
+        },
+        "used_for_historical_cas_eligibility": false,
+        "used_for_historical_plan_identity": false,
+        "used_for_historical_selection": false,
+        "used_for_pit_eligibility": false
+      },
+      "dated_nse_cas_evidence": {
+        "selection_flags": {
+          "CallAuctnInd": "1",
+          "ElgbltyClsgAuctnSsn": "1",
+          "ElgbltyNrmlMkt": "1",
+          "PrtdToTrad": "1"
+        },
+        "session_policy_id": "nse-cm-session-policy:cas-effective-2026-08-03",
+        "source": {
+          "payload_bytes": 1209602,
+          "payload_sha256": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359",
+          "raw_fields": {
+            "BidIntrvl": "10",
+            "CallAuctnInd": "1",
+            "DelFlg": "N",
+            "ElgbltyClsgAuctnSsn": "1",
+            "ElgbltyNrmlMkt": "1",
+            "FinInstrmId": "31181",
+            "ISIN": "INE745G01043",
+            "NewBrdLotQty": "1",
+            "PrtdToTrad": "1",
+            "SctySrs": "EQ",
+            "SctyStsNrmlMkt": "6",
+            "SctyTpFlg": "0",
+            "TckrSymb": "MCX"
+          },
+          "source_id": "nse-mii-pit-snapshot:2026-08-03",
+          "source_row_number": 24122,
+          "url": "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_03082026.csv.gz"
+        },
+        "trade_date": "2026-08-03"
       },
       "dates": [
         {
@@ -173,6 +215,7 @@
       ],
       "instrument_key": "NSE_EQ|INE745G01043",
       "isin": "INE745G01043",
+      "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
       "role": "CAS_CONTROL",
       "selection_rank": 1,
       "symbol": "MCX"
@@ -181,6 +224,7 @@
   "selection_inputs": {
     "cas_effective_date": "2026-08-03",
     "cas_source": "https://www.nseindia.com/static/products-services/closing-auction-session",
+    "dated_cas_source_id": "nse-mii-pit-snapshot:2026-08-03",
     "max_instrument_trading_days": 7,
     "max_instruments": 3,
     "normal_dates": [
@@ -188,8 +232,8 @@
       "2026-07-31",
       "2026-08-03"
     ],
-    "selected_instrument_count": 1,
+    "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
     "selected_instrument_trading_days": 3
   },
-  "selection_rule": "From the exact pilot date intersection, retain NSE CM EQ rows with canonical v1.5 PrtdToTrad=1, ElgbltyNrmlMkt=1, active normal-market status, exact ISIN identity, and one PITMembershipSegment per date; on 2026-08-03 additionally require CallAuctnInd=1 and ElgbltyClsgAuctnSsn=1 plus current Upstox NSE EQ BOD cas_eligible=true. Sort instrument_key and select the first result. No price, performance, liquidity, MIS, BOD, or suspension backprojection is used."
+  "selection_rule": "From the exact pilot date intersection, retain dated NSE CM EQ rows with canonical v1.5 PrtdToTrad=1, ElgbltyNrmlMkt=1, active normal-market status, exact ISIN identity, and one PITMembershipSegment per date; on 2026-08-03 additionally require dated NSE CallAuctnInd=1 and ElgbltyClsgAuctnSsn=1 under the canonical NSE closing-auction session policy. Sort instrument_key and select the first result. No current BOD, price, performance, liquidity, MIS, or suspension backprojection is used."
 }

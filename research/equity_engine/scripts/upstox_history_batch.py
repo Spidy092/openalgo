@@ -110,6 +110,8 @@ def main() -> int:
             "mode": "dry-run-verified",
             "status": "verified",
             "acquisition_plan_fingerprint": acquisition_plan.deterministic_fingerprint,
+            "pit_evidence_fingerprint": evidence.pit_fingerprint,
+            "canonical_pit_evidence_fingerprint": acquisition_plan.pit_evidence_fingerprint,
             "acquisition_evidence_fingerprint": evidence.fingerprint(),
             "canonical_estimated_request_count": canonical_plan_payload["expected_request_count"],
             "canonical_estimated_rows": canonical_plan_payload["estimated_rows"],

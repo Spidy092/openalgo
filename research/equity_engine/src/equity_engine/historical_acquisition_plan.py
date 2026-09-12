@@ -20,6 +20,7 @@ from itertools import pairwise
 from typing import Any
 
 from .nse_calendar import CalendarEvidence
+from .provenance import canonical_sha256
 from .research_window_compiler import (
     FrozenTrainUniverse,
     PITMembershipSegment,
@@ -37,9 +38,29 @@ def _require_digest(name: str, value: str) -> None:
         raise ValueError(f"{name} must be a 64-character hexadecimal digest")
 
 
-def _canonical_sha256(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def aggregate_pit_evidence_fingerprint(
+    segments: Iterable[PITMembershipSegment],
+) -> str:
+    """Fingerprint all canonical PIT segment identity records in sorted order."""
+
+    records = []
+    for segment in segments:
+        if not isinstance(segment, PITMembershipSegment):
+            raise TypeError("PIT evidence must contain PITMembershipSegment records")
+        records.append(segment.as_dict())
+    if not records:
+        raise ValueError("PIT evidence must contain at least one segment")
+    records.sort(
+        key=lambda item: (
+            str(item["instrument_key"]),
+            str(item["valid_from"]),
+            str(item["valid_to"]),
+            str(item["evidence_as_of"]),
+            bool(item["eligible"]),
+            str(item["source_fingerprint"]),
+        )
+    )
+    return canonical_sha256({"pit_segments": records})
 
 
 def _date_tuple(values: Iterable[date], *, name: str) -> tuple[date, ...]:
@@ -463,6 +484,7 @@ class HistoricalAcquisitionPlan:
                 item.isoformat() for item in self.excluded_special_session_dates
             ],
             "evidence_sources": [item.as_dict() for item in self.evidence_sources],
+            "pit_evidence_fingerprint": aggregate_pit_evidence_fingerprint(self.pit_segments),
             "pit_segments": [item.as_dict() for item in self.pit_segments],
             "formation_boundary_adapter": self.formation_boundary_adapter.as_dict(),
             "historical_acquisition_superset": list(self.historical_acquisition_superset),
@@ -485,7 +507,7 @@ class HistoricalAcquisitionPlan:
         }
 
     def deterministic_fingerprint(self) -> str:
-        return _canonical_sha256(self.deterministic_payload())
+        return canonical_sha256(self.deterministic_payload())
 
     @property
     def plan_id(self) -> str:
@@ -639,7 +661,14 @@ def build_historical_acquisition_plan(
     segments = tuple(
         sorted(
             (item for item in raw_segments if isinstance(item, PITMembershipSegment)),
-            key=lambda item: (item.instrument_key, item.valid_from, item.valid_to),
+            key=lambda item: (
+                item.instrument_key,
+                item.valid_from,
+                item.valid_to,
+                item.evidence_as_of,
+                item.eligible,
+                item.source_fingerprint,
+            ),
         )
     )
     if not segments:

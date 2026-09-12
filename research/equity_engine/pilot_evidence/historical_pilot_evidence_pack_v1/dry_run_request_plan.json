@@ -17,6 +17,7 @@
   "interval_minutes": 5,
   "live_orders_called": false,
   "mode": "DRY_RUN",
+  "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
   "requests": [
     {
       "chunk_count": 1,

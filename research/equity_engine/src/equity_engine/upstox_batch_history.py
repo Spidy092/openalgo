@@ -16,7 +16,10 @@ from urllib.parse import quote
 import httpx
 import pandas as pd
 
-from .historical_acquisition_plan import HISTORICAL_ACQUISITION_PLAN_SCHEMA_VERSION
+from .historical_acquisition_plan import (
+    HISTORICAL_ACQUISITION_PLAN_SCHEMA_VERSION,
+    aggregate_pit_evidence_fingerprint,
+)
 from .historical_validation import IntradaySessionRule, validate_intraday_dataset
 from .provenance import (
     FINGERPRINT_SCHEMA,
@@ -25,6 +28,7 @@ from .provenance import (
     canonical_sha256,
     dataframe_fingerprint,
 )
+from .research_window_compiler import PITMembershipSegment
 from .upstox_history import (
     UPSTOX_HISTORY_BASE,
     HistoricalChunk,
@@ -868,6 +872,7 @@ class AcquisitionPlanBinding:
     """Validated execution identity extracted from a canonical dry-run plan."""
 
     deterministic_fingerprint: str
+    pit_evidence_fingerprint: str
     historical_acquisition_superset: tuple[str, ...]
     frozen_wfo_population: tuple[str, ...]
     requested_intervals: tuple[tuple[str, int, date, date, tuple[date, ...]], ...]
@@ -891,9 +896,9 @@ class AcquisitionPlanBinding:
             raise ArtifactValidationError(
                 "acquisition evidence fingerprint does not match the canonical acquisition plan"
             )
-        if evidence.pit_fingerprint not in self.pit_source_fingerprints:
+        if evidence.pit_fingerprint != self.pit_evidence_fingerprint:
             raise ArtifactValidationError(
-                "acquisition evidence PIT fingerprint is not bound to the canonical plan"
+                "acquisition evidence PIT fingerprint does not match the aggregate canonical plan fingerprint"
             )
         if evidence.corporate_action_fingerprint != self.corporate_action_fingerprint:
             raise ArtifactValidationError(
@@ -1034,6 +1039,39 @@ def load_acquisition_plan_binding(path: Path) -> AcquisitionPlanBinding:
             "canonical plan intervals do not cover its acquisition superset"
         )
 
+    raw_pit_segments = payload.get("pit_segments")
+    if not isinstance(raw_pit_segments, list) or not raw_pit_segments:
+        raise ArtifactCorruptionError("canonical plan pit_segments is invalid")
+    pit_segments: list[PITMembershipSegment] = []
+    for raw_segment in raw_pit_segments:
+        if not isinstance(raw_segment, dict):
+            raise ArtifactCorruptionError("canonical plan PIT segment is not an object")
+        try:
+            eligible = raw_segment["eligible"]
+            if not isinstance(eligible, bool):
+                raise TypeError("eligible is not boolean")
+            pit_segments.append(
+                PITMembershipSegment(
+                    instrument_key=str(raw_segment["instrument_key"]),
+                    valid_from=date.fromisoformat(str(raw_segment["valid_from"])),
+                    valid_to=date.fromisoformat(str(raw_segment["valid_to"])),
+                    evidence_as_of=date.fromisoformat(str(raw_segment["evidence_as_of"])),
+                    source_fingerprint=str(raw_segment["source_fingerprint"]),
+                    eligible=eligible,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactCorruptionError("canonical plan PIT segment is malformed") from exc
+    pit_evidence_fingerprint = _require_digest(
+        "canonical PIT evidence fingerprint", payload.get("pit_evidence_fingerprint")
+    )
+    try:
+        computed_pit_evidence_fingerprint = aggregate_pit_evidence_fingerprint(pit_segments)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactCorruptionError("canonical plan PIT evidence is malformed") from exc
+    if computed_pit_evidence_fingerprint != pit_evidence_fingerprint:
+        raise ArtifactCorruptionError("canonical plan PIT evidence fingerprint mismatch")
+
     sources = payload.get("evidence_sources")
     if not isinstance(sources, list):
         raise ArtifactCorruptionError("canonical plan evidence_sources is invalid")
@@ -1069,6 +1107,7 @@ def load_acquisition_plan_binding(path: Path) -> AcquisitionPlanBinding:
     )
     return AcquisitionPlanBinding(
         deterministic_fingerprint=fingerprint,
+        pit_evidence_fingerprint=pit_evidence_fingerprint,
         historical_acquisition_superset=superset,
         frozen_wfo_population=frozen,
         requested_intervals=interval_tuple,
