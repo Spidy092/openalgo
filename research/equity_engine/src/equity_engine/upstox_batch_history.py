@@ -225,6 +225,395 @@ class HistoricalBatchRunResult:
         return not self.failures and bool(self.items)
 
 
+_CANONICAL_MANIFEST_IDENTITY_FIELDS = (
+    "schema_version",
+    "artifact_type",
+    "request",
+    "pit_evidence_fingerprint",
+    "corporate_action_evidence_fingerprint",
+    "acquisition_plan_fingerprint",
+    "session_policy_identity",
+    "evidence_fingerprint",
+    "adjustment_policy",
+    "universe_rule_version",
+    "raw_sha256",
+    "raw_artifacts_identity",
+    "requested_dates",
+    "status",
+)
+
+
+def aggregate_raw_sha(raw_hashes: Iterable[str]) -> str:
+    return canonical_sha256({"chunks": list(raw_hashes)})
+
+
+def raw_sha_sidecar_path(raw_path: Path) -> Path:
+    """Return the sidecar path used for a Kiro immutable raw response."""
+
+    if raw_path.name.endswith(".raw.json"):
+        return raw_path.with_name(raw_path.name.removesuffix(".raw.json") + ".raw.sha256")
+    return raw_path.with_suffix(raw_path.suffix + ".sha256")
+
+
+def _immutable_chunk_provenance(item: Mapping[str, object]) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in item.items()
+        if key
+        not in {
+            "retrieval_timestamp",
+            "validation",
+            "error",
+            "status",
+            "manifest_fingerprint",
+            "raw_path",
+        }
+    }
+
+
+def _manifest_identity(payload: Mapping[str, object]) -> dict[str, object]:
+    try:
+        return {key: payload[key] for key in _CANONICAL_MANIFEST_IDENTITY_FIELDS}
+    except KeyError as exc:
+        raise ArtifactCorruptionError(
+            f"canonical acquisition manifest is missing {exc.args[0]!r}"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class KiroHistoricalDatasetManifest:
+    """Typed view over Kiro's persisted candidate manifest.
+
+    Kiro's JSON manifest is the canonical acquisition contract.  This type intentionally stores
+    the payload rather than copying its fields into a second manifest model; consumers access
+    validated projections through properties and retain the original payload for provenance.
+    """
+
+    payload: Mapping[str, object]
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> KiroHistoricalDatasetManifest:
+        if not isinstance(payload, Mapping):
+            raise ArtifactCorruptionError("canonical acquisition manifest is not an object")
+        if payload.get("schema_version") != _BATCH_SCHEMA_VERSION:
+            raise ArtifactCorruptionError("unsupported canonical acquisition manifest schema")
+        if payload.get("artifact_type") != "upstox_v3_historical_dataset":
+            raise ArtifactCorruptionError("unexpected canonical acquisition artifact type")
+        request = payload.get("request")
+        if not isinstance(request, Mapping):
+            raise ArtifactCorruptionError("canonical acquisition request is invalid")
+        for key in ("instrument_key", "symbol", "start", "end", "interval_minutes"):
+            if key not in request:
+                raise ArtifactCorruptionError(f"canonical acquisition request lacks {key}")
+        status = payload.get("status")
+        if status not in _STATE_VALUES:
+            raise ArtifactCorruptionError("canonical acquisition status is invalid")
+        if payload.get("live_orders_called") is not False:
+            raise ArtifactCorruptionError("canonical acquisition contains live-order activity")
+        for name in (
+            "pit_evidence_fingerprint",
+            "corporate_action_evidence_fingerprint",
+            "acquisition_plan_fingerprint",
+        ):
+            _require_digest(f"canonical acquisition {name}", payload.get(name))
+        for name in ("session_policy_identity", "adjustment_policy", "universe_rule_version"):
+            if not isinstance(payload.get(name), str) or not str(payload[name]).strip():
+                raise ArtifactCorruptionError(f"canonical acquisition {name} is required")
+        requested_dates = payload.get("requested_dates")
+        covered_dates = payload.get("covered_dates")
+        for name, values in (
+            ("requested_dates", requested_dates),
+            ("covered_dates", covered_dates),
+        ):
+            if not isinstance(values, list) or not values or values != sorted(set(values)):
+                raise ArtifactCorruptionError(f"canonical acquisition {name} is not sorted")
+            try:
+                [date.fromisoformat(str(item)) for item in values]
+            except ValueError as exc:
+                raise ArtifactCorruptionError(
+                    f"canonical acquisition {name} contains invalid dates"
+                ) from exc
+        if not set(covered_dates).issubset(requested_dates):
+            raise ArtifactCorruptionError(
+                "canonical acquisition covered dates exceed requested dates"
+            )
+        if (
+            payload.get("requested_start") != requested_dates[0]
+            or payload.get("requested_end") != requested_dates[-1]
+        ):
+            raise ArtifactCorruptionError("canonical acquisition date boundaries mismatch")
+        _require_digest("canonical acquisition raw SHA-256", payload.get("raw_sha256"))
+        _require_digest(
+            "canonical acquisition manifest fingerprint", payload.get("manifest_fingerprint")
+        )
+        if payload.get("manifest_fingerprint") != canonical_sha256(_manifest_identity(payload)):
+            raise ArtifactCorruptionError("canonical acquisition manifest fingerprint mismatch")
+        immutable = payload.get("raw_artifacts_identity")
+        raw_artifacts = payload.get("raw_artifacts")
+        if not isinstance(immutable, list) or not isinstance(raw_artifacts, list):
+            raise ArtifactCorruptionError("canonical acquisition raw provenance is invalid")
+        if immutable != [
+            _immutable_chunk_provenance(item) for item in raw_artifacts if isinstance(item, Mapping)
+        ]:
+            raise ArtifactCorruptionError("canonical acquisition raw provenance mismatch")
+        if len(immutable) != len(raw_artifacts):
+            raise ArtifactCorruptionError("canonical acquisition raw artifact entry is invalid")
+        for item in raw_artifacts:
+            if not isinstance(item, Mapping):
+                continue
+            for key in (
+                "pit_evidence_fingerprint",
+                "corporate_action_evidence_fingerprint",
+                "acquisition_plan_fingerprint",
+                "session_policy_identity",
+                "adjustment_policy",
+                "universe_rule_version",
+            ):
+                if item.get(key) != payload.get(key):
+                    raise ArtifactCorruptionError(
+                        f"canonical acquisition raw provenance {key} mismatch"
+                    )
+        expected_raw_sha = aggregate_raw_sha(
+            str(item["raw_sha256"]) for item in raw_artifacts if isinstance(item, Mapping)
+        )
+        if payload.get("raw_sha256") != expected_raw_sha:
+            raise ArtifactCorruptionError("canonical acquisition aggregate raw SHA-256 mismatch")
+        return cls(dict(payload))
+
+    @property
+    def instrument_key(self) -> str:
+        return str(self.payload["request"]["instrument_key"])
+
+    @property
+    def symbol(self) -> str:
+        return str(self.payload["request"]["symbol"])
+
+    @property
+    def interval(self) -> str:
+        return f"{int(self.payload['request']['interval_minutes'])}m"
+
+    @property
+    def requested_start(self) -> date:
+        return date.fromisoformat(str(self.payload["requested_start"]))
+
+    @property
+    def requested_end(self) -> date:
+        return date.fromisoformat(str(self.payload["requested_end"]))
+
+    @property
+    def requested_dates(self) -> tuple[date, ...]:
+        return tuple(date.fromisoformat(str(item)) for item in self.payload["requested_dates"])
+
+    @property
+    def covered_dates(self) -> tuple[date, ...]:
+        return tuple(date.fromisoformat(str(item)) for item in self.payload["covered_dates"])
+
+    @property
+    def raw_sha256(self) -> str:
+        return str(self.payload["raw_sha256"])
+
+    @property
+    def status(self) -> str:
+        return str(self.payload["status"])
+
+    @property
+    def timezone(self) -> str:
+        return str(self.payload["timezone"])
+
+    @property
+    def row_count(self) -> int:
+        return int(self.payload["rows"])
+
+    @property
+    def pit_fingerprint(self) -> str:
+        return str(self.payload["pit_evidence_fingerprint"])
+
+    @property
+    def corporate_action_fingerprint(self) -> str:
+        return str(self.payload["corporate_action_evidence_fingerprint"])
+
+    @property
+    def acquisition_plan_fingerprint(self) -> str:
+        return str(self.payload["acquisition_plan_fingerprint"])
+
+    @property
+    def session_policy_identity(self) -> str:
+        return str(self.payload["session_policy_identity"])
+
+    @property
+    def adjustment_policy(self) -> str:
+        return str(self.payload["adjustment_policy"])
+
+    @property
+    def source_reference(self) -> str:
+        market_manifest = self.payload.get("market_data_manifest")
+        if isinstance(market_manifest, Mapping):
+            return str(market_manifest.get("source_reference", ""))
+        return "upstox_v3_historical_candle"
+
+    @property
+    def parquet_path(self) -> Path:
+        value = self.payload.get("parquet_path")
+        if not isinstance(value, str) or not value.strip():
+            raise ArtifactCorruptionError("canonical COMPLETE acquisition lacks Parquet path")
+        return Path(value)
+
+    @property
+    def parquet_sha256(self) -> str:
+        return _require_digest("canonical Parquet SHA-256", self.payload.get("parquet_sha256"))
+
+    @property
+    def raw_artifacts(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(item for item in self.payload["raw_artifacts"] if isinstance(item, Mapping))
+
+    def fingerprint(self) -> str:
+        return str(self.payload["manifest_fingerprint"])
+
+    def as_dict(self) -> dict[str, object]:
+        return dict(self.payload)
+
+    @property
+    def market_data_manifest(self) -> MarketDataManifest:
+        persisted = self.payload.get("market_data_manifest")
+        if not isinstance(persisted, Mapping):
+            raise ArtifactCorruptionError("canonical acquisition market-data manifest is invalid")
+        return _market_manifest_from_payload(persisted)
+
+
+@dataclass(frozen=True)
+class KiroHistoricalAcquisitionArtifact:
+    """Kiro's canonical manifest/state plus the immutable files it owns."""
+
+    manifest: KiroHistoricalDatasetManifest
+    state: Mapping[str, object]
+    parquet_path: Path | None
+    raw_paths: tuple[Path, ...]
+
+
+def load_kiro_historical_acquisition(manifest_path: Path) -> KiroHistoricalAcquisitionArtifact:
+    """Load and verify a Kiro candidate manifest, state, raw bytes, and derived Parquet."""
+
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = KiroHistoricalDatasetManifest.from_payload(manifest_payload)
+    state_path = manifest_path.with_suffix(".state.json")
+    if not state_path.is_file():
+        raise ArtifactCorruptionError(f"canonical acquisition state is missing: {state_path}")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if not isinstance(state, Mapping):
+        raise ArtifactCorruptionError("canonical acquisition state is not an object")
+    for key in (
+        "schema_version",
+        "status",
+        "request",
+        "raw_sha256",
+        "requested_dates",
+        "adjustment_policy",
+        "universe_rule_version",
+        "completed_chunks",
+        "covered_dates",
+        "failure",
+        "live_orders_called",
+    ):
+        if key not in state:
+            raise ArtifactCorruptionError(f"canonical acquisition state lacks {key}")
+    if state["schema_version"] != _BATCH_SCHEMA_VERSION:
+        raise ArtifactCorruptionError("unsupported canonical acquisition state schema")
+    if state["status"] != manifest.status or state["request"] != manifest.payload["request"]:
+        raise ArtifactCorruptionError("canonical acquisition manifest/state mismatch")
+    if state["raw_sha256"] != manifest.raw_sha256:
+        raise ArtifactCorruptionError("canonical acquisition manifest/state raw SHA-256 mismatch")
+    if state["requested_dates"] != list(manifest.payload["requested_dates"]):
+        raise ArtifactCorruptionError(
+            "canonical acquisition manifest/state requested dates mismatch"
+        )
+    if state["covered_dates"] != list(manifest.payload["covered_dates"]):
+        raise ArtifactCorruptionError("canonical acquisition manifest/state covered dates mismatch")
+    if manifest.status == "COMPLETE" and state["failure"] is not None:
+        raise ArtifactCorruptionError("canonical COMPLETE acquisition state contains a failure")
+    for key in (
+        "pit_evidence_fingerprint",
+        "corporate_action_evidence_fingerprint",
+        "acquisition_plan_fingerprint",
+        "session_policy_identity",
+    ):
+        if state.get(key) != manifest.payload.get(key):
+            raise ArtifactCorruptionError(f"canonical acquisition manifest/state {key} mismatch")
+    for key in ("adjustment_policy", "universe_rule_version", "live_orders_called"):
+        if state.get(key) != manifest.payload.get(key):
+            raise ArtifactCorruptionError(f"canonical acquisition manifest/state {key} mismatch")
+    if state.get("completed_chunks") != [
+        {
+            "start": item["request"]["chunk_start"],
+            "end": item["request"]["chunk_end"],
+            "raw_sha256": item["raw_sha256"],
+            "status": "COMPLETE",
+        }
+        for item in manifest.raw_artifacts
+    ]:
+        raise ArtifactCorruptionError("canonical acquisition state/chunk provenance mismatch")
+
+    raw_paths: list[Path] = []
+    raw_hashes: list[str] = []
+    for item in manifest.raw_artifacts:
+        raw_path_value = item.get("raw_path")
+        if not isinstance(raw_path_value, str) or not raw_path_value.strip():
+            raise ArtifactCorruptionError("canonical acquisition raw path is invalid")
+        raw_path = Path(raw_path_value)
+        if not raw_path.is_file():
+            raise ArtifactCorruptionError(
+                f"canonical acquisition raw bytes are missing: {raw_path}"
+            )
+        raw_payload = raw_path.read_bytes()
+        raw_sha = bytes_sha256(raw_payload)
+        if raw_sha != item.get("raw_sha256"):
+            raise ArtifactCorruptionError(f"canonical acquisition raw SHA-256 mismatch: {raw_path}")
+        sha_path = raw_sha_sidecar_path(raw_path)
+        if not sha_path.is_file() or sha_path.read_text(encoding="utf-8").strip() != raw_sha:
+            raise ArtifactCorruptionError(
+                f"canonical acquisition raw SHA sidecar mismatch: {raw_path}"
+            )
+        raw_paths.append(raw_path)
+        raw_hashes.append(raw_sha)
+    if aggregate_raw_sha(raw_hashes) != manifest.raw_sha256:
+        raise ArtifactCorruptionError("canonical acquisition raw SHA-256 aggregate mismatch")
+
+    parquet_path: Path | None = None
+    if manifest.status == "COMPLETE":
+        parquet_path = manifest.parquet_path
+        if not parquet_path.is_file():
+            raise ArtifactCorruptionError(
+                f"canonical acquisition Parquet is missing: {parquet_path}"
+            )
+        parquet_bytes = parquet_path.read_bytes()
+        if bytes_sha256(parquet_bytes) != manifest.parquet_sha256:
+            raise ArtifactCorruptionError(
+                f"canonical acquisition Parquet SHA-256 mismatch: {parquet_path}"
+            )
+        frame = pd.read_parquet(io.BytesIO(parquet_bytes))
+        if len(frame) != manifest.row_count:
+            raise ArtifactCorruptionError("canonical acquisition Parquet row count mismatch")
+        if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+            raise ArtifactCorruptionError("canonical acquisition Parquet timezone is invalid")
+        if str(frame.index.tz) != manifest.timezone:
+            raise ArtifactCorruptionError("canonical acquisition Parquet timezone mismatch")
+        if tuple(sorted({timestamp.date() for timestamp in frame.index})) != manifest.covered_dates:
+            raise ArtifactCorruptionError("canonical acquisition Parquet coverage mismatch")
+        if dataframe_fingerprint(frame, manifest.market_data_manifest) != manifest.payload.get(
+            "data_fingerprint"
+        ):
+            raise ArtifactCorruptionError("canonical acquisition Parquet data fingerprint mismatch")
+        if manifest.covered_dates != manifest.requested_dates:
+            raise ArtifactCorruptionError(
+                "canonical COMPLETE acquisition does not cover requested dates"
+            )
+    return KiroHistoricalAcquisitionArtifact(
+        manifest=manifest,
+        state=dict(state),
+        parquet_path=parquet_path,
+        raw_paths=tuple(raw_paths),
+    )
+
+
 def historical_request_limit_days(interval: str) -> int:
     """Return the documented V3 maximum calendar span for an interval family."""
 
@@ -1413,22 +1802,7 @@ class UpstoxHistoricalBatchDownloader:
         failure: str | None = None,
     ) -> dict[str, object]:
         raw_hashes = [str(item["raw_sha256"]) for item in chunks]
-        immutable_chunk_provenance = [
-            {
-                key: value
-                for key, value in item.items()
-                if key
-                not in {
-                    "retrieval_timestamp",
-                    "validation",
-                    "error",
-                    "status",
-                    "manifest_fingerprint",
-                    "raw_path",
-                }
-            }
-            for item in chunks
-        ]
+        immutable_chunk_provenance = [_immutable_chunk_provenance(item) for item in chunks]
         identity = {
             "schema_version": _BATCH_SCHEMA_VERSION,
             "artifact_type": "upstox_v3_historical_dataset",
@@ -1436,8 +1810,9 @@ class UpstoxHistoricalBatchDownloader:
             **self._evidence_payload(evidence),
             "adjustment_policy": adjustment_policy,
             "universe_rule_version": universe_rule_version,
-            "raw_sha256": canonical_sha256({"chunks": raw_hashes}),
+            "raw_sha256": aggregate_raw_sha(raw_hashes),
             "raw_artifacts_identity": immutable_chunk_provenance,
+            "requested_dates": [item.isoformat() for item in evidence.expected_trade_dates],
             "status": status,
         }
         payload: dict[str, object] = {
@@ -1445,6 +1820,7 @@ class UpstoxHistoricalBatchDownloader:
             "retrieval_timestamp": retrieved_at.isoformat(),
             "requested_start": candidate.start.isoformat(),
             "requested_end": candidate.end.isoformat(),
+            "requested_dates": [item.isoformat() for item in evidence.expected_trade_dates],
             "covered_dates": sorted(
                 {
                     date.fromisoformat(item).isoformat()
@@ -1495,6 +1871,17 @@ class UpstoxHistoricalBatchDownloader:
                 **self._evidence_payload(evidence),
                 "adjustment_policy": adjustment_policy,
                 "universe_rule_version": universe_rule_version,
+                "requested_dates": [item.isoformat() for item in evidence.expected_trade_dates],
+                "raw_sha256": aggregate_raw_sha(
+                    str(item["raw_sha256"]) for item in completed_chunks
+                ),
+                "covered_dates": sorted(
+                    {
+                        str(trade_date)
+                        for item in completed_chunks
+                        for trade_date in item.get("covered_dates", [])
+                    }
+                ),
                 "completed_chunks": [
                     {
                         "start": item["request"]["chunk_start"],
@@ -1579,6 +1966,12 @@ class UpstoxHistoricalBatchDownloader:
             raise ArtifactCorruptionError("complete artifact state is not COMPLETE")
         if state.get("request") != self._candidate_request(candidate):
             raise ArtifactCorruptionError(f"complete artifact state request mismatch: {state_path}")
+        if state.get("requested_dates") != [
+            item.isoformat() for item in evidence.expected_trade_dates
+        ]:
+            raise ArtifactCorruptionError("complete artifact state requested dates mismatch")
+        if state.get("raw_sha256") != payload.get("raw_sha256"):
+            raise ArtifactCorruptionError("complete artifact state raw SHA-256 mismatch")
         for key, expected in self._evidence_payload(evidence).items():
             if payload.get(key) != expected or state.get(key) != expected:
                 raise ArtifactCorruptionError(f"complete artifact evidence mismatch for {key}")
@@ -1665,7 +2058,7 @@ class UpstoxHistoricalBatchDownloader:
             expected_raw_hashes.append(
                 _require_digest("chunk raw SHA-256", chunk_payload.get("raw_sha256"))
             )
-        if canonical_sha256({"chunks": expected_raw_hashes}) != payload.get("raw_sha256"):
+        if aggregate_raw_sha(expected_raw_hashes) != payload.get("raw_sha256"):
             raise ArtifactCorruptionError("complete artifact aggregate raw SHA-256 mismatch")
 
         expected_identity = self._candidate_manifest_base(

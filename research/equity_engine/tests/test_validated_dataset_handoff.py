@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,7 +9,8 @@ import pandas as pd
 import pytest
 
 from equity_engine.market_sessions import NSEEquitySessionPolicy
-from equity_engine.provenance import MarketDataManifest
+from equity_engine.provenance import MarketDataManifest, canonical_sha256, dataframe_fingerprint
+from equity_engine.upstox_batch_history import aggregate_raw_sha
 from equity_engine.validated_dataset_handoff import (
     AcquisitionArtifactManifest,
     AcquisitionStatus,
@@ -63,9 +64,15 @@ def _artifact(
     raw_sha256: str | None = None,
 ) -> RawAcquisitionArtifact:
     actual_frame = _frame() if frame is None else frame
-    raw_path = tmp_path / "raw.parquet"
-    actual_frame.to_parquet(raw_path)
-    raw_digest = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    parquet_path = tmp_path / "raw.parquet"
+    actual_frame.to_parquet(parquet_path)
+    raw_path = tmp_path / "2026-09-07.raw.json"
+    raw_payload = b'{"status":"success","data":{"candles":[]}}'
+    raw_path.write_bytes(raw_payload)
+    raw_digest = hashlib.sha256(raw_payload).hexdigest()
+    raw_path.with_name(raw_path.name.removesuffix(".raw.json") + ".raw.sha256").write_text(
+        f"{raw_digest}\n"
+    )
     policy = session_policy or NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=0)
     market_manifest = MarketDataManifest(
         provider="synthetic-local-fixture",
@@ -83,28 +90,111 @@ def _artifact(
         source_reference="synthetic:local-fixture",
     )
     trade_dates = tuple(sorted(set(actual_frame.index.date)))
-    manifest = AcquisitionArtifactManifest(
-        instrument_key=instrument_key,
-        interval=interval,
-        requested_start=trade_dates[0],
-        requested_end=trade_dates[-1],
-        requested_dates=trade_dates,
-        covered_dates=trade_dates,
-        raw_sha256=raw_sha256 or raw_digest,
-        status=status,
-        timezone=timezone,
-        row_count=len(actual_frame),
-        pit_fingerprint=pit_fingerprint or _digest("pit-v1"),
-        corporate_action_fingerprint=corporate_action_fingerprint or _digest("ca-v1"),
-        acquisition_plan_fingerprint=_digest("plan-v1"),
-        session_policy_identity=session_policy_fingerprint(policy),
-        adjustment_policy=adjustment_policy,
-        source_reference="synthetic:local-fixture",
-    )
+    pit = pit_fingerprint or _digest("pit-v1")
+    corporate_actions = corporate_action_fingerprint or _digest("ca-v1")
+    plan = _digest("plan-v1")
+    session_identity = session_policy_fingerprint(policy)
+    request = {
+        "instrument_key": instrument_key,
+        "symbol": "RELIANCE",
+        "start": trade_dates[0].isoformat(),
+        "end": trade_dates[-1].isoformat(),
+        "interval_minutes": int(interval.removesuffix("m")),
+    }
+    chunk = {
+        "schema_version": 1,
+        "artifact_type": "upstox_v3_historical_raw_response",
+        "request": {
+            **request,
+            "chunk_start": trade_dates[0].isoformat(),
+            "chunk_end": trade_dates[-1].isoformat(),
+        },
+        "covered_dates": [day.isoformat() for day in trade_dates],
+        "raw_sha256": raw_digest,
+        "rows": len(actual_frame),
+        "timezone": str(actual_frame.index.tz),
+        "adjustment_policy": adjustment_policy,
+        "pit_evidence_fingerprint": pit,
+        "corporate_action_evidence_fingerprint": corporate_actions,
+        "acquisition_plan_fingerprint": plan,
+        "session_policy_identity": session_identity,
+        "evidence_fingerprint": _digest("evidence-v1"),
+        "source_api": "upstox_v3_historical_candle",
+        "request_url": "synthetic:upstox-v3",
+        "universe_rule_version": "synthetic-pit-v1",
+        "retrieval_timestamp": datetime(2026, 9, 10, tzinfo=UTC).isoformat(),
+        "raw_path": str(raw_path),
+        "raw_bytes": len(raw_payload),
+        "min_timestamp": str(actual_frame.index[0]),
+        "max_timestamp": str(actual_frame.index[-1]),
+        "fingerprint_schema": "equity-market-data-v2",
+        "data_fingerprint": dataframe_fingerprint(actual_frame, market_manifest),
+        "validation": None,
+        "status": "COMPLETE",
+        "live_orders_called": False,
+        "manifest_fingerprint": _digest("chunk-manifest-v1"),
+    }
+    immutable_chunk = {
+        key: value
+        for key, value in chunk.items()
+        if key
+        not in {
+            "retrieval_timestamp",
+            "validation",
+            "error",
+            "status",
+            "manifest_fingerprint",
+            "raw_path",
+        }
+    }
+    parent_raw_sha = raw_sha256 or aggregate_raw_sha([raw_digest])
+    manifest_identity = {
+        "schema_version": 2,
+        "artifact_type": "upstox_v3_historical_dataset",
+        "request": request,
+        "pit_evidence_fingerprint": pit,
+        "corporate_action_evidence_fingerprint": corporate_actions,
+        "acquisition_plan_fingerprint": plan,
+        "session_policy_identity": session_identity,
+        "evidence_fingerprint": _digest("evidence-v1"),
+        "adjustment_policy": adjustment_policy,
+        "universe_rule_version": "synthetic-pit-v1",
+        "raw_sha256": parent_raw_sha,
+        "raw_artifacts_identity": [immutable_chunk],
+        "requested_dates": [day.isoformat() for day in trade_dates],
+        "status": status.value,
+    }
+    manifest_payload = {
+        **manifest_identity,
+        "retrieval_timestamp": datetime(2026, 9, 10, tzinfo=UTC).isoformat(),
+        "requested_start": trade_dates[0].isoformat(),
+        "requested_end": trade_dates[-1].isoformat(),
+        "covered_dates": [day.isoformat() for day in trade_dates],
+        "raw_bytes": len(raw_payload),
+        "rows": len(actual_frame),
+        "timezone": timezone,
+        "min_timestamp": str(actual_frame.index[0]),
+        "max_timestamp": str(actual_frame.index[-1]),
+        "fingerprint_schema": "equity-market-data-v2",
+        "failure": None,
+        "raw_artifacts": [chunk],
+        "manifest_fingerprint": canonical_sha256(manifest_identity),
+        "live_orders_called": False,
+        "parquet_path": str(parquet_path),
+        "parquet_sha256": hashlib.sha256(parquet_path.read_bytes()).hexdigest(),
+        "manifest_path": str(tmp_path / "synthetic.manifest.json"),
+        "market_data_manifest": asdict(market_manifest),
+        "validation": None,
+        "continuous_session_rows": 2,
+        "cas_auxiliary_rows": 2,
+    }
+    manifest = AcquisitionArtifactManifest.from_kiro_payload(manifest_payload)
     return RawAcquisitionArtifact(
-        raw_path=raw_path,
+        raw_path=parquet_path,
         manifest=manifest,
         market_data_manifest=market_manifest,
+        raw_byte_paths=(raw_path,),
+        parquet_sha256=hashlib.sha256(parquet_path.read_bytes()).hexdigest(),
     )
 
 
@@ -233,7 +323,7 @@ def test_duplicate_timestamps_fail_closed(tmp_path: Path) -> None:
 
 
 def test_missing_evidence_never_defaults(tmp_path: Path) -> None:
-    with pytest.raises(HandoffValidationError, match="pit_fingerprint"):
+    with pytest.raises(HandoffValidationError, match="pit.*fingerprint"):
         _artifact(tmp_path, pit_fingerprint="unknown")
 
 
@@ -241,29 +331,18 @@ def test_pit_corporate_action_and_session_mutations_change_identity(tmp_path: Pa
     first = _artifact(tmp_path)
     _, first_descriptor, _ = _run(first)
 
-    pit_changed = replace(
-        first, manifest=replace(first.manifest, pit_fingerprint=_digest("pit-v2"))
-    )
+    pit_changed = _artifact(tmp_path, pit_fingerprint=_digest("pit-v2"))
     _, pit_descriptor, _ = _run(pit_changed)
     assert (
         pit_descriptor.deterministic_fingerprint() != first_descriptor.deterministic_fingerprint()
     )
 
-    ca_changed = replace(
-        first,
-        manifest=replace(first.manifest, corporate_action_fingerprint=_digest("ca-v2")),
-    )
+    ca_changed = _artifact(tmp_path, corporate_action_fingerprint=_digest("ca-v2"))
     _, ca_descriptor, _ = _run(ca_changed)
     assert ca_descriptor.deterministic_fingerprint() != first_descriptor.deterministic_fingerprint()
 
     changed_policy = NSEEquitySessionPolicy(cas_eligible=True, exit_buffer_minutes=5)
-    policy_changed = replace(
-        first,
-        manifest=replace(
-            first.manifest,
-            session_policy_identity=session_policy_fingerprint(changed_policy),
-        ),
-    )
+    policy_changed = _artifact(tmp_path, session_policy=changed_policy)
     changed_result = build_validated_dataset_handoff(
         policy_changed,
         expected_instrument_key=policy_changed.manifest.instrument_key,
@@ -279,7 +358,7 @@ def test_pit_corporate_action_and_session_mutations_change_identity(tmp_path: Pa
 def test_adjustment_policy_mutation_changes_identity(tmp_path: Path) -> None:
     first = _artifact(tmp_path)
     _, first_descriptor, _ = _run(first)
-    changed = replace(first, manifest=replace(first.manifest, adjustment_policy="split-adjusted"))
+    changed = _artifact(tmp_path, adjustment_policy="split-adjusted")
     _, changed_descriptor, _ = _run(changed)
     assert (
         changed_descriptor.deterministic_fingerprint()

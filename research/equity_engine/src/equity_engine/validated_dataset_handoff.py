@@ -30,6 +30,13 @@ from .provenance import (
     dataframe_fingerprint,
     validate_ohlcv_frame,
 )
+from .upstox_batch_history import (
+    KiroHistoricalAcquisitionArtifact,
+    KiroHistoricalDatasetManifest,
+    aggregate_raw_sha,
+    load_kiro_historical_acquisition,
+    raw_sha_sidecar_path,
+)
 
 HANDOFF_SCHEMA_VERSION = "validated-dataset-handoff/v1"
 _HEX_DIGEST_LENGTH = 64
@@ -99,107 +106,136 @@ def _date_tuple(name: str, values: tuple[date, ...]) -> tuple[date, ...]:
 
 @dataclass(frozen=True)
 class AcquisitionArtifactManifest:
-    """The future Kiro-to-research manifest contract.
+    """Lossless Codex view over Kiro's canonical persisted acquisition manifest.
 
-    ``requested_dates`` are the exact dates requested from the acquisition plan, not an inferred
-    weekday range.  A COMPLETE artifact must cover exactly those dates.  This keeps holidays and
-    special sessions explicit instead of silently treating absent dates as missing candles.
+    This is an adapter, not a second manifest model.  The Kiro payload remains the only source
+    for acquisition identity, state, dates, evidence, and raw-byte provenance.
     """
 
-    instrument_key: str
-    interval: str
-    requested_start: date
-    requested_end: date
-    requested_dates: tuple[date, ...]
-    covered_dates: tuple[date, ...]
-    raw_sha256: str
-    status: AcquisitionStatus
-    timezone: str
-    row_count: int
-    pit_fingerprint: str
-    corporate_action_fingerprint: str
-    acquisition_plan_fingerprint: str
-    session_policy_identity: str
-    adjustment_policy: str
-    source_reference: str
-    raw_format: str = "parquet"
+    canonical: KiroHistoricalDatasetManifest
 
-    def __post_init__(self) -> None:
-        _require_nonempty("instrument_key", self.instrument_key)
-        _require_nonempty("interval", self.interval)
-        _require_nonempty("timezone", self.timezone)
-        _require_nonempty("session_policy_identity", self.session_policy_identity)
-        _require_nonempty("adjustment_policy", self.adjustment_policy)
-        _require_nonempty("source_reference", self.source_reference)
-        if self.requested_start > self.requested_end:
-            raise HandoffValidationError("requested date boundaries are invalid")
-        _date_tuple("requested_dates", self.requested_dates)
-        _date_tuple("covered_dates", self.covered_dates)
-        if self.requested_dates[0] < self.requested_start:
-            raise HandoffValidationError("requested_dates precede requested_start")
-        if self.requested_dates[-1] > self.requested_end:
-            raise HandoffValidationError("requested_dates exceed requested_end")
-        if any(
-            day < self.requested_start or day > self.requested_end for day in self.covered_dates
-        ):
-            raise HandoffValidationError("covered_dates exceed requested date boundaries")
-        if not set(self.covered_dates).issubset(self.requested_dates):
-            raise HandoffValidationError("covered_dates contain dates that were not requested")
-        _require_digest("raw_sha256", self.raw_sha256)
-        for name, value in (
-            ("pit_fingerprint", self.pit_fingerprint),
-            ("corporate_action_fingerprint", self.corporate_action_fingerprint),
-            ("acquisition_plan_fingerprint", self.acquisition_plan_fingerprint),
-        ):
-            _require_digest(name, value)
-        if not isinstance(self.status, AcquisitionStatus):
-            raise HandoffValidationError("status must be COMPLETE, PARTIAL, or FAILED")
-        if (
-            not isinstance(self.row_count, int)
-            or isinstance(self.row_count, bool)
-            or self.row_count <= 0
-        ):
-            raise HandoffValidationError("row_count must be a positive integer")
-        if self.raw_format != "parquet":
-            raise HandoffValidationError("only local parquet acquisition artifacts are supported")
+    @classmethod
+    def from_kiro_payload(cls, payload: dict[str, object]) -> AcquisitionArtifactManifest:
+        try:
+            return cls(KiroHistoricalDatasetManifest.from_payload(payload))
+        except ValueError as exc:
+            raise HandoffValidationError(
+                f"Kiro acquisition manifest is not trustworthy: {exc}"
+            ) from exc
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": HANDOFF_SCHEMA_VERSION,
-            "instrument_key": self.instrument_key,
-            "interval": self.interval,
-            "requested_start": self.requested_start.isoformat(),
-            "requested_end": self.requested_end.isoformat(),
-            "requested_dates": [day.isoformat() for day in self.requested_dates],
-            "covered_dates": [day.isoformat() for day in self.covered_dates],
-            "raw_sha256": self.raw_sha256,
-            "status": self.status.value,
-            "timezone": self.timezone,
-            "row_count": self.row_count,
-            "pit_fingerprint": self.pit_fingerprint,
-            "corporate_action_fingerprint": self.corporate_action_fingerprint,
-            "acquisition_plan_fingerprint": self.acquisition_plan_fingerprint,
-            "session_policy_identity": self.session_policy_identity,
-            "adjustment_policy": self.adjustment_policy,
-            "source_reference": self.source_reference,
-            "raw_format": self.raw_format,
-        }
+    @classmethod
+    def from_kiro_artifact(
+        cls, artifact: KiroHistoricalAcquisitionArtifact
+    ) -> AcquisitionArtifactManifest:
+        return cls(artifact.manifest)
+
+    @property
+    def instrument_key(self) -> str:
+        return self.canonical.instrument_key
+
+    @property
+    def interval(self) -> str:
+        return self.canonical.interval
+
+    @property
+    def requested_start(self) -> date:
+        return self.canonical.requested_start
+
+    @property
+    def requested_end(self) -> date:
+        return self.canonical.requested_end
+
+    @property
+    def requested_dates(self) -> tuple[date, ...]:
+        return self.canonical.requested_dates
+
+    @property
+    def covered_dates(self) -> tuple[date, ...]:
+        return self.canonical.covered_dates
+
+    @property
+    def raw_sha256(self) -> str:
+        return self.canonical.raw_sha256
+
+    @property
+    def status(self) -> AcquisitionStatus:
+        return AcquisitionStatus(self.canonical.status)
+
+    @property
+    def timezone(self) -> str:
+        return self.canonical.timezone
+
+    @property
+    def row_count(self) -> int:
+        return self.canonical.row_count
+
+    @property
+    def pit_fingerprint(self) -> str:
+        return self.canonical.pit_fingerprint
+
+    @property
+    def corporate_action_fingerprint(self) -> str:
+        return self.canonical.corporate_action_fingerprint
+
+    @property
+    def acquisition_plan_fingerprint(self) -> str:
+        return self.canonical.acquisition_plan_fingerprint
+
+    @property
+    def session_policy_identity(self) -> str:
+        return self.canonical.session_policy_identity
+
+    @property
+    def adjustment_policy(self) -> str:
+        return self.canonical.adjustment_policy
+
+    @property
+    def source_reference(self) -> str:
+        return self.canonical.source_reference
+
+    @property
+    def parquet_sha256(self) -> str:
+        return self.canonical.parquet_sha256
+
+    def as_dict(self) -> dict[str, object]:
+        return self.canonical.as_dict()
 
     def fingerprint(self) -> str:
-        return _canonical_sha256(self.as_dict())
+        return self.canonical.fingerprint()
 
 
 @dataclass(frozen=True)
 class RawAcquisitionArtifact:
-    """A local immutable-by-contract raw file plus its acquisition manifest."""
+    """Kiro-owned immutable raw bytes plus its canonical manifest and derived Parquet."""
 
-    raw_path: Path
+    raw_path: Path | None
     manifest: AcquisitionArtifactManifest
-    market_data_manifest: MarketDataManifest
+    market_data_manifest: MarketDataManifest | None
+    raw_byte_paths: tuple[Path, ...] = ()
+    parquet_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.raw_path, Path):
-            raise HandoffValidationError("raw_path must be a pathlib.Path")
+        if self.raw_path is not None and not isinstance(self.raw_path, Path):
+            raise HandoffValidationError("raw_path must be a pathlib.Path or None")
+        if any(not isinstance(path, Path) for path in self.raw_byte_paths):
+            raise HandoffValidationError("raw_byte_paths must contain pathlib.Path values")
+
+    @classmethod
+    def from_kiro_manifest(cls, manifest_path: Path) -> RawAcquisitionArtifact:
+        loaded = load_kiro_historical_acquisition(manifest_path)
+        return cls(
+            raw_path=loaded.parquet_path,
+            manifest=AcquisitionArtifactManifest.from_kiro_artifact(loaded),
+            market_data_manifest=(
+                loaded.manifest.market_data_manifest
+                if loaded.manifest.status == "COMPLETE"
+                else None
+            ),
+            raw_byte_paths=loaded.raw_paths,
+            parquet_sha256=(
+                loaded.manifest.parquet_sha256 if loaded.manifest.status == "COMPLETE" else None
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -369,6 +405,41 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _raw_source_sha256(artifact: RawAcquisitionArtifact) -> str:
+    """Return Kiro's canonical aggregate raw-byte SHA, or the legacy fixture file SHA."""
+
+    if artifact.raw_byte_paths:
+        raw_hashes: list[str] = []
+        for raw_path in artifact.raw_byte_paths:
+            raw_sha = _sha256_file(raw_path)
+            sidecar = raw_sha_sidecar_path(raw_path)
+            try:
+                recorded_sha = sidecar.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise HandoffValidationError(
+                    f"cannot read raw acquisition SHA sidecar: {sidecar}"
+                ) from exc
+            if recorded_sha != raw_sha:
+                raise HandoffValidationError(
+                    f"raw acquisition SHA-256 sidecar mismatch: {raw_path}"
+                )
+            raw_hashes.append(raw_sha)
+        return aggregate_raw_sha(raw_hashes)
+    if artifact.raw_path is None:
+        raise HandoffValidationError("raw acquisition has no readable raw source")
+    return _sha256_file(artifact.raw_path)
+
+
+def _assert_parquet_unchanged(artifact: RawAcquisitionArtifact) -> None:
+    if artifact.raw_path is None:
+        raise HandoffValidationError("COMPLETE acquisition has no Parquet path")
+    if (
+        artifact.parquet_sha256 is not None
+        and _sha256_file(artifact.raw_path) != artifact.parquet_sha256
+    ):
+        raise HandoffValidationError("derived Parquet SHA-256 no longer matches its manifest")
+
+
 def session_policy_fingerprint(policy: ContinuousSessionPolicy) -> str:
     """Derive a stable identity from a dataclass-backed effective session policy."""
 
@@ -387,8 +458,9 @@ def _assert_verified_frame_unchanged(verified: VerifiedRawAcquisition) -> None:
     """Reject mutation of either the source file or the in-memory verified frame."""
 
     artifact = verified.artifact
-    if _sha256_file(artifact.raw_path) != artifact.manifest.raw_sha256:
+    if _raw_source_sha256(artifact) != artifact.manifest.raw_sha256:
         raise HandoffValidationError("raw acquisition SHA-256 no longer matches its manifest")
+    _assert_parquet_unchanged(artifact)
     frame = verified.frame
     if len(frame) != artifact.manifest.row_count:
         raise HandoffValidationError("verified frame row count no longer matches its manifest")
@@ -420,6 +492,8 @@ def verify_raw_acquisition(
     if manifest.interval != expected_interval:
         raise HandoffValidationError("acquisition interval does not match the requested interval")
     market_manifest = artifact.market_data_manifest
+    if market_manifest is None:
+        raise HandoffValidationError("COMPLETE acquisition lacks its market-data manifest")
     if market_manifest.instrument_token != manifest.instrument_key:
         raise HandoffValidationError("market-data manifest instrument does not match acquisition")
     if market_manifest.interval != manifest.interval:
@@ -427,10 +501,11 @@ def verify_raw_acquisition(
     if market_manifest.timezone != manifest.timezone:
         raise HandoffValidationError("market-data manifest timezone does not match acquisition")
 
-    if not artifact.raw_path.is_file():
+    if artifact.raw_path is None or not artifact.raw_path.is_file():
         raise HandoffValidationError("raw acquisition artifact does not exist")
-    if _sha256_file(artifact.raw_path) != manifest.raw_sha256:
+    if _raw_source_sha256(artifact) != manifest.raw_sha256:
         raise HandoffValidationError("raw acquisition SHA-256 does not match its manifest")
+    _assert_parquet_unchanged(artifact)
     try:
         frame = pd.read_parquet(artifact.raw_path)
     except Exception as exc:
