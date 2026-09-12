@@ -16,6 +16,7 @@ from equity_engine.historical_acquisition_plan import (
     HistoricalAcquisitionEvidenceError,
     PITMembershipSegment,
     SessionEvidence,
+    aggregate_pit_evidence_fingerprint,
     build_example_historical_acquisition_plan,
     build_historical_acquisition_plan,
 )
@@ -241,7 +242,51 @@ def test_plan_identity_is_deterministic_and_binds_segment_evidence() -> None:
     assert changed.deterministic_fingerprint() != first.deterministic_fingerprint()
 
 
-def test_missing_segment_source_fails_closed() -> None:
+def test_aggregate_pit_fingerprint_binds_all_segments_and_is_order_invariant() -> None:
+    segments = (
+        PITMembershipSegment(
+            instrument_key="NSE_EQ|MCX",
+            valid_from=date(2026, 7, 30),
+            valid_to=date(2026, 7, 30),
+            evidence_as_of=date(2026, 7, 30),
+            source_fingerprint=_digest("pit-july-30"),
+            eligible=True,
+        ),
+        PITMembershipSegment(
+            instrument_key="NSE_EQ|MCX",
+            valid_from=date(2026, 7, 31),
+            valid_to=date(2026, 8, 2),
+            evidence_as_of=date(2026, 7, 31),
+            source_fingerprint=_digest("pit-july-31"),
+            eligible=True,
+        ),
+        PITMembershipSegment(
+            instrument_key="NSE_EQ|MCX",
+            valid_from=date(2026, 8, 3),
+            valid_to=date(2026, 8, 3),
+            evidence_as_of=date(2026, 8, 3),
+            source_fingerprint=_digest("pit-august-3"),
+            eligible=True,
+        ),
+    )
+    baseline = aggregate_pit_evidence_fingerprint(segments)
+
+    assert aggregate_pit_evidence_fingerprint(tuple(reversed(segments))) == baseline
+    for index, label in enumerate(("changed-july-30", "changed-july-31", "changed-august-3")):
+        changed = (
+            segments[:index]
+            + (replace(segments[index], source_fingerprint=_digest(label)),)
+            + segments[index + 1 :]
+        )
+        assert aggregate_pit_evidence_fingerprint(changed) != baseline
+
+    assert (
+        aggregate_pit_evidence_fingerprint(
+            (replace(segments[1], eligible=False), *segments[0:1], segments[2])
+        )
+        != baseline
+    )
+
     days = (date(2024, 10, 1), date(2024, 10, 2))
     unknown_source = _segment(KEY_A, days[0], days[-1], evidence_as_of=days[0])
     unknown_source = replace(unknown_source, source_fingerprint=_digest("not-supplied"))

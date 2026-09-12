@@ -62,6 +62,33 @@
     "unknown": false,
     "url": "https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=30-07-2026&to_date=03-08-2026"
   },
+  "corroborative_current_metadata": {
+    "blocking": false,
+    "classification": "CORROBORATIVE_CURRENT_METADATA",
+    "may_change_without_historical_plan_change": true,
+    "present": true,
+    "source": {
+      "instrument_record": {
+        "cas_eligible": true,
+        "instrument_key": "NSE_EQ|INE745G01043",
+        "instrument_type": "EQ",
+        "isin": "INE745G01043",
+        "name": "MULTI COMMODITY EXCHANGE",
+        "security_type": "NORMAL",
+        "segment": "NSE_EQ",
+        "trading_symbol": "MCX"
+      },
+      "payload_bytes": 1940184,
+      "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
+      "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
+      "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+      "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
+    },
+    "used_for_historical_cas_eligibility": false,
+    "used_for_historical_plan_identity": false,
+    "used_for_historical_selection": false,
+    "used_for_pit_eligibility": false
+  },
   "credentials_included": false,
   "historical_candles_downloaded": false,
   "live_orders_called": false,
@@ -133,9 +160,12 @@
       "url": "https://nsearchives.nseindia.com/content/cm/NSE_CM_security_03082026.csv.gz"
     }
   ],
+  "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
   "planner_special_session": {
     "calendar_source_id": "nse-cm-calendar:2026",
-    "classification": "SPECIAL_SESSION_EXCLUDED",
+    "classification": "OUTSIDE_PILOT_WINDOW",
+    "counted_as_instrument_trading_day": false,
+    "session_classification": "SPECIAL_SESSION_EXCLUDED",
     "source_urls": [
       "https://nsearchives.nseindia.com/content/circulars/CMTR71775.pdf",
       "https://nsearchives.nseindia.com/content/circulars/CMTR72260.pdf"
@@ -161,22 +191,5 @@
     "policy": "NSEEquitySessionPolicy",
     "policy_id": "nse-cm-session-policy:cas-effective-2026-08-03",
     "timezone": "Asia/Kolkata"
-  },
-  "upstox_bod_cas_evidence": {
-    "instrument_record": {
-      "cas_eligible": true,
-      "instrument_key": "NSE_EQ|INE745G01043",
-      "instrument_type": "EQ",
-      "isin": "INE745G01043",
-      "name": "MULTI COMMODITY EXCHANGE",
-      "security_type": "NORMAL",
-      "segment": "NSE_EQ",
-      "trading_symbol": "MCX"
-    },
-    "payload_bytes": 1940184,
-    "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
-    "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
-    "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
-    "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
   }
 }

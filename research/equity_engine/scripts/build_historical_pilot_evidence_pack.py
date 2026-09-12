@@ -7,7 +7,6 @@ It never reads credentials, calls Upstox historical candles, or reaches an order
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import date, time
 from pathlib import Path
@@ -18,6 +17,7 @@ from equity_engine.historical_acquisition_plan import (
     EvidenceSourceIdentity,
     FormationBoundaryAdapter,
     SessionEvidence,
+    aggregate_pit_evidence_fingerprint,
     build_historical_acquisition_plan,
 )
 from equity_engine.historical_validation import nse_session_rules_for_calendar
@@ -29,6 +29,7 @@ from equity_engine.market_sessions import (
     NSE_NORMAL_CONTINUOUS_START,
 )
 from equity_engine.nse_calendar import nse_cm_normal_session_calendar
+from equity_engine.provenance import bytes_sha256, canonical_sha256
 from equity_engine.research_window_compiler import (
     FrozenTrainUniverse,
     PITMembershipSegment,
@@ -163,18 +164,13 @@ CA_SOURCE = {
 }
 
 
-def _canonical_sha256(payload: Any) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return bytes_sha256(path.read_bytes())
 
 
 def _build_source_fingerprints(
@@ -188,10 +184,53 @@ def _build_source_fingerprints(
         ],
         "source_urls": list(calendar.source_urls),
     }
-    return _canonical_sha256(calendar_payload), _canonical_sha256(session_policy_payload)
+    return canonical_sha256(calendar_payload), canonical_sha256(session_policy_payload)
 
 
-def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
+def _corroborative_current_metadata(
+    current_bod: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "classification": "CORROBORATIVE_CURRENT_METADATA",
+        "present": current_bod is not None,
+        "blocking": False,
+        "used_for_historical_selection": False,
+        "used_for_pit_eligibility": False,
+        "used_for_historical_cas_eligibility": False,
+        "used_for_historical_plan_identity": False,
+        "may_change_without_historical_plan_change": True,
+        "source": current_bod,
+    }
+
+
+def _dated_nse_candidate_eligible(
+    trade_date: date,
+    source: dict[str, Any],
+) -> bool:
+    fields = source["raw_fields"]
+    common_flags = (
+        fields.get("ISIN") == "INE745G01043",
+        fields.get("TckrSymb") == SYMBOL,
+        fields.get("SctySrs") == "EQ",
+        fields.get("PrtdToTrad") == "1",
+        fields.get("ElgbltyNrmlMkt") == "1",
+        fields.get("SctyStsNrmlMkt") == "6",
+        fields.get("DelFlg") == "N",
+    )
+    if not all(common_flags):
+        return False
+    if trade_date == NSE_CAS_EFFECTIVE_DATE:
+        return fields.get("CallAuctnInd") == "1" and fields.get("ElgbltyClsgAuctnSsn") == "1"
+    return True
+
+
+def _build_plan(
+    *,
+    mii_source: dict[str, dict[str, Any]] | None = None,
+    current_bod: dict[str, Any] | None = BOD_SOURCE,
+) -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
+    mii_source = MII_SOURCE if mii_source is None else mii_source
+    current_metadata = _corroborative_current_metadata(current_bod)
     calendar = nse_cm_normal_session_calendar(start=RESEARCH_START, end=RESEARCH_END)
     if calendar.trading_dates != (RESEARCH_START, date(2026, 7, 31), RESEARCH_END):
         raise ValueError(f"unexpected canonical pilot calendar: {calendar.trading_dates}")
@@ -227,7 +266,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             valid_from=date.fromisoformat(trade_date),
             valid_to=date.fromisoformat(segment_end),
             evidence_as_of=date.fromisoformat(trade_date),
-            source_fingerprint=str(MII_SOURCE[trade_date]["payload_sha256"]),
+            source_fingerprint=str(mii_source[trade_date]["payload_sha256"]),
             eligible=True,
         )
         for trade_date, segment_end in (
@@ -271,7 +310,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             "unknown_is_not_no_action": True,
         },
     }
-    ca_fingerprint = _canonical_sha256(ca_identity_payload)
+    ca_fingerprint = canonical_sha256(ca_identity_payload)
     corporate_actions = CorporateActionEvidence(
         source_id=CA_SOURCE_ID,
         fingerprint=ca_fingerprint,
@@ -298,6 +337,9 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
         or cas_rule.auxiliary_end_time != time(15, 35)
     ):
         raise ValueError("canonical CAS session rule did not round-trip to 15:15/15:35")
+    for trade_date in calendar.trading_dates:
+        if not _dated_nse_candidate_eligible(trade_date, mii_source[trade_date.isoformat()]):
+            raise ValueError(f"dated NSE CAS/listing evidence failed for {trade_date.isoformat()}")
 
     sessions = tuple(
         SessionEvidence(
@@ -314,7 +356,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
         for trade_date, rule in sorted(session_rules.items())
     )
 
-    population_policy_id = "historical-pilot-evidence-pack-v1:cas-filtered-pit-v1"
+    population_policy_id = "historical-pilot-evidence-pack-v1:dated-nse-cas-pit-v2"
     population_fingerprint = derive_population_fingerprint(
         instruments=(INSTRUMENT_KEY,),
         universe_policy_id=population_policy_id,
@@ -326,7 +368,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
         population_fingerprint=population_fingerprint,
         frozen_as_of=RESEARCH_START,
     )
-    formation_fingerprint = _canonical_sha256(
+    formation_fingerprint = canonical_sha256(
         {
             "artifact": "historical-pilot-evidence-pack-v1",
             "formation_boundary": RESEARCH_START.isoformat(),
@@ -352,11 +394,6 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             fingerprint=session_fingerprint,
         ),
         EvidenceSourceIdentity(
-            source_id=BOD_SOURCE_ID,
-            evidence_type="CAS eligibility current BOD record only",
-            fingerprint=str(BOD_SOURCE["payload_sha256"]),
-        ),
-        EvidenceSourceIdentity(
             source_id=CA_SOURCE_ID,
             evidence_type="corporate-action coverage and no-action evidence",
             fingerprint=ca_fingerprint,
@@ -368,7 +405,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             evidence_type="PITMembershipSegment/NSE MII security snapshot",
             fingerprint=str(source["payload_sha256"]),
         )
-        for source in MII_SOURCE.values()
+        for source in (mii_source[key] for key in sorted(mii_source))
     )
 
     plan = build_historical_acquisition_plan(
@@ -393,8 +430,9 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             f"unexpected plan estimate: requests={plan.expected_request_count} rows={plan.estimated_rows}"
         )
 
+    pit_evidence_fingerprint = aggregate_pit_evidence_fingerprint(pit_segments)
     acquisition_evidence = HistoricalAcquisitionEvidence(
-        pit_fingerprint=pit_segments[0].source_fingerprint,
+        pit_fingerprint=pit_evidence_fingerprint,
         corporate_action_fingerprint=ca_fingerprint,
         acquisition_plan_fingerprint=plan.deterministic_fingerprint(),
         session_policy_identity=SESSION_SOURCE_ID,
@@ -413,6 +451,9 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
             "ca_identity_payload": ca_identity_payload,
             "ca_fingerprint": ca_fingerprint,
             "pit_segments": pit_segments,
+            "pit_evidence_fingerprint": pit_evidence_fingerprint,
+            "mii_source": mii_source,
+            "current_metadata": current_metadata,
             "session_rules": session_rules,
         },
     )
@@ -421,7 +462,7 @@ def _build_plan() -> tuple[Any, HistoricalAcquisitionEvidence, dict[str, Any]]:
 def _candidate_manifest(plan: Any, context: dict[str, Any]) -> dict[str, Any]:
     dates = []
     for trade_date in plan.normal_trading_dates:
-        source = MII_SOURCE[trade_date.isoformat()]
+        source = context["mii_source"][trade_date.isoformat()]
         fields = dict(source["raw_fields"])
         dates.append(
             {
@@ -431,7 +472,7 @@ def _candidate_manifest(plan: Any, context: dict[str, Any]) -> dict[str, Any]:
                     segment.covers(trade_date) for segment in context["pit_segments"]
                 )
                 == 1,
-                "eligible": True,
+                "eligible": _dated_nse_candidate_eligible(trade_date, source),
                 "listed_on_nse": True,
                 "normal_equity": True,
                 "tradeable_in_normal_market": True,
@@ -452,20 +493,22 @@ def _candidate_manifest(plan: Any, context: dict[str, Any]) -> dict[str, Any]:
         "schema_version": "historical-pilot-candidate-manifest/v1",
         "pack_id": "historical-pilot-evidence-pack-v1",
         "selection_rule": (
-            "From the exact pilot date intersection, retain NSE CM EQ rows with canonical v1.5 "
-            "PrtdToTrad=1, ElgbltyNrmlMkt=1, active normal-market status, exact ISIN identity, "
-            "and one PITMembershipSegment per date; on 2026-08-03 additionally require "
-            "CallAuctnInd=1 and ElgbltyClsgAuctnSsn=1 plus current Upstox NSE EQ BOD "
-            "cas_eligible=true. Sort instrument_key and select the first result. No price, "
-            "performance, liquidity, MIS, BOD, or suspension backprojection is used."
+            "From the exact pilot date intersection, retain dated NSE CM EQ rows with canonical "
+            "v1.5 PrtdToTrad=1, ElgbltyNrmlMkt=1, active normal-market status, exact ISIN "
+            "identity, and one PITMembershipSegment per date; on 2026-08-03 additionally "
+            "require dated NSE CallAuctnInd=1 and ElgbltyClsgAuctnSsn=1 under the canonical "
+            "NSE closing-auction session policy. Sort instrument_key and select the first "
+            "result. No current BOD, price, performance, liquidity, MIS, or suspension "
+            "backprojection is used."
         ),
         "selection_inputs": {
             "normal_dates": [item.isoformat() for item in plan.normal_trading_dates],
             "cas_effective_date": NSE_CAS_EFFECTIVE_DATE.isoformat(),
             "cas_source": NSE_CAS_SOURCE,
+            "dated_cas_source_id": context["mii_source"]["2026-08-03"]["source_id"],
+            "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
             "max_instruments": 3,
             "max_instrument_trading_days": 7,
-            "selected_instrument_count": 1,
             "selected_instrument_trading_days": len(dates),
         },
         "selected_candidates": [
@@ -476,7 +519,19 @@ def _candidate_manifest(plan: Any, context: dict[str, Any]) -> dict[str, Any]:
                 "selection_rank": 1,
                 "role": "CAS_CONTROL",
                 "dates": dates,
-                "cas_eligibility_evidence": BOD_SOURCE,
+                "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
+                "dated_nse_cas_evidence": {
+                    "trade_date": RESEARCH_END.isoformat(),
+                    "source": context["mii_source"][RESEARCH_END.isoformat()],
+                    "session_policy_id": SESSION_SOURCE_ID,
+                    "selection_flags": {
+                        "CallAuctnInd": "1",
+                        "ElgbltyClsgAuctnSsn": "1",
+                        "ElgbltyNrmlMkt": "1",
+                        "PrtdToTrad": "1",
+                    },
+                },
+                "corroborative_current_metadata": context["current_metadata"],
                 "corporate_action_evidence": {
                     **CA_SOURCE,
                     "fingerprint": context["ca_fingerprint"],
@@ -505,12 +560,25 @@ def _candidate_manifest(plan: Any, context: dict[str, Any]) -> dict[str, Any]:
         },
         "live_orders_called": False,
     }
-    manifest["manifest_fingerprint"] = _canonical_sha256(manifest)
+    identity_manifest = dict(manifest)
+    identity_manifest["selected_candidates"] = [
+        {key: value for key, value in candidate.items() if key != "corroborative_current_metadata"}
+        for candidate in manifest["selected_candidates"]
+    ]
+    manifest["manifest_fingerprint"] = canonical_sha256(identity_manifest)
     return manifest
 
 
-def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
-    plan, acquisition_evidence, context = _build_plan()
+def build_pack(
+    output_dir: Path = PACK_ROOT,
+    *,
+    mii_source: dict[str, dict[str, Any]] | None = None,
+    current_bod: dict[str, Any] | None = BOD_SOURCE,
+) -> dict[str, Any]:
+    plan, acquisition_evidence, context = _build_plan(
+        mii_source=mii_source,
+        current_bod=current_bod,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plan_path = output_dir / "historical_acquisition_plan.json"
@@ -544,16 +612,17 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
     prefilter = {
         "schema_version": "historical-pilot-prefilter-evidence/v1",
         "candidate_manifest_fingerprint": manifest["manifest_fingerprint"],
+        "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
         "selection_rule": manifest["selection_rule"],
         "candidate_file": "candidate_file.json",
-        "candidate_file_sha256": _canonical_sha256(candidate_payload),
+        "candidate_file_sha256": canonical_sha256(candidate_payload),
         "affordability_prefilter_applied": True,
         "affordability_note": "Pilot scope is deterministic and bounded; no price/performance ranking or broad acquisition was performed.",
         "historical_acquisition_superset": list(plan.historical_acquisition_superset),
         "frozen_wfo_population": list(plan.frozen_wfo_population),
         "live_orders_called": False,
     }
-    prefilter["fingerprint"] = _canonical_sha256(prefilter)
+    prefilter["fingerprint"] = canonical_sha256(prefilter)
     _write_json(prefilter_path, prefilter)
 
     source_payload = {
@@ -572,10 +641,15 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
             "trade_date": PLANNER_SPECIAL_DATE.isoformat(),
             "calendar_source_id": CALENDAR_SOURCE_ID,
             "source_urls": list(context["special_calendar"].source_urls),
-            "classification": "SPECIAL_SESSION_EXCLUDED",
+            "classification": "OUTSIDE_PILOT_WINDOW",
+            "session_classification": "SPECIAL_SESSION_EXCLUDED",
+            "counted_as_instrument_trading_day": False,
         },
-        "nse_mii_pit_snapshots": list(MII_SOURCE.values()),
-        "upstox_bod_cas_evidence": BOD_SOURCE,
+        "nse_mii_pit_snapshots": [
+            context["mii_source"][key] for key in sorted(context["mii_source"])
+        ],
+        "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
+        "corroborative_current_metadata": context["current_metadata"],
         "corporate_action_query": {
             **CA_SOURCE,
             "fingerprint": context["ca_fingerprint"],
@@ -610,6 +684,7 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
         "estimated_rows": plan.estimated_rows,
         "estimated_raw_storage_bytes": plan.estimated_storage_bytes,
         "estimated_bytes_per_row": plan.estimated_bytes_per_row,
+        "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
         "cas_estimate": {
             "continuous_rows": 72,
             "auxiliary_rows_upper_bound": 4,
@@ -626,7 +701,8 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
         "schema_version": "historical-pilot-special-session-exclusion/v1",
         "trade_date": PLANNER_SPECIAL_DATE.isoformat(),
         "session_kind": "SPECIAL",
-        "classification": "SPECIAL_SESSION_EXCLUDED",
+        "classification": "OUTSIDE_PILOT_WINDOW",
+        "session_classification": "SPECIAL_SESSION_EXCLUDED",
         "acquisition_allowed": False,
         "counted_as_instrument_trading_day": False,
         "downloaded": False,
@@ -634,8 +710,9 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
         "source_id": CALENDAR_SOURCE_ID,
         "source_urls": list(context["special_calendar"].source_urls),
         "reason": (
-            "Canonical NSE CM calendar identifies 2026-11-08 as a separately announced Muhurat "
-            "session; no normal-session rule is inferred and no candle request is authorized."
+            "OUTSIDE_PILOT_WINDOW audit example: canonical NSE CM calendar identifies 2026-11-08 "
+            "as a separately announced Muhurat session; NOT_COUNTED in this pilot, no "
+            "normal-session rule is inferred, and no candle request is authorized."
         ),
         "live_orders_called": False,
     }
@@ -643,6 +720,7 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
 
     plan_fingerprint = plan.deterministic_fingerprint()
     evidence_fingerprint = acquisition_evidence.fingerprint()
+    pit_evidence_fingerprint = context["pit_evidence_fingerprint"]
     fingerprints = {
         "schema_version": "historical-pilot-fingerprints/v1",
         "acquisition_plan_fingerprint": plan_fingerprint,
@@ -650,13 +728,17 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
         "plan_id": plan.plan_id,
         "candidate_manifest_fingerprint": manifest["manifest_fingerprint"],
         "prefilter_evidence_fingerprint": prefilter["fingerprint"],
+        "pit_evidence_fingerprint": context["pit_evidence_fingerprint"],
         "source_fingerprints": {
             "calendar": context["calendar_fingerprint"],
             "session_policy": context["session_fingerprint"],
             "corporate_actions": context["ca_fingerprint"],
-            "nse_mii": {key: value["payload_sha256"] for key, value in MII_SOURCE.items()},
-            "upstox_bod": BOD_SOURCE["payload_sha256"],
+            "nse_mii": {
+                key: context["mii_source"][key]["payload_sha256"]
+                for key in sorted(context["mii_source"])
+            },
         },
+        "corroborative_current_metadata": context["current_metadata"],
         "file_sha256": {},
         "live_orders_called": False,
     }
@@ -678,21 +760,22 @@ def build_pack(output_dir: Path = PACK_ROOT) -> dict[str, Any]:
         f"""# Historical Pilot Evidence Pack V1
 
 - **Mode:** DRY_RUN only; no historical candles were downloaded.
-- **Selection:** deterministic PIT intersection + CAS eligibility, sorted by `instrument_key`, first result; no price/performance ranking.
+- **Selection:** deterministic dated NSE/PIT intersection + canonical dated CAS eligibility, sorted by `instrument_key`, first result; current BOD is nonblocking corroborative metadata and no price/performance ranking was used.
 - **Selected instrument:** `{INSTRUMENT_KEY}` (`{SYMBOL}`)
 - **Pilot dates:** `2026-07-30`, `2026-07-31`, `2026-08-03` (`NSE_CAS_EFFECTIVE_DATE`; CAS-aware)
-- **Planner-level excluded special session:** `2026-11-08`, `SPECIAL_SESSION_EXCLUDED`; not counted or downloaded.
+- **Special-session audit example:** `2026-11-08`, `OUTSIDE_PILOT_WINDOW` / `NOT_COUNTED` / `SPECIAL_SESSION_EXCLUDED`; not part of the canonical acquisition window and not downloaded.
 - **Instrument-trading-days:** `{len(plan.normal_trading_dates)}` (limit 7)
 - **Acquisition requests:** `{plan.expected_request_count}`
 - **Estimated rows:** `{plan.estimated_rows}` (`75 + 75 + 76`, including the CAS auxiliary upper bound)
 - **Estimated raw storage:** `{plan.estimated_storage_bytes}` bytes at `{plan.estimated_bytes_per_row}` bytes/row
 - **Canonical acquisition plan:** `{plan.plan_id}` / `{plan_fingerprint}`
 - **Acquisition evidence fingerprint:** `{evidence_fingerprint}`
+- **Aggregate PIT evidence fingerprint:** `{pit_evidence_fingerprint}` (all three canonical PIT segments)
 - **Corporate-action status:** complete query coverage; `NO_ACTION_CONFIRMED_BY_COMPLETE_COVERAGE`; UNKNOWN is not treated as no action.
 - **Session:** `Asia/Kolkata`, continuous `09:15`–`15:30` on normal dates; CAS continuous end `15:15`, auxiliary `15:15`–`15:35` on `2026-08-03`; source `{NSE_CAS_SOURCE}`.
 - **Safety:** `live_orders_called=false`; credentials are not present in the pack.
 
-The special-session record is intentionally planner-level because the acquisition window ends at the actual CAS-aware date. It remains explicit and excluded rather than being treated as a normal session.
+The special-session record is intentionally a separately sourced audit example: it is outside the pilot window, marked `OUTSIDE_PILOT_WINDOW` and `NOT_COUNTED`, and is not treated as an in-window acquisition exclusion.
 """,
         encoding="utf-8",
     )

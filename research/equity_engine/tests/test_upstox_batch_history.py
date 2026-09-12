@@ -378,7 +378,7 @@ def test_canonical_acquisition_plan_binding_verifies_identity_and_intervals(
     planned_intervals = tuple(item for item in binding.requested_intervals if item[1] == 5)
     expected_dates = tuple(sorted({day for item in planned_intervals for day in item[4]}))
     evidence = HistoricalAcquisitionEvidence(
-        pit_fingerprint=binding.pit_source_fingerprints[0],
+        pit_fingerprint=binding.pit_evidence_fingerprint,
         corporate_action_fingerprint=binding.corporate_action_fingerprint,
         acquisition_plan_fingerprint=binding.deterministic_fingerprint,
         session_policy_identity="example-v2:nse-normal-sessions",

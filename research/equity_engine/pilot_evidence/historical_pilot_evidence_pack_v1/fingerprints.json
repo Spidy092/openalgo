@@ -1,20 +1,48 @@
 {
-  "acquisition_evidence_fingerprint": "b93d8c131f0037ff5f8b9880d3a74d532f09a28fdebce612512c721184a24c85",
-  "acquisition_plan_fingerprint": "5f45d0b05f1b1ffa067a9b33b558bbf134a5f4f2caee2695cfe6dffd80fd5fb3",
-  "candidate_manifest_fingerprint": "8393b440e0400e71207a748e009748a1b8cd89107c4a26ecb9bf4329685753ce",
+  "acquisition_evidence_fingerprint": "7e8aa99b74ac032dbb0c6b104d1867182c2a34ad3811a96b0293ead5136dfc6e",
+  "acquisition_plan_fingerprint": "f7dd6582ff582a3aecadb77172ad06b5a99ce9df30171489f5fab0603c48f795",
+  "candidate_manifest_fingerprint": "e58ff682bd0b1ea5dd27981850115a05c60574e54c4460b0e65b0ddbace0fea0",
+  "corroborative_current_metadata": {
+    "blocking": false,
+    "classification": "CORROBORATIVE_CURRENT_METADATA",
+    "may_change_without_historical_plan_change": true,
+    "present": true,
+    "source": {
+      "instrument_record": {
+        "cas_eligible": true,
+        "instrument_key": "NSE_EQ|INE745G01043",
+        "instrument_type": "EQ",
+        "isin": "INE745G01043",
+        "name": "MULTI COMMODITY EXCHANGE",
+        "security_type": "NORMAL",
+        "segment": "NSE_EQ",
+        "trading_symbol": "MCX"
+      },
+      "payload_bytes": 1940184,
+      "payload_sha256": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1",
+      "source_id": "upstox-bod:nse-eq:cas-eligibility:2026-09-12",
+      "url": "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+      "use_boundary": "CAS eligibility only from the current BOD record; never used to back-project dated listing, MIS, BOD, suspension, or normal-market membership"
+    },
+    "used_for_historical_cas_eligibility": false,
+    "used_for_historical_plan_identity": false,
+    "used_for_historical_selection": false,
+    "used_for_pit_eligibility": false
+  },
   "file_sha256": {
-    "acquisition_evidence.json": "3191c33be96b893b50dda457e3e4471a0e2a368fb4099193d7b0f08a9052d545",
+    "acquisition_evidence.json": "3ffea1fa8d77b33ec0aaefa99f6047f2687c224eba9448ab1eaea2f570be12c0",
     "candidate_file.json": "03713a0736611e755edeb55a5dac20c42b8b20c5d4498fc6c84696bfd6a2ec1d",
-    "dry_run_request_plan.json": "3436fbff855ffba1ea114de9c08c37f09b563500328d31047f706c1a45134fc4",
-    "excluded_special_session.json": "a6546e10a922217a7f4b8a5cb3865cd0e49d814d97994874bdf94b4c03954623",
-    "historical_acquisition_plan.json": "0e9bc98b41190ab7f0624dfdd97a657e438d8301b6f30558e85953bda9303a96",
-    "prefilter_evidence.json": "6640a2c109fc190e907968398701e567728b926f49004bf8c09f83bb6715e8f3",
-    "selected_candidate_manifest.json": "b7fa67c5e2fd25ad28e9fddb5c948f6e64044498c1d285d817ff4931f5237c50",
-    "source_evidence.json": "0a3dba6f46cc1e4a5321be1e663650e6cec5505ac2f7d8a682c781a221a6f4b3"
+    "dry_run_request_plan.json": "aefbf0ef4fcbd4fffcc2aead81be75451729b438e30d9283a441dce2f64ad1b8",
+    "excluded_special_session.json": "4129f01f64c7c659cfa64baa2a43b331037cf6b1d876e7d9181d8582e0f7faf6",
+    "historical_acquisition_plan.json": "488c1e290c72c3f2b3ae75fa24f44a7eb6611e3dbf86f52f4a5714a22a1afcd9",
+    "prefilter_evidence.json": "77f85bc780b1a6ad777fcee53b47de35700db43ac998b0ba431be9f591e5c942",
+    "selected_candidate_manifest.json": "e4d22ddc1832c22acc1f85a371d184febd96f0a13838c8f2a68eaa8d6d89cfc5",
+    "source_evidence.json": "937c35d16222d0fae495b94b9a41f56bd374f0a41573181edb6857ab9327e708"
   },
   "live_orders_called": false,
-  "plan_id": "hap_5f45d0b05f1b1ffa",
-  "prefilter_evidence_fingerprint": "ffd2819ff933c323b642bfa59ce8743c9b758770f125ef8fc97ebd2a86d37e82",
+  "pit_evidence_fingerprint": "71bb39108ec5ffb4b17ded22b79aecee0ef7fd32e05b285f47d17c63af852d37",
+  "plan_id": "hap_f7dd6582ff582a3a",
+  "prefilter_evidence_fingerprint": "252d49ffa407e72ba3eac5b4c50cb8d8b023b13df5dc35b60e074b94dcee56fe",
   "schema_version": "historical-pilot-fingerprints/v1",
   "source_fingerprints": {
     "calendar": "5e1db7d0ec7d7cd17325ee615b2255fa449fe72039506276e34e615665f5771f",
@@ -24,7 +52,6 @@
       "2026-07-31": "5c3b3113e7c147a5be79a725f025b53b5d16f8f0826fc9ba5d8ed0198a6ef8d7",
       "2026-08-03": "c61c505973befcf041acd8900339b6c3b595aae18283726b4725661c29be8359"
     },
-    "session_policy": "418336f2d3b9e93915ec4901f52e9a8b0a170b036c5b16ced72c4d789fa6eaf1",
-    "upstox_bod": "598edaa5403775660a28ea1933218e043c5d283255a483f8105e6348bb67b2f1"
+    "session_policy": "418336f2d3b9e93915ec4901f52e9a8b0a170b036c5b16ced72c4d789fa6eaf1"
   }
 }
