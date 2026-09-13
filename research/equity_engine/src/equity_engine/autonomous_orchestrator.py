@@ -1,9 +1,8 @@
 """Fail-closed orchestration contract for autonomous research execution.
 
-This module joins research output, deterministic risk approval and an execution
-adapter without giving the research package a live-order path.  Version 1 only
-permits SHADOW and ANALYZER modes.  A future live adapter must be implemented
-outside this package and pass a separate capital-authorization boundary.
+Version 1 joins research output, deterministic risk approval, and a non-live
+executor. It intentionally supports only cash equity on NSE/BSE and only
+SHADOW/ANALYZER execution. Nothing in this module can authorize live capital.
 """
 
 from __future__ import annotations
@@ -37,6 +36,8 @@ class TradeCandidate:
     strategy_version: str
     side: str
     quantity: int
+    product: str
+    price_type: str
     entry_price: Decimal
     stop_price: Decimal
     target_price: Decimal
@@ -52,8 +53,14 @@ class TradeCandidate:
             raise ValueError("valid_until must be timezone-aware")
         if self.valid_until <= current:
             raise ValueError("candidate is stale")
+        if self.exchange not in {"NSE", "BSE"}:
+            raise ValueError("autonomous equity v1 supports only NSE/BSE")
         if self.side not in {"BUY", "SELL"}:
             raise ValueError("side must be BUY or SELL")
+        if self.product not in {"CNC", "MIS"}:
+            raise ValueError("autonomous equity v1 product must be CNC or MIS")
+        if self.price_type not in {"MARKET", "LIMIT"}:
+            raise ValueError("autonomous equity v1 price_type must be MARKET or LIMIT")
         if self.quantity <= 0:
             raise ValueError("quantity must be positive")
         if min(self.entry_price, self.stop_price, self.target_price) <= 0:
@@ -72,11 +79,8 @@ class TradeCandidate:
     @property
     def fingerprint(self) -> str:
         payload = asdict(self)
-        payload["entry_price"] = str(self.entry_price)
-        payload["stop_price"] = str(self.stop_price)
-        payload["target_price"] = str(self.target_price)
-        payload["expected_edge_bps"] = str(self.expected_edge_bps)
-        payload["confidence"] = str(self.confidence)
+        for key in ("entry_price", "stop_price", "target_price", "expected_edge_bps", "confidence"):
+            payload[key] = str(payload[key])
         payload["valid_until"] = self.valid_until.astimezone(timezone.utc).isoformat()
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
@@ -98,8 +102,6 @@ class RiskDecision:
 
 
 class Executor(Protocol):
-    """Execution boundary implemented by shadow/analyzer adapters."""
-
     mode: ExecutionMode
 
     def submit(self, candidate: TradeCandidate) -> str:
@@ -116,9 +118,17 @@ class OrchestrationResult:
 
 
 class DeterministicRiskGate:
-    """Small mandatory gate that an LLM cannot override."""
+    """Mandatory risk gate that an LLM cannot override."""
 
     def __init__(self, limits: RiskLimits) -> None:
+        if limits.max_order_notional <= 0:
+            raise ValueError("max_order_notional must be positive")
+        if limits.max_quantity <= 0:
+            raise ValueError("max_quantity must be positive")
+        if limits.min_expected_edge_bps <= 0:
+            raise ValueError("min_expected_edge_bps must be positive")
+        if not Decimal("0") <= limits.min_confidence <= Decimal("1"):
+            raise ValueError("min_confidence must be between 0 and 1")
         self._limits = limits
 
     def evaluate(self, candidate: TradeCandidate, *, now: datetime | None = None) -> RiskDecision:
