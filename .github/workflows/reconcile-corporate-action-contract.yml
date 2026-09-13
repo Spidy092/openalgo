@@ -18,6 +18,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: research/equity_engine/pyproject.toml
+
       - name: Fetch source branch
         run: git fetch origin agent/pit-corporate-action-evidence:refs/remotes/origin/agent/pit-corporate-action-evidence
 
@@ -35,8 +41,6 @@ jobs:
               'origin/agent/pit-corporate-action-evidence:research/equity_engine/src/equity_engine/experiment.py'
           ], text=True)
 
-          # Preserve all v3 cost/calibration code. Only restore the corporate-action
-          # import, mismatch exception, and evidence identity class from the dedicated branch.
           current = current.replace(
               'from collections.abc import Mapping\n',
               'from collections.abc import Iterable, Mapping\n',
@@ -71,7 +75,21 @@ jobs:
           python -m compileall -q research/equity_engine/src/equity_engine/experiment.py
           git diff --check
 
+      - name: Install research package
+        working-directory: research/equity_engine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest==9.1.1 pytest-timeout==2.4.0
+
+      - name: Run research compile and tests
+        working-directory: research/equity_engine
+        run: |
+          python -m compileall -q src tests
+          python -m pytest
+
       - name: Commit reconciled contract
+        if: success()
         shell: bash
         run: |
           if git diff --quiet; then
