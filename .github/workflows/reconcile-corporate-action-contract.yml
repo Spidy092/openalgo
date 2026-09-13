@@ -1,0 +1,85 @@
+name: Reconcile Corporate Action Contract
+
+on:
+  push:
+    branches:
+      - codex/autonomous-integration-v1
+    paths:
+      - .github/workflows/reconcile-corporate-action-contract.yml
+
+permissions:
+  contents: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch source branch
+        run: git fetch origin agent/pit-corporate-action-evidence:refs/remotes/origin/agent/pit-corporate-action-evidence
+
+      - name: Reconcile experiment corporate-action contract
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          path = Path('research/equity_engine/src/equity_engine/experiment.py')
+          current = path.read_text()
+          old = subprocess.check_output([
+              'git', 'show',
+              'origin/agent/pit-corporate-action-evidence:research/equity_engine/src/equity_engine/experiment.py'
+          ], text=True)
+
+          # Preserve all v3 cost/calibration code. Only restore the corporate-action
+          # import, mismatch exception, and evidence identity class from the dedicated branch.
+          current = current.replace(
+              'from collections.abc import Mapping\n',
+              'from collections.abc import Iterable, Mapping\n',
+              1,
+          )
+          if 'from .corporate_actions import CorporateActionEvaluationMode\n' not in current:
+              marker = 'import pandas as pd\n\n'
+              current = current.replace(
+                  marker,
+                  marker + 'from .corporate_actions import CorporateActionEvaluationMode\n',
+                  1,
+              )
+
+          exc_start = old.index('class CorporateActionMismatchError(')
+          exc_end = old.index('\n\nclass DataLeakageError', exc_start)
+          exception_block = old[exc_start:exc_end]
+          if 'class CorporateActionMismatchError(' not in current:
+              insert_at = current.index('\n\nclass DataLeakageError')
+              current = current[:insert_at] + '\n\n' + exception_block + current[insert_at:]
+
+          class_start_old = old.index('@dataclass(frozen=True)\nclass CorporateActionEvidenceIdentity:')
+          class_end_old = old.index('\n\n@dataclass(frozen=True)\nclass CostModelIdentity:', class_start_old)
+          rich_class = old[class_start_old:class_end_old]
+
+          class_start_cur = current.index('@dataclass(frozen=True)\nclass CorporateActionEvidenceIdentity:')
+          class_end_cur = current.index('\n\n@dataclass(frozen=True)\nclass CostModelIdentity:', class_start_cur)
+          current = current[:class_start_cur] + rich_class + current[class_end_cur:]
+
+          path.write_text(current)
+          PY
+
+          python -m compileall -q research/equity_engine/src/equity_engine/experiment.py
+          git diff --check
+
+      - name: Commit reconciled contract
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo 'No reconciliation changes required.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add research/equity_engine/src/equity_engine/experiment.py
+          git commit -m 'research: restore corporate-action evidence contract on experiment v3'
+          git push origin HEAD:codex/autonomous-integration-v1
