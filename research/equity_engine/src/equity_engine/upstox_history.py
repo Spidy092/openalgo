@@ -15,6 +15,8 @@ from .provenance import MarketDataManifest, dataframe_fingerprint, validate_ohlc
 
 UPSTOX_HISTORY_DOC = "https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/"
 UPSTOX_HISTORY_BASE = "https://api.upstox.com/v3/historical-candle"
+UPSTOX_MINUTE_HISTORY_START = date(2022, 1, 1)
+UPSTOX_DAILY_HISTORY_START = date(2000, 1, 1)
 _HISTORY_COLUMNS = [
     "timestamp",
     "open",
@@ -127,7 +129,7 @@ class UpstoxHistoricalDataProvider:
             raise ValueError("this loader currently supports 1-15 minute V3 intervals")
         if start > end:
             raise ValueError("start must be on or before end")
-        if start < date(2022, 1, 1):
+        if start < UPSTOX_MINUTE_HISTORY_START:
             raise ValueError("Upstox documents minute history availability from January 2022")
 
     def fetch_minute_chunk(
