@@ -32,6 +32,8 @@ def candidate(**overrides):
         strategy_version="v1",
         side="BUY",
         quantity=1,
+        product="MIS",
+        price_type="MARKET",
         entry_price=Decimal("100"),
         stop_price=Decimal("98"),
         target_price=Decimal("105"),
@@ -83,6 +85,24 @@ def test_stale_candidate_fails_closed():
     )
     assert result.risk.decision is Decision.REJECTED
     assert "candidate is stale" in result.risk.reasons
+    assert executor.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("exchange", "NFO", "only NSE/BSE"),
+        ("product", "NRML", "CNC or MIS"),
+        ("price_type", "SL", "MARKET or LIMIT"),
+    ],
+)
+def test_unsupported_execution_semantics_fail_closed(field, value, reason):
+    executor = FakeExecutor(ExecutionMode.ANALYZER)
+    result = AutonomousOrchestrator(risk_gate=gate(), executor=executor).process(
+        candidate(**{field: value})
+    )
+    assert result.risk.decision is Decision.REJECTED
+    assert any(reason in item for item in result.risk.reasons)
     assert executor.calls == []
 
 
