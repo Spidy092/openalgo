@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -19,6 +19,7 @@ from typing import Any
 
 import pandas as pd
 
+from .corporate_actions import CorporateActionEvaluationMode
 from .cost_ledger import (
     HISTORICAL_ACTUAL_LABEL,
     SCENARIO_LABEL,
@@ -57,6 +58,10 @@ class UniverseFingerprintMismatchError(ExperimentValidationError):
 
 class MissingEvidenceError(ExperimentValidationError):
     """Raised when required concrete evidence is missing (arbitrary booleans are forbidden)."""
+
+
+class CorporateActionMismatchError(MissingEvidenceError):
+    """Raised when a corporate-action evidence claim disagrees with trusted evidence."""
 
 
 class DataLeakageError(ExperimentValidationError):
@@ -246,20 +251,306 @@ class CorporateActionEvidenceIdentity:
     complete: bool
     blocking_events: tuple[str, ...]
     evidence_fingerprint: str
+    coverage_start: date | None = None
+    coverage_end: date | None = None
+    covered_instruments: tuple[str, ...] = ()
+    events_count: int = 0
+    policy_identity: str = "DEFAULT"
+    authoritative: bool = False
+    evaluation_mode: CorporateActionEvaluationMode = (
+        CorporateActionEvaluationMode.TRADABLE_INFORMATION
+    )
 
     def __post_init__(self) -> None:
+        if isinstance(self.evaluation_mode, str):
+            object.__setattr__(
+                self,
+                "evaluation_mode",
+                CorporateActionEvaluationMode(self.evaluation_mode),
+            )
         if not self.complete:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
+        if not self.covered_instruments:
+            raise ValueError("covered_instruments cannot be empty for corporate-action evidence")
+        if any(not str(k).strip() for k in self.covered_instruments):
+            raise ValueError("covered_instruments cannot contain empty instrument keys")
+        if len(set(self.covered_instruments)) != len(self.covered_instruments):
+            raise ValueError("covered_instruments must be unique; duplicates are strictly forbidden")
+        if tuple(sorted(self.covered_instruments)) != tuple(self.covered_instruments):
+            raise ValueError("covered_instruments must be in sorted canonical order")
+        if self.coverage_start is not None and self.coverage_end is not None:
+            if self.coverage_start > self.coverage_end:
+                raise ValueError("coverage_start must be on or before coverage_end")
+
+    @property
+    def is_authoritative(self) -> bool:
+        """Return True only if this claim asserts authoritative status.
+
+        NOTE: This is a caller-supplied or serialized CLAIM, never proof.
+        Authoritative status must always be revalidated against a trusted
+        PointInTimeCorporateActionLedger at integrity or promotion time.
+        """
+        return self.authoritative
+
+    def covers_window(self, start: date, end: date) -> bool:
+        if self.coverage_start is None or self.coverage_end is None:
+            return False
+        return self.coverage_start <= start and self.coverage_end >= end
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "complete": self.complete,
+            "blocking_events": sorted(self.blocking_events),
+            "evidence_fingerprint": self.evidence_fingerprint,
+            "coverage_start": (
+                self.coverage_start.isoformat() if self.coverage_start else None
+            ),
+            "coverage_end": (
+                self.coverage_end.isoformat() if self.coverage_end else None
+            ),
+            "covered_instruments": list(self.covered_instruments),
+            "events_count": self.events_count,
+            "policy_identity": self.policy_identity,
+            "authoritative": self.authoritative,
+            "evaluation_mode": self.evaluation_mode.value,
+        }
+
+    def identity_fingerprint(self) -> str:
+        """SHA-256 fingerprint over complete canonical corporate-action evidence payload."""
+        payload = self.canonical_payload()
+        canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+    def fingerprint(self) -> str:
+        return self.identity_fingerprint()
+
+    def _derive_from_trusted_ledger(
+        self,
+        ledger: Any,
+        *,
+        research_start: date | None = None,
+        research_end: date | None = None,
+        canonical_instruments: Iterable[str] | None = None,
+        policy: Any = None,
+    ) -> CorporateActionEvidenceIdentity:
+        start = research_start if research_start is not None else self.coverage_start
+        end = research_end if research_end is not None else self.coverage_end
+        instruments = (
+            canonical_instruments
+            if canonical_instruments is not None
+            else self.covered_instruments
+        )
+        if start is None or end is None:
+            raise CorporateActionMismatchError(
+                "coverage start and end dates are required to validate against trusted ledger"
+            )
+        if not instruments:
+            raise CorporateActionMismatchError(
+                "canonical instruments are required to validate against trusted ledger"
+            )
+
+        try:
+            # Note: Do NOT pass source=self.source!
+            # Provenance/source must be derived from trusted ledger, not caller claim.
+            expected = ledger.to_evidence_identity(
+                research_start=start,
+                research_end=end,
+                instruments=instruments,
+                policy=policy,
+                evaluation_mode=self.evaluation_mode,
+            )
+        except Exception as exc:
+            raise CorporateActionMismatchError(
+                f"trusted corporate-action ledger failed revalidation: {exc}"
+            ) from exc
+
+        return expected
+
+    def validate_against_trusted_ledger(
+        self,
+        ledger: Any,
+        *,
+        research_start: date | None = None,
+        research_end: date | None = None,
+        canonical_instruments: Iterable[str] | None = None,
+        policy: Any = None,
+    ) -> None:
+        """Fail closed unless this claim exactly matches trusted ledger evidence.
+
+        Recomputes from trusted ledger:
+        - complete ledger fingerprint
+        - exact research_start
+        - exact research_end
+        - exact instrument population
+        - corporate-action policy identity
+        - blocking events
+        - event count
+        - completeness
+        - coverage
+        - evaluation mode
+        - source/provenance
+        """
+        expected = self._derive_from_trusted_ledger(
+            ledger,
+            research_start=research_start,
+            research_end=research_end,
+            canonical_instruments=canonical_instruments,
+            policy=policy,
+        )
+
+        mismatches: list[str] = []
+
+        # 1. Complete ledger fingerprint
+        if self.evidence_fingerprint != expected.evidence_fingerprint:
+            mismatches.append(
+                f"evidence_fingerprint (expected {expected.evidence_fingerprint!r}, "
+                f"got {self.evidence_fingerprint!r})"
+            )
+
+        # 2. Exact research_start
+        if self.coverage_start != expected.coverage_start:
+            mismatches.append(
+                f"coverage_start (expected {expected.coverage_start}, got {self.coverage_start})"
+            )
+        if research_start is not None and self.coverage_start != research_start:
+            mismatches.append(
+                f"research_start mismatch with coverage_start (expected {research_start}, got {self.coverage_start})"
+            )
+
+        # 3. Exact research_end
+        if self.coverage_end != expected.coverage_end:
+            mismatches.append(
+                f"coverage_end (expected {expected.coverage_end}, got {self.coverage_end})"
+            )
+        if research_end is not None and self.coverage_end != research_end:
+            mismatches.append(
+                f"research_end mismatch with coverage_end (expected {research_end}, got {self.coverage_end})"
+            )
+
+        # 4. Exact instrument population
+        if tuple(sorted(self.covered_instruments)) != tuple(sorted(expected.covered_instruments)):
+            mismatches.append(
+                f"covered_instruments (expected {expected.covered_instruments}, got {self.covered_instruments})"
+            )
+        if canonical_instruments is not None:
+            expected_canon = tuple(sorted(canonical_instruments))
+            if tuple(sorted(self.covered_instruments)) != expected_canon:
+                mismatches.append(
+                    f"covered_instruments vs canonical experiment instruments "
+                    f"(expected {expected_canon}, got {tuple(sorted(self.covered_instruments))})"
+                )
+
+        # 5. Corporate-action policy identity
+        if self.policy_identity != expected.policy_identity:
+            mismatches.append(
+                f"policy_identity (expected {expected.policy_identity!r}, got {self.policy_identity!r})"
+            )
+
+        # 6. Blocking events
+        if self.blocking_events != expected.blocking_events:
+            mismatches.append(
+                f"blocking_events (expected {expected.blocking_events}, got {self.blocking_events})"
+            )
+
+        # 7. Event count
+        if self.events_count != expected.events_count:
+            mismatches.append(
+                f"events_count (expected {expected.events_count}, got {self.events_count})"
+            )
+
+        # 8. Completeness
+        if self.complete != expected.complete:
+            mismatches.append(
+                f"complete (expected {expected.complete}, got {self.complete})"
+            )
+
+        # 9. Coverage window
+        if (
+            self.coverage_start is None
+            or self.coverage_end is None
+            or expected.coverage_start is None
+            or expected.coverage_end is None
+            or not self.covers_window(expected.coverage_start, expected.coverage_end)
+        ):
+            mismatches.append("coverage window does not cover required window")
+
+        # 10. Evaluation mode
+        if self.evaluation_mode != expected.evaluation_mode:
+            mismatches.append(
+                f"evaluation_mode (expected {expected.evaluation_mode.value!r}, "
+                f"got {self.evaluation_mode.value!r})"
+            )
+
+        # 11. Source / provenance
+        if self.source != expected.source:
+            mismatches.append(
+                f"source (expected {expected.source!r}, got {self.source!r})"
+            )
+
+        if not self.authoritative:
+            mismatches.append("authoritative (claim is not marked authoritative)")
+
+        if mismatches:
+            raise CorporateActionMismatchError(
+                "corporate-action evidence claim does not match trusted ledger; mismatches: "
+                + "; ".join(mismatches)
+            )
+
+    @classmethod
+    def from_ledger(
+        cls,
+        ledger: Any,
+        *,
+        research_window: ResearchWindowConfig | Any,
+        instruments: Iterable[str],
+        policy: Any = None,
+        evaluation_mode: CorporateActionEvaluationMode | str = (
+            CorporateActionEvaluationMode.TRADABLE_INFORMATION
+        ),
+        source: str | None = None,
+    ) -> CorporateActionEvidenceIdentity:
+        start = (
+            research_window.start
+            if hasattr(research_window, "start")
+            else research_window[0]
+        )
+        end = (
+            research_window.end
+            if hasattr(research_window, "end")
+            else research_window[1]
+        )
+        return ledger.to_evidence_identity(
+            research_start=start,
+            research_end=end,
+            instruments=instruments,
+            policy=policy,
+            evaluation_mode=evaluation_mode,
+            source=source,
+        )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "source": self.source,
             "complete": self.complete,
             "blocking_events": list(self.blocking_events),
             "evidence_fingerprint": self.evidence_fingerprint,
+            "authoritative": self.authoritative,
+            "evaluation_mode": self.evaluation_mode.value,
         }
+        if self.coverage_start is not None:
+            payload["coverage_start"] = self.coverage_start.isoformat()
+        if self.coverage_end is not None:
+            payload["coverage_end"] = self.coverage_end.isoformat()
+        if self.covered_instruments:
+            payload["covered_instruments"] = list(self.covered_instruments)
+        if self.events_count:
+            payload["events_count"] = self.events_count
+        if self.policy_identity != "DEFAULT":
+            payload["policy_identity"] = self.policy_identity
+        return payload
 
 
 @dataclass(frozen=True)
