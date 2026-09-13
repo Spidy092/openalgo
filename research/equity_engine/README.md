@@ -6,6 +6,8 @@ Research-only layer for validating NSE equity strategies before they can reach O
 
 This package MUST NOT place live orders. It produces research artifacts, paper-trading signals, cost estimates, and eligibility decisions. Live execution remains behind OpenAlgo/broker controls and a separate manual capital approval.
 
+This package never imports or calls trading execution services or authenticated live-market session components.
+
 ## Why VectorBT is here
 
 VectorBT is used only for fast hypothesis screening and parameter sweeps. A VectorBT backtest is never sufficient by itself to make a strategy live-eligible.
