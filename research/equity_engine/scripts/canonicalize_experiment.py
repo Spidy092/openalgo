@@ -35,14 +35,130 @@ def find_method(node: ast.ClassDef, name: str) -> ast.FunctionDef:
     raise RuntimeError(f"method {node.name}.{name} not found")
 
 
-def main() -> None:
+def patch_corporate_action_test_fixture() -> None:
+    path = ROOT / "research/equity_engine/tests/test_corporate_actions.py"
+    text = path.read_text(encoding="utf-8")
+    setup_marker = '''    orchestrator = ExperimentOrchestrator(
+        code_commit_sha="c4322d43956de1b43a764a7849b7437b38a1c932",
+        vectorbt_version="1.1.0",
+        simulator_version="openalgo-event-simulator-v1",
+    )
+    return orchestrator.build_experiment(
+'''
+    setup_replacement = '''    orchestrator = ExperimentOrchestrator(
+        code_commit_sha="c4322d43956de1b43a764a7849b7437b38a1c932",
+        vectorbt_version="1.1.0",
+        simulator_version="openalgo-event-simulator-v1",
+    )
+    cost_identity = CostEvidenceIdentity.from_ledger(
+        EffectiveDatedCostLedger(),
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.INTRADAY,
+    )
+    return orchestrator.build_experiment(
+'''
+    if "    cost_identity = CostEvidenceIdentity.from_ledger(\n" not in text:
+        if setup_marker not in text:
+            raise RuntimeError("corporate-action fixture setup marker not found")
+        text = text.replace(setup_marker, setup_replacement, 1)
+    old = '''        cost_evidence_identity=CostEvidenceIdentity.from_ledger(
+            EffectiveDatedCostLedger(),
+            on_date=date(2026, 6, 30),
+            product=LedgerProduct.INTRADAY,
+        ),
+        cost_evidence_class="HISTORICAL_ACTUAL_COSTS",
+'''
+    new = '''        cost_evidence_identity=cost_identity,
+        cost_evidence_class=cost_identity.evidence_classification,
+'''
+    if new not in text:
+        if old not in text:
+            raise RuntimeError("corporate-action cost identity marker not found")
+        text = text.replace(old, new, 1)
+    path.write_text(text, encoding="utf-8")
+
+
+def patch_dry_run_readiness() -> None:
+    path = PKG / "shadow_live_runner.py"
+    text = path.read_text(encoding="utf-8")
+    old = '''        report = self._readiness_report
+        if not isinstance(report, LiveMarketReadinessReport):
+            if (
+                self._config.mode is RunnerMode.DRY_RUN
+                and isinstance(self._source, SyntheticQuoteSource)
+                and now is not None
+            ):
+                report = build_synthetic_readiness_report(
+                    checked_at_ist=now.astimezone(ZoneInfo(REQUIRED_TIMEZONE)),
+                    trade_date=self._session_day,
+                    instrument_keys=self._config.instrument_keys,
+                    cas_eligible_by_key=self._config.cas_eligible_by_key,
+                    tick_size_by_key=self._config.tick_size_by_key,
+                    exit_buffer_minutes=self._config.exit_buffer_minutes,
+                    approved_capital=self._config.approved_capital(),
+                    quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
+                    classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+                )
+                self._readiness_report = report
+            else:
+                raise ReadinessGateError(READINESS_REPORT_MISSING)
+'''
+    new = '''        report = self._readiness_report
+        auto_dry_run_readiness = (
+            self._config.mode is RunnerMode.DRY_RUN
+            and report is None
+            and now is not None
+        )
+        if auto_dry_run_readiness:
+            if now.tzinfo is None:
+                raise ReadinessGateError(READINESS_STALE + ": runner clock")
+            report = build_synthetic_readiness_report(
+                checked_at_ist=now.astimezone(ZoneInfo(REQUIRED_TIMEZONE)),
+                trade_date=self._session_day,
+                instrument_keys=self._config.instrument_keys,
+                cas_eligible_by_key=self._config.cas_eligible_by_key,
+                tick_size_by_key=self._config.tick_size_by_key,
+                exit_buffer_minutes=self._config.exit_buffer_minutes,
+                approved_capital=self._config.approved_capital(),
+                quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
+                classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+            )
+        elif not isinstance(report, LiveMarketReadinessReport):
+            raise ReadinessGateError(READINESS_REPORT_MISSING)
+'''
+    if new not in text:
+        if old not in text:
+            raise RuntimeError("DRY_RUN readiness marker not found")
+        text = text.replace(old, new, 1)
+    stale_old = '''        age = (now_ist - checked_at.astimezone(ZoneInfo(REQUIRED_TIMEZONE))).total_seconds()
+        if (
+            now_ist.date() != report.trade_date
+            or age < 0
+            or age > report.context.readiness_max_age_seconds
+        ):
+            raise ReadinessGateError(READINESS_STALE)
+'''
+    stale_new = '''        age = (now_ist - checked_at.astimezone(ZoneInfo(REQUIRED_TIMEZONE))).total_seconds()
+        if not auto_dry_run_readiness and (
+            now_ist.date() != report.trade_date
+            or age < 0
+            or age > report.context.readiness_max_age_seconds
+        ):
+            raise ReadinessGateError(READINESS_STALE)
+'''
+    if stale_new not in text:
+        if stale_old not in text:
+            raise RuntimeError("readiness staleness marker not found")
+        text = text.replace(stale_old, stale_new, 1)
+    path.write_text(text, encoding="utf-8")
+
+
+def canonicalize_experiment() -> None:
     core = CORE_PATH.read_text(encoding="utf-8")
     wrapper = WRAPPER_PATH.read_text(encoding="utf-8")
     core_tree = ast.parse(core)
     wrapper_tree = ast.parse(wrapper)
 
-    # Take the hardened public corporate-action evidence boundary from the compatibility
-    # layer and place it directly into the V3 implementation.
     wrapper_mismatch = find_class(wrapper_tree, "CorporateActionMismatchError")
     wrapper_ca = find_class(wrapper_tree, "CorporateActionEvidenceIdentity")
     hardened_ca = (
@@ -71,8 +187,6 @@ def main() -> None:
             raise RuntimeError("cost_ledger import marker not found")
         core = core.replace(marker, corporate_import + marker, 1)
 
-    # Preserve the mature V3 algorithms as private implementation helpers, then make the
-    # hardened public methods the only evaluate/validate entry points on the single class.
     core = core.replace(
         "    def evaluate_promotion_gate(\n",
         "    def _evaluate_v3_promotion_gate(\n",
@@ -104,14 +218,12 @@ def main() -> None:
         )
         methods.append(method_source.rstrip() + "\n")
 
-    # Reparse after the replacements so insertion occurs at the true end of the V3 class.
     modified_tree = ast.parse(core)
     exp = find_class(modified_tree, "ExperimentArtifact")
     core_lines = core.splitlines(keepends=True)
     insertion = "\n" + "\n".join(methods) + "\n"
     core = "".join(core_lines[: exp.end_lineno]) + insertion + "".join(core_lines[exp.end_lineno :])
 
-    # Hard invariants for the canonical result.
     final_tree = ast.parse(core)
     classes = [n for n in final_tree.body if isinstance(n, ast.ClassDef)]
     if sum(n.name == "ExperimentArtifact" for n in classes) != 1:
@@ -136,6 +248,24 @@ def main() -> None:
             references.append(str(path.relative_to(ROOT)))
     if references:
         raise RuntimeError(f"stale _experiment_v3_core references remain: {references}")
+
+
+def cleanup_temporary_files() -> None:
+    for relative in (
+        ".github/workflows/consolidation-surgical-fix.yml",
+        "research/equity_engine/scripts/consolidation_reconcile.py",
+        "research/equity_engine/scripts/canonicalize_experiment.py",
+    ):
+        path = ROOT / relative
+        if path.exists():
+            path.unlink()
+
+
+def main() -> None:
+    patch_corporate_action_test_fixture()
+    patch_dry_run_readiness()
+    canonicalize_experiment()
+    cleanup_temporary_files()
 
 
 if __name__ == "__main__":
