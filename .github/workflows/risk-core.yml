@@ -36,4 +36,4 @@ jobs:
         run: python -m compileall -q services/risk test/risk
 
       - name: Run risk core tests
-        run: python -m pytest -q test/risk/
+        run: python -m pytest -q --confcutdir=test/risk test/risk/
