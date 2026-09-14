@@ -856,7 +856,7 @@ def test_research_execution_readiness_end_to_end(monkeypatch: pytest.MonkeyPatch
     assert experiment.schema_version == EXPERIMENT_SCHEMA_VERSION
     assert experiment.live_orders_called is False
     assert experiment.experiment_id.startswith("exp_")
-    experiment.validate_integrity()
+    experiment.validate_structure()
 
     # 11. Promotion Gate
     thresholds = PromotionThresholds(

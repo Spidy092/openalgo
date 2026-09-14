@@ -28,6 +28,9 @@ class CorporateActionMismatchError(MissingEvidenceError):
     """Raised when a corporate-action evidence claim disagrees with trusted evidence."""
 
 
+_UNSET_COVERED_INSTRUMENTS = object()
+
+
 @dataclass(frozen=True)
 class CorporateActionEvidenceIdentity:
     """Serialized corporate-action evidence claim that must be revalidated before trust.
@@ -48,7 +51,7 @@ class CorporateActionEvidenceIdentity:
     evidence_fingerprint: str
     coverage_start: date | None = None
     coverage_end: date | None = None
-    covered_instruments: tuple[str, ...] = ()
+    covered_instruments: tuple[str, ...] | object = _UNSET_COVERED_INSTRUMENTS
     events_count: int = 0
     policy_identity: str = "DEFAULT"
     authoritative: bool = False
@@ -67,6 +70,10 @@ class CorporateActionEvidenceIdentity:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
+        if self.covered_instruments is _UNSET_COVERED_INSTRUMENTS:
+            object.__setattr__(self, "covered_instruments", ())
+        elif not self.covered_instruments:
+            raise ValueError("covered_instruments cannot be empty for corporate-action evidence")
         if any(not str(key).strip() for key in self.covered_instruments):
             raise ValueError("covered_instruments cannot contain empty instrument keys")
         if len(set(self.covered_instruments)) != len(self.covered_instruments):
@@ -451,6 +458,18 @@ class ExperimentArtifact(_core.ExperimentArtifact):
             if trusted_corporate_action_policy is not None
             else corporate_action_policy
         )
+        if promotion_thresholds is not None:
+            passed, violations = self.evaluate_promotion_gate(
+                promotion_thresholds,
+                trusted_corporate_action_ledger=ledger,
+                trusted_corporate_action_policy=policy,
+                **kwargs,
+            )
+            if not passed:
+                raise MissingEvidenceError(
+                    "experiment failed promotion gate criteria: " + "; ".join(violations)
+                )
+            return
         if ledger is None:
             raise MissingEvidenceError(
                 "trusted corporate-action evidence ledger is required for integrity validation; "

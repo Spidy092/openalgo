@@ -68,6 +68,7 @@ from .live_market_readiness import (
     LiveMarketReadinessReport,
     ReadinessClassification,
     build_runner_readiness_context,
+    build_synthetic_readiness_report,
 )
 from .market_sessions import NSEEquitySessionPolicy
 from .models import Exchange
@@ -474,7 +475,25 @@ class ShadowLiveRunner:
     def _validate_readiness(self, now: datetime | None = None) -> LiveMarketReadinessReport:
         report = self._readiness_report
         if not isinstance(report, LiveMarketReadinessReport):
-            raise ReadinessGateError(READINESS_REPORT_MISSING)
+            if (
+                self._config.mode is RunnerMode.DRY_RUN
+                and isinstance(self._source, SyntheticQuoteSource)
+                and now is not None
+            ):
+                report = build_synthetic_readiness_report(
+                    checked_at_ist=now.astimezone(ZoneInfo(REQUIRED_TIMEZONE)),
+                    trade_date=self._session_day,
+                    instrument_keys=self._config.instrument_keys,
+                    cas_eligible_by_key=self._config.cas_eligible_by_key,
+                    tick_size_by_key=self._config.tick_size_by_key,
+                    exit_buffer_minutes=self._config.exit_buffer_minutes,
+                    approved_capital=self._config.approved_capital(),
+                    quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
+                    classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+                )
+                self._readiness_report = report
+            else:
+                raise ReadinessGateError(READINESS_REPORT_MISSING)
         if report.live_orders_called is not False:
             raise ReadinessGateError("readiness report contains live-order activity")
         if report.trade_date != self._session_day:

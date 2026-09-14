@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+from equity_engine.cost_ledger import EffectiveDatedCostLedger, LedgerProduct
 from equity_engine.corporate_actions import (
     CorporateActionConfidence,
     CorporateActionCoverageError,
@@ -103,19 +104,10 @@ def _sample_experiment(
             rates={"brokerage": "0.001", "gst": "0.18"},
             source_refs=("source",),
         ),
-        cost_evidence_identity=CostEvidenceIdentity(
-            ledger_schema_version="effective-dated-cost-ledger/v1",
-            ledger_fingerprint="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            evidence_classification="HISTORICAL_ACTUAL_COSTS",
-            historical_actual=True,
-            product_scope="INTRADAY",
-            evidence_mode="historical_resolution",
-            policy_identity="policy",
-            resolved_on_date=date(2026, 6, 30),
-            selected_record_ids=("rec1",),
-            unknown_components=(),
-            _verified_ledger_fingerprint="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            _verified_historical_actual=True,
+        cost_evidence_identity=CostEvidenceIdentity.from_ledger(
+            EffectiveDatedCostLedger(),
+            on_date=date(2026, 6, 30),
+            product=LedgerProduct.INTRADAY,
         ),
         cost_evidence_class="HISTORICAL_ACTUAL_COSTS",
         strategy_definitions=(
