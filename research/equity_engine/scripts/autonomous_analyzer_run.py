@@ -3,14 +3,19 @@
 
 This command never enables Analyzer mode and never accepts a live-execution
 flag. The operator must enable Analyzer separately. Every candidate that passes
-the research/order gate is then projected against the current Analyzer portfolio
-before the hard-wired sandbox executor can be called.
+the research/order gate is projected against the current Analyzer portfolio and
+then passes a durable idempotent execution state machine before the hard-wired
+sandbox executor can be called.
 
 ``--portfolio-context`` is required evidence, not a convenience default. Its
 ``market_data_timestamp`` must be the oldest verified timestamp covering the
 candidate reference prices and portfolio marks represented by the run. The
 launcher uses the current UTC clock as ``as_of`` on every candidate so an old
 context file expires instead of making old data appear fresh.
+
+``--execution-state-db`` is also mandatory. The SQLite file is the durable
+submission barrier across process restarts. It is intentionally separate from
+the human-readable session journal.
 """
 
 from __future__ import annotations
@@ -48,15 +53,13 @@ from equity_engine.autonomous_session import (
     SessionOutcome,
 )
 from equity_engine.openalgo_analyzer_executor import OpenAlgoAnalyzerExecutor
-from equity_engine.shadow_session_health import (
-    HealthStatus,
-    HealthThresholds,
-    check_persisted_session,
-)
 from services.autonomous import (
     AnalyzerPortfolioSnapshotAdapter,
     AnalyzerRiskContext,
+    DuplicateExecution,
+    ExecutionStateMachine,
     PortfolioAnalyzerBridge,
+    SqliteExecutionStateStore,
 )
 from services.risk import PortfolioLimits, SymbolActivity
 
@@ -161,8 +164,6 @@ class PortfolioContextEvidence:
         current = now or datetime.now(timezone.utc)
         price = self.candidate_reference_prices.get(candidate.candidate_id)
         if price is None:
-            # The loader requires exact candidate coverage; keep this guard for
-            # programmatic callers that construct evidence directly.
             raise ExecutionRejected("portfolio_context_missing_candidate_reference_price")
         return AnalyzerRiskContext(
             as_of=current,
@@ -272,7 +273,7 @@ RiskContextProvider = Callable[[TradeCandidate], AnalyzerRiskContext]
 
 
 class PortfolioGuardedAnalyzerExecutor:
-    """Executor facade that makes portfolio approval mandatory before Analyzer."""
+    """Executor facade that makes portfolio and idempotency approval mandatory."""
 
     def __init__(
         self,
@@ -287,7 +288,16 @@ class PortfolioGuardedAnalyzerExecutor:
 
     def submit(self, candidate: TradeCandidate) -> str:
         context = self._context_provider(candidate)
-        result = self._bridge.process(candidate, context)
+        try:
+            result = self._bridge.process(candidate, context)
+        except DuplicateExecution as exc:
+            # A durable prior record proves this candidate must not be submitted
+            # again. Surface it as a deterministic refusal so the session journal
+            # records REJECTED rather than treating it as a transport crash.
+            raise ExecutionRejected(
+                f"execution_duplicate:{exc.record.state.value}:{exc.record.execution_key}"
+            ) from exc
+
         if not result.portfolio_decision.allowed:
             reasons = tuple(
                 f"portfolio_{code.value}:{reason}"
@@ -307,6 +317,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--journal", type=Path, required=True)
+    parser.add_argument(
+        "--execution-state-db",
+        type=Path,
+        required=True,
+        help="Durable SQLite idempotency/state database; must survive process restarts.",
+    )
     parser.add_argument(
         "--api-key-env",
         required=True,
@@ -375,6 +391,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.shadow_health_dir is not None:
         if args.health_freshness_seconds <= 0:
             raise SystemExit("--health-freshness-seconds must be positive")
+
+        # Keep heavyweight research/readiness dependencies out of the normal
+        # Analyzer launcher import path. They are needed only when the optional
+        # persisted shadow-health gate is explicitly requested.
+        from equity_engine.shadow_session_health import (
+            HealthStatus,
+            HealthThresholds,
+            check_persisted_session,
+        )
+
         thresholds = HealthThresholds(freshness_seconds=args.health_freshness_seconds)
 
         def health_check() -> bool:
@@ -385,6 +411,9 @@ def main(argv: list[str] | None = None) -> int:
                 and not report.live_orders_called
             )
 
+    execution_state = ExecutionStateMachine(
+        SqliteExecutionStateStore(args.execution_state_db)
+    )
     raw_analyzer_executor = OpenAlgoAnalyzerExecutor(api_key=api_key)
     portfolio_bridge = PortfolioAnalyzerBridge(
         limits=PortfolioLimits(
@@ -399,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         snapshot_adapter=AnalyzerPortfolioSnapshotAdapter(api_key=api_key),
         analyzer_executor=raw_analyzer_executor,
+        execution_state_machine=execution_state,
     )
     guarded_executor = PortfolioGuardedAnalyzerExecutor(
         bridge=portfolio_bridge,
@@ -436,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         "stopped": sum(entry.outcome is SessionOutcome.STOPPED for entry in entries),
         "errors": sum(entry.outcome is SessionOutcome.ERROR for entry in entries),
         "journal": str(args.journal),
+        "execution_state_db": str(args.execution_state_db),
         "outcomes": [entry.as_dict() for entry in entries],
     }
     print(json.dumps(summary, sort_keys=True, indent=2))

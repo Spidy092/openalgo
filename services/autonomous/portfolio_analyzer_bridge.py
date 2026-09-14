@@ -1,4 +1,4 @@
-"""TradeCandidate -> portfolio risk -> Analyzer-only submission bridge.
+"""TradeCandidate -> portfolio risk -> idempotent Analyzer submission bridge.
 
 This module deliberately lives outside ``research/equity_engine``: research may
 produce a candidate, but platform services own portfolio state, deterministic
@@ -11,6 +11,12 @@ older mark when a quote refresh fails, so this adapter never fabricates a quote
 timestamp. The autonomous session must provide a verified market-data
 ``market_data_timestamp`` in :class:`AnalyzerRiskContext`; missing/stale values
 are rejected by ``services.risk.evaluate_portfolio_order``.
+
+When an :class:`ExecutionStateMachine` is supplied, the bridge persists
+``PROPOSED`` before portfolio evaluation, ``RISK_APPROVED`` after deterministic
+approval, and ``SUBMITTING`` before entering the Analyzer executor. Any
+exception after ``SUBMITTING`` is treated as ambiguous and converted to
+``RECONCILIATION_REQUIRED`` rather than being retried automatically.
 """
 
 from __future__ import annotations
@@ -21,6 +27,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from services.autonomous.execution_state import (
+    ExecutionNeedsReconciliation,
+    ExecutionState,
+    ExecutionStateMachine,
+)
 from services.risk import (
     PortfolioDecision,
     PortfolioIntent,
@@ -169,8 +180,6 @@ class AnalyzerPortfolioSnapshotAdapter:
                     f"position row {index} quantity must be a whole number"
                 )
             if quantity == 0:
-                # Closed rows still contribute to the aggregate realized PnL
-                # fields below, but have no current exposure.
                 continue
 
             symbol = str(row.get("symbol") or "").strip().upper()
@@ -187,10 +196,6 @@ class AnalyzerPortfolioSnapshotAdapter:
                     f"open position {exchange}:{symbol} has unsupported product {product or '<missing>'}"
                 )
 
-            # Sandbox exposes contract_value as lot_size. Autonomous equity v1
-            # is intentionally unit-notional cash equity only; refusing any
-            # other multiplier avoids understating exposure for derivatives or
-            # crypto contracts.
             if "lot_size" not in row:
                 raise AnalyzerSnapshotUnavailable(
                     f"open position {exchange}:{symbol} is missing lot_size evidence"
@@ -209,9 +214,6 @@ class AnalyzerPortfolioSnapshotAdapter:
 
             key = _portfolio_symbol(exchange, symbol)
             if key in seen_keys:
-                # The current canonical PortfolioSnapshot is one row per risk
-                # symbol. Do not silently net CNC/MIS rows because doing so can
-                # hide gross exposure.
                 raise AnalyzerSnapshotUnavailable(
                     f"analyzer snapshot contains multiple open rows for {key}"
                 )
@@ -279,9 +281,6 @@ class TradeCandidatePortfolioIntentAdapter:
                 )
             reference_price = current
         elif price_type == "LIMIT":
-            # A verified current price above the limit is conservatively useful
-            # for risk projection (especially for short exposure). Otherwise
-            # the executable limit itself is the maximum known order price.
             reference_price = max(entry, current) if current is not None else entry
         else:
             raise ValueError("candidate price_type must be MARKET or LIMIT")
@@ -301,6 +300,8 @@ class PortfolioAnalyzerResult:
     candidate_fingerprint: str
     portfolio_decision: PortfolioDecision
     execution_id: str | None
+    execution_key: str | None = None
+    execution_state: ExecutionState | None = None
 
     @property
     def submitted(self) -> bool:
@@ -317,6 +318,7 @@ class PortfolioAnalyzerBridge:
         snapshot_adapter: AnalyzerPortfolioSnapshotAdapter,
         analyzer_executor: AnalyzerExecutorLike,
         intent_adapter: TradeCandidatePortfolioIntentAdapter | None = None,
+        execution_state_machine: ExecutionStateMachine | None = None,
     ) -> None:
         mode = getattr(analyzer_executor, "mode", None)
         mode_value = getattr(mode, "value", mode)
@@ -326,6 +328,14 @@ class PortfolioAnalyzerBridge:
         self._snapshot_adapter = snapshot_adapter
         self._analyzer_executor = analyzer_executor
         self._intent_adapter = intent_adapter or TradeCandidatePortfolioIntentAdapter()
+        self._execution_state_machine = execution_state_machine
+
+    @staticmethod
+    def _decision_detail(decision: PortfolioDecision) -> str:
+        return ";".join(
+            f"{code.value}:{reason}"
+            for code, reason in zip(decision.codes, decision.reasons, strict=True)
+        )
 
     def process(
         self,
@@ -334,34 +344,101 @@ class PortfolioAnalyzerBridge:
         *,
         reduce_only: bool = False,
     ) -> PortfolioAnalyzerResult:
-        # Validate against the exact snapshot time rather than a second implicit
-        # clock. The Analyzer executor validates again at submission, closing
-        # the candidate-expiry race between this decision and sandbox submit.
         candidate.validate(now=context.as_of)
 
-        snapshot = self._snapshot_adapter.snapshot(context)
-        intent = self._intent_adapter.intent(
-            candidate,
-            context,
-            reduce_only=reduce_only,
-        )
-        decision = evaluate_portfolio_order(self._limits, snapshot, intent)
+        state_record = None
+        machine = self._execution_state_machine
+        if machine is not None:
+            state_record = machine.propose(
+                candidate_id=candidate.candidate_id,
+                candidate_fingerprint=candidate.fingerprint,
+            )
+
+        try:
+            snapshot = self._snapshot_adapter.snapshot(context)
+            intent = self._intent_adapter.intent(
+                candidate,
+                context,
+                reduce_only=reduce_only,
+            )
+            decision = evaluate_portfolio_order(self._limits, snapshot, intent)
+        except Exception as exc:
+            if machine is not None and state_record is not None:
+                machine.error(
+                    state_record.execution_key,
+                    detail=f"pre_submit_error:{type(exc).__name__}",
+                )
+            raise
 
         if not decision.allowed:
+            if machine is not None and state_record is not None:
+                state_record = machine.reject(
+                    state_record.execution_key,
+                    detail=self._decision_detail(decision),
+                )
             return PortfolioAnalyzerResult(
                 candidate_id=candidate.candidate_id,
                 candidate_fingerprint=candidate.fingerprint,
                 portfolio_decision=decision,
                 execution_id=None,
+                execution_key=(None if state_record is None else state_record.execution_key),
+                execution_state=(None if state_record is None else state_record.state),
             )
 
-        execution_id = self._analyzer_executor.submit(candidate)
+        if machine is not None and state_record is not None:
+            state_record = machine.risk_approved(state_record.execution_key)
+            state_record = machine.begin_submission(state_record.execution_key)
+
+        try:
+            execution_id = self._analyzer_executor.submit(candidate)
+        except Exception as exc:
+            if machine is not None and state_record is not None:
+                state_record = machine.reconciliation_required(
+                    state_record.execution_key,
+                    detail=f"analyzer_submit_exception:{type(exc).__name__}",
+                )
+                raise ExecutionNeedsReconciliation(state_record) from exc
+            raise
+
         if execution_id is None or not str(execution_id).strip():
+            if machine is not None and state_record is not None:
+                state_record = machine.reconciliation_required(
+                    state_record.execution_key,
+                    detail="analyzer_submit_returned_empty_execution_id",
+                )
+                raise ExecutionNeedsReconciliation(state_record)
             raise RuntimeError("Analyzer executor returned an empty execution id")
+
+        if machine is not None and state_record is not None:
+            try:
+                state_record = machine.submitted(state_record.execution_key, str(execution_id))
+                state_record = machine.acknowledged(state_record.execution_key)
+            except Exception as exc:
+                # The Analyzer has already returned an order id. Never re-submit
+                # merely because local lifecycle persistence/ack advancement had
+                # a problem. The durable SUBMITTING/SUBMITTED record is the
+                # reconciliation boundary.
+                latest = machine.store.get(state_record.execution_key)
+                if latest is not None and latest.state is ExecutionState.SUBMITTING:
+                    try:
+                        latest = machine.reconciliation_required(
+                            latest.execution_key,
+                            detail="state_persistence_failed_after_analyzer_acceptance",
+                        )
+                    except Exception:
+                        pass
+                if latest is not None:
+                    raise ExecutionNeedsReconciliation(latest) from exc
+                raise RuntimeError(
+                    "Analyzer accepted order but execution state persistence failed; "
+                    "manual reconciliation required"
+                ) from exc
 
         return PortfolioAnalyzerResult(
             candidate_id=candidate.candidate_id,
             candidate_fingerprint=candidate.fingerprint,
             portfolio_decision=decision,
             execution_id=str(execution_id),
+            execution_key=(None if state_record is None else state_record.execution_key),
+            execution_state=(None if state_record is None else state_record.state),
         )
