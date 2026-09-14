@@ -27,6 +27,23 @@ class Decision(StrEnum):
     REJECTED = "rejected"
 
 
+class ExecutionRejected(RuntimeError):
+    """A non-live executor deterministically refused an approved candidate.
+
+    The primary research gate may approve a candidate while a downstream
+    platform gate (for example portfolio exposure or current session state)
+    rejects it.  Raising this typed exception lets the session journal the
+    refusal as ``REJECTED`` instead of misclassifying it as an execution crash.
+    """
+
+    def __init__(self, *reasons: str) -> None:
+        normalized = tuple(str(reason).strip() for reason in reasons if str(reason).strip())
+        if not normalized:
+            normalized = ("executor_rejected",)
+        self.reasons = normalized
+        super().__init__("; ".join(normalized))
+
+
 @dataclass(frozen=True, slots=True)
 class TradeCandidate:
     candidate_id: str
