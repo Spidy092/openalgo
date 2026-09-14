@@ -20,6 +20,7 @@ from typing import Callable, Sequence
 from equity_engine.autonomous_orchestrator import (
     AutonomousOrchestrator,
     Decision,
+    ExecutionRejected,
     OrchestrationResult,
     TradeCandidate,
 )
@@ -220,6 +221,15 @@ class AutonomousSession:
 
             try:
                 result: OrchestrationResult = self._orchestrator.process(candidate)
+            except ExecutionRejected as exc:
+                entry = self._entry(
+                    candidate,
+                    SessionOutcome.REJECTED,
+                    reasons=exc.reasons,
+                )
+                self._journal.append(entry)
+                results.append(entry)
+                continue
             except Exception as exc:
                 entry = self._entry(
                     candidate,
