@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -16,6 +16,9 @@ from equity_engine.autonomous_session import (
     SessionLimits,
     SessionOutcome,
 )
+
+
+VALID_UNTIL = datetime(2099, 1, 1, tzinfo=timezone.utc)
 
 
 class FakeExecutor:
@@ -48,7 +51,10 @@ def candidate(candidate_id: str, *, symbol="RELIANCE", price="100", quantity=1):
         target_price=Decimal("105"),
         expected_edge_bps=Decimal("25"),
         confidence=Decimal("0.80"),
-        valid_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        # Candidate identity must be stable across repeated construction. Using
+        # ``now()`` here made the duplicate test produce two different payloads
+        # and correctly trip the candidate-id tamper guard instead.
+        valid_until=VALID_UNTIL,
         dataset_fingerprint="dataset-sha256",
         research_fingerprint=f"research-{candidate_id}",
     )
