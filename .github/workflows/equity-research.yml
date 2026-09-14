@@ -15,8 +15,78 @@ permissions:
 
 jobs:
   test:
+    name: test / ${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: experiment-corporate-cost
+            pytest_args: >-
+              tests/test_experiment.py
+              tests/test_cost_experiment_integration.py
+              tests/test_corporate_actions.py
+              tests/test_gates.py
+              tests/test_historical_cost_evidence.py
+              tests/test_historical_cost_scenario.py
+              tests/test_cost_ledger.py
+              tests/test_costs.py
+              tests/test_observed_costs.py
+              tests/test_upstox_cost_reconciliation.py
+          - group: readiness-shadow
+            pytest_args: >-
+              tests/test_live_market_readiness.py
+              tests/test_monday_final_shadow_integration.py
+              tests/test_monday_readiness_probe.py
+              tests/test_monday_shadow_integration.py
+              tests/test_research_execution_readiness.py
+              tests/test_shadow_evidence_qualification.py
+              tests/test_shadow_execution.py
+              tests/test_shadow_live_runner.py
+              tests/test_shadow_session_health.py
+          - group: pit-historical-data
+            pytest_args: >-
+              tests/test_historical_acquisition_plan.py
+              tests/test_historical_pilot_evidence_pack.py
+              tests/test_historical_validation.py
+              tests/test_pit_acquisition_no_lookahead.py
+              tests/test_pit_historical_acquisition.py
+              tests/test_point_in_time_execution.py
+              tests/test_research_window_compiler.py
+              tests/test_validated_dataset_handoff.py
+              tests/test_upstox_batch_history.py
+          - group: remaining
+            pytest_args: >-
+              --ignore=tests/test_experiment.py
+              --ignore=tests/test_cost_experiment_integration.py
+              --ignore=tests/test_corporate_actions.py
+              --ignore=tests/test_gates.py
+              --ignore=tests/test_historical_cost_evidence.py
+              --ignore=tests/test_historical_cost_scenario.py
+              --ignore=tests/test_cost_ledger.py
+              --ignore=tests/test_costs.py
+              --ignore=tests/test_observed_costs.py
+              --ignore=tests/test_upstox_cost_reconciliation.py
+              --ignore=tests/test_live_market_readiness.py
+              --ignore=tests/test_monday_final_shadow_integration.py
+              --ignore=tests/test_monday_readiness_probe.py
+              --ignore=tests/test_monday_shadow_integration.py
+              --ignore=tests/test_research_execution_readiness.py
+              --ignore=tests/test_shadow_evidence_qualification.py
+              --ignore=tests/test_shadow_execution.py
+              --ignore=tests/test_shadow_live_runner.py
+              --ignore=tests/test_shadow_session_health.py
+              --ignore=tests/test_historical_acquisition_plan.py
+              --ignore=tests/test_historical_pilot_evidence_pack.py
+              --ignore=tests/test_historical_validation.py
+              --ignore=tests/test_pit_acquisition_no_lookahead.py
+              --ignore=tests/test_pit_historical_acquisition.py
+              --ignore=tests/test_point_in_time_execution.py
+              --ignore=tests/test_research_window_compiler.py
+              --ignore=tests/test_validated_dataset_handoff.py
+              --ignore=tests/test_upstox_batch_history.py
+
     defaults:
       run:
         working-directory: research/equity_engine
@@ -41,5 +111,32 @@ jobs:
       - name: Compile package
         run: python -m compileall -q src tests
 
-      - name: Run tests
-        run: python -m pytest
+      - name: Run tests and capture summary
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q ${{ matrix.pytest_args }} 2>&1 | tee pytest-output.txt
+          code=${PIPESTATUS[0]}
+          summary=$(grep -E '([0-9]+ (passed|failed|error|errors|skipped))' pytest-output.txt | tail -1 || true)
+          first_failure=$(grep -E '^(FAILED|ERROR) ' pytest-output.txt | head -1 || true)
+          [ -n "$summary" ] || summary="no-summary"
+          [ -n "$first_failure" ] || first_failure="none"
+          safe_summary=$(printf '%s' "$summary" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-110)
+          safe_failure=$(printf '%s' "$first_failure" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-110)
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${{ matrix.group }}__${safe_failure}__${safe_summary}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tests.outputs.artifact_name }}
+          path: research/equity_engine/pytest-output.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce test result
+        if: steps.tests.outputs.exit_code != '0'
+        run: exit 1
