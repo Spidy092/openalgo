@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .live_market_readiness import LiveMarketReadinessReport
+
 SCHEMA_VERSION = "shadow-session-health/v1"
 RUNNER_TIMEZONE = "Asia/Kolkata"
 KILL_SENTINEL = "KILL"
@@ -54,6 +56,7 @@ DISK_ERROR_SENTINEL = "DISK_ERROR"
 
 REQUIRED_EVIDENCE_FILES = (
     "config.json",
+    "readiness-report.json",
     "market_events.jsonl",
     "decisions.jsonl",
     "trades.jsonl",
@@ -407,6 +410,8 @@ def check_persisted_session(
     runner_stopped = summary_path.exists()
     session_id = output_dir.name
     expected_cadence: float | None = None
+    summary_payload: dict[str, Any] | None = None
+    summary_valid = True
     if config_path.exists():
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -414,11 +419,37 @@ def check_persisted_session(
             expected_cadence = float(config.get("expected_cadence_seconds"))
         except (OSError, ValueError, TypeError):
             expected_cadence = None
+    if summary_path.exists():
+        try:
+            loaded_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded_summary, dict):
+                raise TypeError("summary must be an object")
+            summary_payload = loaded_summary
+        except (OSError, ValueError, TypeError):
+            summary_valid = False
 
     missing = [name for name in REQUIRED_EVIDENCE_FILES if not (output_dir / name).exists()]
     # report-*.json files are required when a summary exists.
     report_files = sorted(output_dir.glob("report-*.json"))
-    persistence_ok = not missing and (not runner_stopped or bool(report_files)) and not disk_error
+    shadow_strategy_enabled = (
+        summary_payload.get("shadow_strategy_enabled") if summary_payload is not None else None
+    )
+    reports_required = runner_stopped and shadow_strategy_enabled is not False
+    persistence_ok = (
+        not missing
+        and (not reports_required or bool(report_files))
+        and not disk_error
+        and summary_valid
+    )
+    readiness_path = output_dir / "readiness-report.json"
+    if readiness_path.exists():
+        try:
+            readiness_payload = json.loads(readiness_path.read_text(encoding="utf-8"))
+            if not isinstance(readiness_payload, dict):
+                raise TypeError("readiness report must be an object")
+            LiveMarketReadinessReport.from_dict(readiness_payload)
+        except (OSError, TypeError, ValueError):
+            persistence_ok = False
 
     feed_statuses: list[str] = []
     received_ats: list[str | None] = []
@@ -474,7 +505,9 @@ def check_persisted_session(
     reports_ok: bool | None = None
     if report_files and summary_path.exists():
         try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary = summary_payload
+            if summary is None:
+                raise ValueError("summary was not loaded")
             expected_fps = summary.get("report_fingerprints", {})
             reports_ok = True
             for path in report_files:
