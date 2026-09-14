@@ -2,13 +2,13 @@
 
 This module deliberately lives outside ``research/equity_engine``: research may
 produce a candidate, but platform services own portfolio state, deterministic
-risk and execution.  The bridge has no live-order dependency.  Its executor is
+risk and execution. The bridge has no live-order dependency. Its executor is
 required to advertise Analyzer mode, and the production snapshot adapter reads
 positions directly from the sandbox service.
 
-Market-data freshness is explicit.  Sandbox position MTM refresh can retain an
+Market-data freshness is explicit. Sandbox position MTM refresh can retain an
 older mark when a quote refresh fails, so this adapter never fabricates a quote
-timestamp.  The autonomous session must provide a verified market-data
+timestamp. The autonomous session must provide a verified market-data
 ``market_data_timestamp`` in :class:`AnalyzerRiskContext`; missing/stale values
 are rejected by ``services.risk.evaluate_portfolio_order``.
 """
@@ -65,7 +65,7 @@ class AnalyzerSnapshotUnavailable(RuntimeError):
 class AnalyzerRiskContext:
     """Point-in-time market/session evidence supplied by the autonomous loop.
 
-    ``candidate_reference_price`` is mandatory for MARKET candidates.  LIMIT
+    ``candidate_reference_price`` is mandatory for MARKET candidates. LIMIT
     candidates can use their limit price, but when a verified current reference
     price is supplied the adapter uses the larger value for a conservative
     notional projection.
@@ -77,6 +77,12 @@ class AnalyzerRiskContext:
     candidate_reference_price: Decimal | None = None
     kill_switch_engaged: bool = False
     symbol_activity: tuple[SymbolActivity, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.as_of.tzinfo is None or self.as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+        if not isinstance(self.kill_switch_engaged, bool):
+            raise ValueError("kill_switch_engaged must be boolean")
 
 
 def _decimal(value: object, *, field: str) -> Decimal:
@@ -115,7 +121,7 @@ class AnalyzerPortfolioSnapshotAdapter:
         if self._positions_reader is not None:
             return self._positions_reader()
 
-        # Direct sandbox dependency is intentional.  Do not replace this with
+        # Direct sandbox dependency is intentional. Do not replace this with
         # get_positionbook(auth_token=..., broker=...), whose internal-call
         # branch can read a live broker position book.
         from services.sandbox_service import sandbox_get_positions
@@ -132,7 +138,11 @@ class AnalyzerPortfolioSnapshotAdapter:
             ) from exc
 
         if not success:
-            message = response.get("message", "unknown error") if isinstance(response, dict) else "unknown error"
+            message = (
+                response.get("message", "unknown error")
+                if isinstance(response, dict)
+                else "unknown error"
+            )
             raise AnalyzerSnapshotUnavailable(
                 f"analyzer position snapshot failed ({status_code}): {message}"
             )
@@ -177,7 +187,7 @@ class AnalyzerPortfolioSnapshotAdapter:
                     f"open position {exchange}:{symbol} has unsupported product {product or '<missing>'}"
                 )
 
-            # Sandbox exposes contract_value as lot_size.  Autonomous equity v1
+            # Sandbox exposes contract_value as lot_size. Autonomous equity v1
             # is intentionally unit-notional cash equity only; refusing any
             # other multiplier avoids understating exposure for derivatives or
             # crypto contracts.
@@ -200,7 +210,7 @@ class AnalyzerPortfolioSnapshotAdapter:
             key = _portfolio_symbol(exchange, symbol)
             if key in seen_keys:
                 # The current canonical PortfolioSnapshot is one row per risk
-                # symbol.  Do not silently net CNC/MIS rows because doing so can
+                # symbol. Do not silently net CNC/MIS rows because doing so can
                 # hide gross exposure.
                 raise AnalyzerSnapshotUnavailable(
                     f"analyzer snapshot contains multiple open rows for {key}"
@@ -239,6 +249,12 @@ class TradeCandidatePortfolioIntentAdapter:
         *,
         reduce_only: bool = False,
     ) -> PortfolioIntent:
+        if reduce_only:
+            raise ValueError(
+                "reduce_only is not supported by the plain Analyzer order bridge; "
+                "use an atomic target-position execution path"
+            )
+
         try:
             entry = Decimal(str(candidate.entry_price))
         except (InvalidOperation, TypeError, ValueError) as exc:
@@ -264,7 +280,7 @@ class TradeCandidatePortfolioIntentAdapter:
             reference_price = current
         elif price_type == "LIMIT":
             # A verified current price above the limit is conservatively useful
-            # for risk projection (especially for short exposure).  Otherwise
+            # for risk projection (especially for short exposure). Otherwise
             # the executable limit itself is the maximum known order price.
             reference_price = max(entry, current) if current is not None else entry
         else:
@@ -275,7 +291,7 @@ class TradeCandidatePortfolioIntentAdapter:
             side=candidate.side,
             quantity=candidate.quantity,
             reference_price=reference_price,
-            reduce_only=reduce_only,
+            reduce_only=False,
         )
 
 
@@ -319,7 +335,7 @@ class PortfolioAnalyzerBridge:
         reduce_only: bool = False,
     ) -> PortfolioAnalyzerResult:
         # Validate against the exact snapshot time rather than a second implicit
-        # clock.  The Analyzer executor validates again at submission, closing
+        # clock. The Analyzer executor validates again at submission, closing
         # the candidate-expiry race between this decision and sandbox submit.
         candidate.validate(now=context.as_of)
 
