@@ -9,6 +9,7 @@ on:
       - "test/autonomous/**"
       - "research/equity_engine/src/equity_engine/autonomous_orchestrator.py"
       - "research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py"
+      - "research/equity_engine/scripts/autonomous_analyzer_run.py"
       - ".github/workflows/risk-core.yml"
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - "test/autonomous/**"
       - "research/equity_engine/src/equity_engine/autonomous_orchestrator.py"
       - "research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py"
+      - "research/equity_engine/scripts/autonomous_analyzer_run.py"
       - ".github/workflows/risk-core.yml"
 
 permissions:
@@ -49,6 +51,7 @@ jobs:
           test/autonomous
           research/equity_engine/src/equity_engine/autonomous_orchestrator.py
           research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py
+          research/equity_engine/scripts/autonomous_analyzer_run.py
 
       - name: Run risk core tests
         run: python -m pytest -q -o addopts='' --confcutdir=test/risk test/risk/
