@@ -11,9 +11,38 @@ on:
       - ".github/workflows/equity-research.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  patch-stage-b:
+    if: github.ref == 'refs/heads/codex/branch-consolidation-final-v1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: codex/branch-consolidation-final-v1
+      - name: Remove obsolete planner keyword
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('research/equity_engine/src/equity_engine/pit_historical_acquisition.py')
+          text = p.read_text()
+          old = '        interval_minutes=interval_minutes,\n        resolution="minutes",\n'
+          count = text.count(old)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 obsolete resolution arguments, found {count}')
+          p.write_text(text.replace(old, '        interval_minutes=interval_minutes,\n'))
+          PY
+          python -m compileall -q research/equity_engine/src
+      - name: Commit Stage-B compatibility repair
+        run: |
+          git config user.name "openalgo-consolidation-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add research/equity_engine/src/equity_engine/pit_historical_acquisition.py
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix Stage-B historical planner API compatibility"
+          git push origin HEAD:codex/branch-consolidation-final-v1
+
   test:
     name: test / ${{ matrix.group }}
     runs-on: ubuntu-latest
@@ -89,9 +118,9 @@ jobs:
           [ -n "$summary" ] || summary="no-summary"
           [ -n "$first_failure" ] || first_failure="none"
           [ -n "$first_exception" ] || first_exception="none"
-          safe_summary=$(printf '%s' "$summary" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-90)
-          safe_failure=$(printf '%s' "$first_failure" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-90)
-          safe_exception=$(printf '%s' "$first_exception" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-120)
+          safe_summary=$(printf '%s' "$summary" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-60)
+          safe_failure=$(printf '%s' "$first_failure" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-50)
+          safe_exception=$(printf '%s' "$first_exception" | tr -cs 'A-Za-z0-9._+-' '_' | cut -c1-70)
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           echo "artifact_name=${{ matrix.group }}__${safe_failure}__${safe_exception}__${safe_summary}" >> "$GITHUB_OUTPUT"
           exit 0
