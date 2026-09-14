@@ -1,7 +1,7 @@
 """Canonical Experiment V3 API with hardened PIT corporate-action trust validation.
 
 The complete pre-existing Experiment V3 implementation is preserved verbatim in
-``_experiment_v3_core``.  This module extends that canonical artifact at the corporate-action
+``_experiment_v3_core``. This module extends that canonical artifact at the corporate-action
 trust boundary without replacing the effective-dated cost ledger, current-calibration guard,
 provenance, promotion evidence, or live-order prohibition already present in V3.
 """
@@ -32,9 +32,14 @@ class CorporateActionMismatchError(MissingEvidenceError):
 class CorporateActionEvidenceIdentity:
     """Serialized corporate-action evidence claim that must be revalidated before trust.
 
-    ``authoritative`` is a claim carried by the artifact, not proof.  Promotion and integrity
+    ``authoritative`` is a claim carried by the artifact, not proof. Promotion and integrity
     validation always recompute the expected identity from a trusted PIT ledger and compare the
     complete evidence boundary, including exact dates, instruments, policy, events, and source.
+
+    The original Experiment contract allowed an unscoped four-field claim. Such a claim remains
+    representable for backwards-compatible research identity, but it is deliberately
+    non-authoritative and cannot pass trusted integrity or promotion gates until exact coverage
+    and instrument scope are supplied and revalidated against a trusted ledger.
     """
 
     source: str
@@ -62,8 +67,6 @@ class CorporateActionEvidenceIdentity:
             raise ValueError("corporate-action evidence must be complete")
         if not self.evidence_fingerprint.strip():
             raise ValueError("corporate-action evidence fingerprint is required")
-        if not self.covered_instruments:
-            raise ValueError("covered_instruments cannot be empty for corporate-action evidence")
         if any(not str(key).strip() for key in self.covered_instruments):
             raise ValueError("covered_instruments cannot contain empty instrument keys")
         if len(set(self.covered_instruments)) != len(self.covered_instruments):
@@ -78,6 +81,18 @@ class CorporateActionEvidenceIdentity:
     def is_authoritative(self) -> bool:
         """Return the serialized authority claim; callers must still revalidate it."""
         return self.authoritative
+
+    @property
+    def is_legacy_unscoped_claim(self) -> bool:
+        """Whether this is the original non-authoritative four-field evidence shape."""
+        return (
+            self.coverage_start is None
+            and self.coverage_end is None
+            and not self.covered_instruments
+            and self.events_count == 0
+            and self.policy_identity == "DEFAULT"
+            and not self.authoritative
+        )
 
     def covers_window(self, start: date, end: date) -> bool:
         if self.coverage_start is None or self.coverage_end is None:
@@ -280,6 +295,18 @@ class ExperimentArtifact(_core.ExperimentArtifact):
         evidence = self.corporate_action_evidence
         if not evidence.complete:
             raise MissingEvidenceError("corporate-action evidence is incomplete")
+        if evidence.blocking_events:
+            raise MissingEvidenceError(
+                "experiment has unresolved blocking corporate actions: "
+                + ", ".join(evidence.blocking_events)
+            )
+
+        # Backward-compatible unscoped claims are permitted as research metadata only. They are
+        # never trusted: validate_integrity/evaluate_promotion_gate still require a trusted ledger
+        # and exact scoped evidence, so a legacy claim cannot authorize promotion.
+        if evidence.is_legacy_unscoped_claim:
+            return
+
         if (
             evidence.coverage_start is None
             or evidence.coverage_end is None
@@ -288,11 +315,6 @@ class ExperimentArtifact(_core.ExperimentArtifact):
             raise MissingEvidenceError(
                 "experiment cannot claim corporate-action-complete unless evidence covers "
                 f"exact research window [{self.research_window.start.isoformat()}, {self.research_window.end.isoformat()}]"
-            )
-        if evidence.blocking_events:
-            raise MissingEvidenceError(
-                "experiment has unresolved blocking corporate actions: "
-                + ", ".join(evidence.blocking_events)
             )
         instruments = evidence.covered_instruments
         if not instruments:
