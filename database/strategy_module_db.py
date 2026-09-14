@@ -174,6 +174,7 @@ EVENT_SEVERITIES = ("info", "warn", "critical")
 EVENT_KINDS = (
     # Lifecycle
     "strategy_created",
+    "research_candidate_imported",
     "strategy_updated",
     "webhook_token_rotated",
     "live_enabled",

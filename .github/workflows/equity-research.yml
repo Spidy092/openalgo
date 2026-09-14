@@ -1,0 +1,45 @@
+name: Equity Research
+
+on:
+  push:
+    paths:
+      - "research/equity_engine/**"
+      - ".github/workflows/equity-research.yml"
+  pull_request:
+    paths:
+      - "research/equity_engine/**"
+      - ".github/workflows/equity-research.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: research/equity_engine
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: research/equity_engine/pyproject.toml
+
+      - name: Install research package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest==9.1.1 pytest-timeout==2.4.0
+
+      - name: Compile package
+        run: python -m compileall -q src tests
+
+      - name: Run tests
+        run: python -m pytest

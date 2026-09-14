@@ -6,6 +6,7 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import {
   deleteStrategy,
+  importResearchCandidate,
   listStrategies,
   strategyQueryKeys,
   useStrategyListPnl,
@@ -29,6 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import {
   formatIst,
@@ -59,6 +61,9 @@ export default function StrategyList() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [deleteTargetId, setDeleteTargetId] = useState<number | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+  const [candidateJson, setCandidateJson] = useState('')
+  const [importedToken, setImportedToken] = useState<string | null>(null)
 
   const { data, isLoading, error } = useQuery({
     queryKey: strategyQueryKeys.list({}),
@@ -81,6 +86,27 @@ export default function StrategyList() {
     },
   })
 
+  const importMutation = useMutation({
+    mutationFn: async () => {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(candidateJson)
+      } catch {
+        throw new Error('Candidate must be valid JSON')
+      }
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw new Error('Candidate JSON must contain one object')
+      }
+      return importResearchCandidate(parsed as Record<string, unknown>)
+    },
+    onSuccess: (result) => {
+      setImportedToken(result.webhook_token)
+      queryClient.invalidateQueries({ queryKey: strategyQueryKeys.strategies() })
+      showToast.success('Research candidate imported in stopped sandbox mode')
+    },
+    onError: (err: Error) => showToast.error(err.message || 'Import failed'),
+  })
+
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between gap-4">
@@ -91,7 +117,12 @@ export default function StrategyList() {
             mode requires explicit per-strategy opt-in.
           </p>
         </div>
-        <Button onClick={() => navigate('/strategy/new')}>+ New strategy</Button>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => setImportOpen(true)}>
+            Import research candidate
+          </Button>
+          <Button onClick={() => navigate('/strategy/new')}>+ New strategy</Button>
+        </div>
       </div>
 
       <Card>
@@ -215,6 +246,58 @@ export default function StrategyList() {
           )}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={importOpen}
+        onOpenChange={(open) => {
+          setImportOpen(open)
+          if (!open) {
+            setCandidateJson('')
+            setImportedToken(null)
+            importMutation.reset()
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Import research candidate</DialogTitle>
+            <DialogDescription>
+              Paste one equity-trade-candidate/v1 JSON document. It will be saved stopped,
+              sandbox-only, with scheduling disabled. Importing does not place an order.
+            </DialogDescription>
+          </DialogHeader>
+          {importedToken ? (
+            <div className="space-y-3">
+              <p className="text-sm font-medium">Candidate connected successfully.</p>
+              <p className="text-sm text-muted-foreground">
+                Copy this webhook token now. It cannot be shown again.
+              </p>
+              <Textarea readOnly value={importedToken} className="font-mono text-xs" />
+            </div>
+          ) : (
+            <Textarea
+              value={candidateJson}
+              onChange={(event) => setCandidateJson(event.target.value)}
+              placeholder='{"schema_version":"equity-trade-candidate/v1", ...}'
+              className="min-h-64 font-mono text-xs"
+              aria-label="Research candidate JSON"
+            />
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setImportOpen(false)}>
+              {importedToken ? 'Done' : 'Cancel'}
+            </Button>
+            {!importedToken && (
+              <Button
+                disabled={!candidateJson.trim() || importMutation.isPending}
+                onClick={() => importMutation.mutate()}
+              >
+                {importMutation.isPending ? 'Importing…' : 'Import stopped strategy'}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={deleteTargetId !== null}

@@ -1,9 +1,10 @@
 """Shared, pure risk evaluation core.
 
 One place where OpenAlgo decides whether a position has hit its stop, taken its
-target, earned a tighter trailing stop, or whether a whole set of positions has
-run past its combined limits. The scalping terminal, Flow, a strategy engine and
-a REST endpoint can all sit on it because of one rule:
+target, earned a tighter trailing stop, whether a whole set of positions has
+run past its combined limits, or whether a proposed order would violate
+portfolio-wide exposure policy. The scalping terminal, Flow, a strategy engine
+and a REST endpoint can all sit on it because of one rule:
 
     **No I/O of any kind.** No database, no broker, no market data, no logging,
     no clock. Every input arrives as an argument and every decision leaves as a
@@ -20,6 +21,8 @@ Layout
 * ``position``  per position stop, target and trailing stop, plus the
                 reconciliation notes explaining every behavioural choice
 * ``aggregate`` combined stop, combined target, lock profit, trail to entry
+* ``portfolio`` pre-trade gross/net exposure, concentration, loss and cooldown
+                policy over a point-in-time portfolio snapshot
 * ``adapters``  the legacy ``evaluate_trail`` dict shape, unchanged
 
 The golden vectors in ``test/risk/vectors.json`` are the contract that binds
@@ -63,6 +66,16 @@ from services.risk.models import (
     stop_from_points,
     target_from_points,
 )
+from services.risk.portfolio import (
+    PortfolioDecision,
+    PortfolioIntent,
+    PortfolioLimits,
+    PortfolioPosition,
+    PortfolioRiskCode,
+    PortfolioSnapshot,
+    SymbolActivity,
+    evaluate_portfolio_order,
+)
 from services.risk.position import (
     evaluate_position,
     evaluate_position_state,
@@ -75,16 +88,24 @@ __all__ = [
     "AggregateRisk",
     "BreachReason",
     "PnLSummary",
+    "PortfolioDecision",
+    "PortfolioIntent",
+    "PortfolioLimits",
+    "PortfolioPosition",
+    "PortfolioRiskCode",
+    "PortfolioSnapshot",
     "PositionDecision",
     "PositionPnL",
     "PositionRisk",
     "Side",
     "StopMove",
+    "SymbolActivity",
     "TrailMode",
     "TrailToEntryDecision",
     "aggregate_pnl",
     "evaluate_aggregate",
     "evaluate_aggregate_state",
+    "evaluate_portfolio_order",
     "evaluate_position",
     "evaluate_position_state",
     "evaluate_trail",

@@ -127,6 +127,31 @@ export async function createStrategy(payload: StrategyConfigPayload): Promise<Cr
   return { strategy: response.data.data, webhook_token: response.data.webhook_token }
 }
 
+export interface ImportedResearchStrategy extends CreatedStrategy {
+  provenance: {
+    candidate_id: string
+    strategy_id: string
+    strategy_version: string
+    dataset_fingerprint: string
+    research_fingerprint: string
+  }
+}
+
+export async function importResearchCandidate(
+  payload: Record<string, unknown>
+): Promise<ImportedResearchStrategy> {
+  const response = await webClient.post<{
+    data: Strategy
+    webhook_token: string
+    provenance: ImportedResearchStrategy['provenance']
+  }>(`${BASE}/strategies/import-research-candidate`, payload)
+  return {
+    strategy: response.data.data,
+    webhook_token: response.data.webhook_token,
+    provenance: response.data.provenance,
+  }
+}
+
 export async function updateStrategy(
   id: number,
   payload: StrategyUpdatePayload
