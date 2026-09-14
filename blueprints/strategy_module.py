@@ -1259,6 +1259,72 @@ def create_strategy():
     )
 
 
+@strategy_module_bp.route("/api/strategies/import-research-candidate", methods=["POST"])
+@check_session_validity
+@_api_limit
+def import_research_candidate():
+    """Import a strict research candidate as an inert Analyzer strategy.
+
+    Importing is configuration only: the created strategy is stopped, its
+    scheduler is disabled, and live mode remains disabled.  This route never
+    calls the strategy engine or an order service.
+    """
+    username = _current_user()
+    if not username:
+        return _error("Not authenticated", 401)
+
+    payload, error = _json_body()
+    if error:
+        return error
+
+    from services.strategy_module.research_bridge import (
+        ResearchCandidateError,
+        candidate_to_strategy_config,
+    )
+
+    try:
+        candidate_config, provenance = candidate_to_strategy_config(payload)
+    except ResearchCandidateError as exc:
+        return _error(str(exc), 400)
+
+    config, message = validate_strategy_config(candidate_config)
+    if message:
+        return _error(message, 400)
+
+    created, store_message = store.create_strategy(username, config)
+    if not created:
+        return _store_error(store_message)
+
+    # A one-time webhook token is still issued by the canonical store. It is
+    # required for signal mode, but importing neither starts nor triggers it.
+    token = created.pop("webhook_token", None)
+    store.record_event(
+        created["id"],
+        username,
+        "research_candidate_imported",
+        (
+            "Research candidate imported in stopped sandbox-only state; "
+            f"candidate={provenance['candidate_id']}; "
+            f"strategy={provenance['strategy_id']}@{provenance['strategy_version']}; "
+            f"dataset_sha256={provenance['dataset_fingerprint']}; "
+            f"research_sha256={provenance['research_fingerprint']}"
+        ),
+    )
+    logger.info("Imported research candidate into stopped strategy %s", created["id"])
+    return _ok(
+        {
+            "data": created,
+            "webhook_token": token,
+            "provenance": provenance,
+            "message": (
+                "Candidate imported. The strategy is stopped, live trading is disabled, "
+                "and its scheduler is disabled. Copy the webhook token now."
+            ),
+        },
+        201,
+    )
+
+
 @strategy_module_bp.route("/api/strategies/<int:sid>", methods=["GET"])
 @check_session_validity
 @_api_limit
