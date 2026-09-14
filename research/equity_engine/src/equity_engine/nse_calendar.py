@@ -18,6 +18,7 @@ NSE_CM_HOLIDAY_SOURCES = {
     2024: (
         "https://nsearchives.nseindia.com/content/circulars/CMTR59722.pdf",
         "https://nsearchives.nseindia.com/content/circulars/CMTR61518.pdf",
+        "https://nsearchives.nseindia.com/content/circulars/CMTR64960.pdf",
     ),
     2025: ("https://nsearchives.nseindia.com/content/circulars/CMTR65587.pdf",),
     2026: (
@@ -45,6 +46,7 @@ _NSE_CM_HOLIDAYS = {
             date(2024, 10, 2),
             date(2024, 11, 1),
             date(2024, 11, 15),
+            date(2024, 11, 20),
             date(2024, 12, 25),
         }
     ),

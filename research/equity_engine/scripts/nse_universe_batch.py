@@ -9,9 +9,8 @@ from pathlib import Path
 from equity_engine.nse_batch_universe import NseBatchUniverseBuilder
 from equity_engine.nse_calendar import nse_cm_normal_session_calendar
 from equity_engine.nse_semantics import (
-    EffectiveDatedNseCmSemanticsPolicy,
     NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE,
-    nse_cm_master_data_v15_semantics,
+    nse_cm_verified_semantics_policy,
 )
 
 
@@ -41,7 +40,7 @@ def main() -> int:
     if args.start < NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE:
         parser.error("exact NSE CM semantics are intentionally bounded to 2024-07-01 or later")
     calendar = nse_cm_normal_session_calendar(start=args.start, end=args.end)
-    policy = EffectiveDatedNseCmSemanticsPolicy([nse_cm_master_data_v15_semantics()])
+    policy = nse_cm_verified_semantics_policy()
     result = NseBatchUniverseBuilder(
         output_dir=Path(args.output_dir),
         semantics_policy=policy,

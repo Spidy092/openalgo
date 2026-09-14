@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Iterable
 
@@ -14,6 +14,11 @@ NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE = date(2024, 7, 1)
 NSE_MASTER_DATA_V15_SOURCE = (
     "https://nsearchives.nseindia.com/web/sites/default/files/inline-files/"
     "NSE_MasterData_Technical_Specifications.pdf"
+)
+NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE = date(2026, 2, 10)
+NSE_CURRENT_PROTOCOL_SOURCE = (
+    "https://nsearchives.nseindia.com/web/mediaattachment/2026-02/"
+    "TP_EGR_Trimmed_NNF_PROTOCOL_1_1_20260210174632.pdf"
 )
 
 
@@ -131,6 +136,42 @@ def nse_cm_master_data_v15_semantics() -> NseCmSemantics:
         cm_price_scale_rupees_per_raw_unit=Decimal("0.01"),
         source=NSE_MASTER_DATA_V15_SOURCE,
     )
+
+
+def nse_cm_current_protocol_semantics() -> NseCmSemantics:
+    """Interpret the current permitted-to-trade extension conservatively.
+
+    The 2026 protocol documents ``PrtdToTrad=2`` as a BSE-listed exclusive security that is
+    tradable on NSE only during a BSE outage.  The daily security master does not itself prove
+    that an outage existed on the report date, so code ``2`` is recognized as a known but
+    non-permitted state.  It is never promoted to a normal-equity candidate.
+    """
+
+    return NseCmSemantics(
+        effective_from=NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE,
+        effective_to=None,
+        normal_equity_series=frozenset({"EQ"}),
+        listed_on_nse_values=frozenset({"0", "1"}),
+        permitted_to_trade_values=frozenset({"1"}),
+        known_permitted_to_trade_values=frozenset({"0", "1", "2"}),
+        normal_market_eligible_values=frozenset({"1"}),
+        known_normal_market_eligibility_values=frozenset({"0", "1"}),
+        normal_market_tradeable_status_values=frozenset({"1", "2", "4", "5", "6"}),
+        known_normal_market_status_values=frozenset({"1", "2", "3", "4", "5", "6"}),
+        cm_price_scale_rupees_per_raw_unit=Decimal("0.01"),
+        source=NSE_CURRENT_PROTOCOL_SOURCE,
+    )
+
+
+def nse_cm_verified_semantics_policy() -> EffectiveDatedNseCmSemanticsPolicy:
+    """Return the non-overlapping dated contracts supported by primary evidence."""
+
+    extension_start = NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE
+    v15 = replace(
+        nse_cm_master_data_v15_semantics(),
+        effective_to=extension_start - timedelta(days=1),
+    )
+    return EffectiveDatedNseCmSemanticsPolicy([v15, nse_cm_current_protocol_semantics()])
 
 
 def interpret_nse_mii_equity_row(

@@ -6,9 +6,12 @@ import pytest
 from equity_engine.nse_mii_security import NseMiiSecurityRow
 from equity_engine.nse_semantics import (
     EffectiveDatedNseCmSemanticsPolicy,
+    NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE,
     NSE_MASTER_DATA_V15_EFFECTIVE_EVIDENCE_DATE,
     interpret_nse_mii_equity_row,
+    nse_cm_current_protocol_semantics,
     nse_cm_master_data_v15_semantics,
+    nse_cm_verified_semantics_policy,
     tick_point_from_nse_mii_price_field,
 )
 
@@ -87,6 +90,28 @@ def test_v15_contract_is_not_projected_before_july_2024() -> None:
     with pytest.raises(ValueError, match="no unique verified NSE CM semantics"):
         policy.resolve(date(2024, 6, 28))
     assert policy.resolve(date(2024, 7, 1)).effective_from == date(2024, 7, 1)
+
+
+def test_current_protocol_code_two_is_known_but_not_normal_tradeable() -> None:
+    semantics = nse_cm_current_protocol_semantics()
+    row = NseMiiSecurityRow(
+        **{
+            **_row(permitted="2").__dict__,
+            "report_date": NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE,
+        }
+    )
+    result = interpret_nse_mii_equity_row(row, semantics=semantics)
+    assert result.listed_on_nse is False
+    assert result.tradeable_in_normal_market is False
+    assert result.eligible is False
+
+
+def test_verified_policy_switches_at_current_protocol_boundary() -> None:
+    policy = nse_cm_verified_semantics_policy()
+    assert policy.resolve(date(2026, 2, 9)).source == nse_cm_master_data_v15_semantics().source
+    assert policy.resolve(NSE_CURRENT_PERMITTED_EXTENSION_EFFECTIVE_DATE).source == (
+        nse_cm_current_protocol_semantics().source
+    )
 
 
 def test_bid_interval_uses_primary_cm_paise_scale() -> None:

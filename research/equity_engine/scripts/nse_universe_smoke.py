@@ -9,10 +9,7 @@ import httpx
 
 from equity_engine.nse_daily_universe import materialize_nse_daily_equity_universe
 from equity_engine.nse_mii_security import NseMiiSecurityMasterParser
-from equity_engine.nse_semantics import (
-    EffectiveDatedNseCmSemanticsPolicy,
-    nse_cm_master_data_v15_semantics,
-)
+from equity_engine.nse_semantics import nse_cm_verified_semantics_policy
 
 
 def _parse_date(value: str) -> date:
@@ -43,7 +40,7 @@ def main() -> int:
     response.raise_for_status()
     snapshot = mii.parse_bytes(response.content, filename=filename)
 
-    policy = EffectiveDatedNseCmSemanticsPolicy([nse_cm_master_data_v15_semantics()])
+    policy = nse_cm_verified_semantics_policy()
     universe = materialize_nse_daily_equity_universe(
         snapshot=snapshot,
         semantics_policy=policy,

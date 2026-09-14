@@ -28,6 +28,15 @@ def test_calendar_excludes_muhurat_from_normal_session_research() -> None:
     assert result.excluded_special_session_dates == (date(2024, 11, 1),)
 
 
+def test_calendar_includes_late_published_assembly_election_holiday() -> None:
+    result = nse_cm_normal_session_calendar(
+        start=date(2024, 11, 19),
+        end=date(2024, 11, 21),
+    )
+    assert result.trading_dates == (date(2024, 11, 19), date(2024, 11, 21))
+    assert result.holiday_dates == (date(2024, 11, 20),)
+
+
 def test_calendar_detects_weekend_special_session_before_weekday_filter() -> None:
     result = nse_cm_normal_session_calendar(
         start=date(2026, 11, 8),
