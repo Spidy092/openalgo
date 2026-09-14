@@ -4,12 +4,20 @@ on:
   push:
     paths:
       - "services/risk/**"
+      - "services/autonomous/**"
       - "test/risk/**"
+      - "test/autonomous/**"
+      - "research/equity_engine/src/equity_engine/autonomous_orchestrator.py"
+      - "research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py"
       - ".github/workflows/risk-core.yml"
   pull_request:
     paths:
       - "services/risk/**"
+      - "services/autonomous/**"
       - "test/risk/**"
+      - "test/autonomous/**"
+      - "research/equity_engine/src/equity_engine/autonomous_orchestrator.py"
+      - "research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py"
       - ".github/workflows/risk-core.yml"
 
 permissions:
@@ -32,8 +40,18 @@ jobs:
       - name: Install test dependency
         run: python -m pip install --disable-pip-version-check pytest==9.0.2
 
-      - name: Compile risk core
-        run: python -m compileall -q services/risk test/risk
+      - name: Compile risk and autonomous bridge
+        run: >-
+          python -m compileall -q
+          services/risk
+          services/autonomous
+          test/risk
+          test/autonomous
+          research/equity_engine/src/equity_engine/autonomous_orchestrator.py
+          research/equity_engine/src/equity_engine/openalgo_analyzer_executor.py
 
       - name: Run risk core tests
         run: python -m pytest -q -o addopts='' --confcutdir=test/risk test/risk/
+
+      - name: Run autonomous bridge tests
+        run: python -m pytest -q -o addopts='' --confcutdir=test/autonomous test/autonomous/
