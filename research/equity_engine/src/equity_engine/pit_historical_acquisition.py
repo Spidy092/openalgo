@@ -2085,7 +2085,6 @@ def build_stage_b_plan(
     plan = plan_historical_batch(
         candidates=candidates,
         interval_minutes=interval_minutes,
-        resolution="minutes",
         expected_rows_per_trading_day=expected_rows_per_trading_day,
         estimated_bytes_per_row=estimated_bytes_per_row,
         trading_day_counts=trading_day_counts,
@@ -2166,7 +2165,6 @@ def build_stage_b_plan_from_timeline(
     plan = plan_historical_batch(
         candidates=candidates,
         interval_minutes=interval_minutes,
-        resolution="minutes",
         expected_rows_per_trading_day=expected_rows_per_trading_day,
         estimated_bytes_per_row=estimated_bytes_per_row,
         trading_day_counts=trading_day_counts,
