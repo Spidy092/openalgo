@@ -61,6 +61,11 @@ def _sample_experiment(
         vectorbt_version="1.1.0",
         simulator_version="openalgo-event-simulator-v1",
     )
+    cost_identity = CostEvidenceIdentity.from_ledger(
+        EffectiveDatedCostLedger(),
+        on_date=date(2026, 6, 30),
+        product=LedgerProduct.INTRADAY,
+    )
     return orchestrator.build_experiment(
         research_window=ResearchWindowConfig(start=research_start, end=research_end),
         train_windows=(
@@ -104,12 +109,8 @@ def _sample_experiment(
             rates={"brokerage": "0.001", "gst": "0.18"},
             source_refs=("source",),
         ),
-        cost_evidence_identity=CostEvidenceIdentity.from_ledger(
-            EffectiveDatedCostLedger(),
-            on_date=date(2026, 6, 30),
-            product=LedgerProduct.INTRADAY,
-        ),
-        cost_evidence_class="HISTORICAL_ACTUAL_COSTS",
+        cost_evidence_identity=cost_identity,
+        cost_evidence_class=cost_identity.evidence_classification,
         strategy_definitions=(
             StrategySpec(
                 candidate_id="c1",

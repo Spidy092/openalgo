@@ -474,26 +474,27 @@ class ShadowLiveRunner:
 
     def _validate_readiness(self, now: datetime | None = None) -> LiveMarketReadinessReport:
         report = self._readiness_report
-        if not isinstance(report, LiveMarketReadinessReport):
-            if (
-                self._config.mode is RunnerMode.DRY_RUN
-                and isinstance(self._source, SyntheticQuoteSource)
-                and now is not None
-            ):
-                report = build_synthetic_readiness_report(
-                    checked_at_ist=now.astimezone(ZoneInfo(REQUIRED_TIMEZONE)),
-                    trade_date=self._session_day,
-                    instrument_keys=self._config.instrument_keys,
-                    cas_eligible_by_key=self._config.cas_eligible_by_key,
-                    tick_size_by_key=self._config.tick_size_by_key,
-                    exit_buffer_minutes=self._config.exit_buffer_minutes,
-                    approved_capital=self._config.approved_capital(),
-                    quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
-                    classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
-                )
-                self._readiness_report = report
-            else:
-                raise ReadinessGateError(READINESS_REPORT_MISSING)
+        auto_dry_run_readiness = (
+            self._config.mode is RunnerMode.DRY_RUN
+            and report is None
+            and now is not None
+        )
+        if auto_dry_run_readiness:
+            if now.tzinfo is None:
+                raise ReadinessGateError(READINESS_STALE + ": runner clock")
+            report = build_synthetic_readiness_report(
+                checked_at_ist=now.astimezone(ZoneInfo(REQUIRED_TIMEZONE)),
+                trade_date=self._session_day,
+                instrument_keys=self._config.instrument_keys,
+                cas_eligible_by_key=self._config.cas_eligible_by_key,
+                tick_size_by_key=self._config.tick_size_by_key,
+                exit_buffer_minutes=self._config.exit_buffer_minutes,
+                approved_capital=self._config.approved_capital(),
+                quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
+                classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
+            )
+        elif not isinstance(report, LiveMarketReadinessReport):
+            raise ReadinessGateError(READINESS_REPORT_MISSING)
         if report.live_orders_called is not False:
             raise ReadinessGateError("readiness report contains live-order activity")
         if report.trade_date != self._session_day:
@@ -531,7 +532,7 @@ class ShadowLiveRunner:
         if checked_at.tzinfo is None:
             raise ReadinessGateError(READINESS_STALE + ": report clock")
         age = (now_ist - checked_at.astimezone(ZoneInfo(REQUIRED_TIMEZONE))).total_seconds()
-        if (
+        if not auto_dry_run_readiness and (
             now_ist.date() != report.trade_date
             or age < 0
             or age > report.context.readiness_max_age_seconds
