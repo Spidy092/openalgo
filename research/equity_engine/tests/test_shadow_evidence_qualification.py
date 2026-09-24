@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -148,6 +148,10 @@ def _run_and_persist_session(
             datetime.fromisoformat("2026-09-07T09:30:05+05:30"),
             datetime.fromisoformat("2026-09-07T09:35:05+05:30"),
         ]
+    target_polls = max_polls or len(batches)
+    poll_times = list(poll_times)
+    while len(poll_times) < target_polls:
+        poll_times.append(poll_times[-1] + timedelta(minutes=5))
     times_iter = list(poll_times)
 
     cfg = ShadowLiveConfig(
@@ -169,7 +173,7 @@ def _run_and_persist_session(
     runner = ShadowLiveRunner(
         config=cfg,
         source=SyntheticQuoteSource(batches),
-        now=lambda: times_iter.pop(0) if times_iter else datetime.now(tz=IST),
+        now=lambda: times_iter.pop(0),
     )
     runner.run()
     runner.persist(out_dir)
