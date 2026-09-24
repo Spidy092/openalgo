@@ -482,7 +482,7 @@ class ShadowLiveRunner:
             and not self._readiness_was_supplied
             and now is not None
         )
-        if auto_dry_run_readiness and report is None:
+        if auto_dry_run_readiness:
             if now.tzinfo is None:
                 raise ReadinessGateError(READINESS_STALE + ": runner clock")
             report = build_synthetic_readiness_report(
