@@ -348,7 +348,7 @@ def test_insufficient_coverage_fails_closed(tmp_path: Path) -> None:
     assert (
         qualification.classification
         == ShadowEvidenceClassification.VALID_SHADOW_EVIDENCE_INSUFFICIENT
-    )
+    ), qualification.qualification_reasons
     assert qualification.qualification_passed is False
     assert any(
         "insufficient observed event coverage" in r for r in qualification.qualification_reasons
