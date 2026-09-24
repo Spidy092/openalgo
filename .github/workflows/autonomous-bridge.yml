@@ -1,0 +1,34 @@
+name: Autonomous Bridge
+
+on:
+  push:
+    paths:
+      - "services/autonomous_bridge/**"
+      - "test/test_autonomous_bridge.py"
+      - "research/equity_engine/src/equity_engine/eligibility_decision.py"
+      - "research/equity_engine/src/equity_engine/trading_rails.py"
+      - ".github/workflows/autonomous-bridge.yml"
+  pull_request:
+    paths:
+      - "services/autonomous_bridge/**"
+      - "test/test_autonomous_bridge.py"
+      - "research/equity_engine/src/equity_engine/eligibility_decision.py"
+      - "research/equity_engine/src/equity_engine/trading_rails.py"
+      - ".github/workflows/autonomous-bridge.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync
+      - name: Test sandbox-only autonomous bridge
+        run: uv run pytest test/test_autonomous_bridge.py -q --tb=short --timeout=60
