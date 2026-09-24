@@ -248,6 +248,7 @@ class CorporateActionMismatchError(MissingEvidenceError):
 _UNSET_COVERED_INSTRUMENTS = object()
 
 
+@dataclass(frozen=True)
 class CorporateActionEvidenceIdentity:
     """Serialized corporate-action evidence claim that must be revalidated before trust.
 
