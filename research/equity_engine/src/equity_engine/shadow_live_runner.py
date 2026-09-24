@@ -493,6 +493,7 @@ class ShadowLiveRunner:
                 quote_freshness_threshold_seconds=self._config.quote_freshness_threshold_seconds,
                 classification=ReadinessClassification.READY_FOR_RESEARCH_SHADOW,
             )
+            self._readiness_report = report
         elif not isinstance(report, LiveMarketReadinessReport):
             raise ReadinessGateError(READINESS_REPORT_MISSING)
         if report.live_orders_called is not False:
