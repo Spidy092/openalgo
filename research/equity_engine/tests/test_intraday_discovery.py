@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from equity_engine.gates import PromotionThresholds
 from equity_engine.intraday_discovery import (
@@ -192,6 +193,7 @@ def test_train_validation_test_split_keeps_test_untouched() -> None:
     assert len(train) > 0 and len(validation) > 0 and len(test) > 0
 
 
+@pytest.mark.timeout(90)
 def test_gauntlet_accepts_known_good_synthetic_trend() -> None:
     frame = _dense_session_frame(days=10, drift_per_day=1.5)
     manifest = _manifest(
