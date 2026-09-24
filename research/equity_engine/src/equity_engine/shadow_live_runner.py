@@ -464,6 +464,9 @@ class ShadowLiveRunner:
         self._sleep = sleep or (lambda _: None)
         self._session_day = session_day or date(2026, 9, 7)
         self._readiness_report = readiness_report or config.readiness_report
+        self._readiness_was_supplied = (
+            readiness_report is not None or config.readiness_report is not None
+        )
         self._engines: dict[str, ShadowSessionEngine] = {}
         self._seq_by_key: dict[str, int] = {key: 0 for key in config.instrument_keys}
         self._normalized: list[NormalizedLiveEvent] = []
@@ -476,10 +479,10 @@ class ShadowLiveRunner:
         report = self._readiness_report
         auto_dry_run_readiness = (
             self._config.mode is RunnerMode.DRY_RUN
-            and report is None
+            and not self._readiness_was_supplied
             and now is not None
         )
-        if auto_dry_run_readiness:
+        if auto_dry_run_readiness and report is None:
             if now.tzinfo is None:
                 raise ReadinessGateError(READINESS_STALE + ": runner clock")
             report = build_synthetic_readiness_report(
