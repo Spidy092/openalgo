@@ -1474,7 +1474,10 @@ class ExperimentArtifact:
         ):
             raise MissingEvidenceError(
                 "experiment cannot claim corporate-action-complete unless evidence covers "
-                f"exact research window [{self.research_window.start.isoformat()}, {self.research_window.end.isoformat()}]"
+                f"exact research window [{self.research_window.start.isoformat()}, "
+                f"{self.research_window.end.isoformat()}]; got coverage "
+                f"[{evidence.coverage_start.isoformat() if evidence.coverage_start else None}, "
+                f"{evidence.coverage_end.isoformat() if evidence.coverage_end else None}]"
             )
         instruments = evidence.covered_instruments
         if not instruments:
